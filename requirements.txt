@@ -1,0 +1,8 @@
+netmiko
+pymysql
+python-dotenv
+cryptography
+networkx
+matplotlib
+pytest
+customtkinter==5.2.2

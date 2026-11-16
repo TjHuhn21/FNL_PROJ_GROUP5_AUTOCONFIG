@@ -1,0 +1,66 @@
+-- NetCommand database. Open this in MySQL Workbench as root and run it.
+-- BEFORE running: change 'choose-a-password' on the CREATE USER line, and use
+-- the same password in your .env file (DB_PASSWORD).
+-- The app connects as the limited 'netcommand' user (no DROP, no ALTER).
+
+CREATE DATABASE IF NOT EXISTS netcommand CHARACTER SET utf8mb4;
+USE netcommand;
+
+CREATE TABLE IF NOT EXISTS devices (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  name         VARCHAR(80)  NOT NULL,
+  ip           VARCHAR(15)  NOT NULL UNIQUE,
+  mac          VARCHAR(17)  NOT NULL DEFAULT '',
+  type         ENUM('switch','router','unknown') NOT NULL DEFAULT 'unknown',
+  managed      TINYINT(1)   NOT NULL DEFAULT 0,
+  status       ENUM('up','down') NOT NULL DEFAULT 'up',
+  username     VARCHAR(50)  NOT NULL DEFAULT '',
+  password_enc VARCHAR(255) NOT NULL DEFAULT '',
+  is_deleted   TINYINT(1)   NOT NULL DEFAULT 0,
+  created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS links (
+  id       INT AUTO_INCREMENT PRIMARY KEY,
+  device_a VARCHAR(80) NOT NULL,
+  port_a   VARCHAR(40) NOT NULL,
+  device_b VARCHAR(80) NOT NULL,
+  port_b   VARCHAR(40) NOT NULL,
+  UNIQUE KEY uq_link (device_a, port_a, device_b, port_b)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS findings (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  device_id  INT NOT NULL,
+  rule       VARCHAR(60) NOT NULL,
+  severity   ENUM('high','medium','low') NOT NULL,
+  message    TEXT NOT NULL,
+  commands   TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS status_events (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  device_id  INT NOT NULL,
+  kind       VARCHAR(30) NOT NULL,
+  detail     TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS config_logs (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  device_id  INT NOT NULL,
+  action     VARCHAR(100) NOT NULL,
+  status     ENUM('success','failed') NOT NULL,
+  details    TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (device_id) REFERENCES devices(id)
+) ENGINE=InnoDB;
+
+-- The limited-privilege user the rubric asks for.
+CREATE USER IF NOT EXISTS 'netcommand'@'localhost' IDENTIFIED BY 'choose-a-password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON netcommand.* TO 'netcommand'@'localhost';
+FLUSH PRIVILEGES;
