@@ -16,12 +16,18 @@ class Inspector(ctk.CTkFrame):
         self.store = store
         self.on_open_devices, self.on_configure = on_open_devices, on_configure
         self.on_focus_device = None          # set by the main window: select a device on the map
+        self.on_hide = None                  # set by the main window: collapse the panel
         self.device = None
         self.selection = None                # ('device', id) | ('details', name) | ('link', (a, b))
         self.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(self, text='INSPECTOR', font=theme.mono(9, 'bold'), anchor='w',
                      text_color=theme.TEXT_MUTED).grid(row=0, column=0, sticky='ew', padx=14,
                                                        pady=(10, 0))
+        self.hide_button = ctk.CTkButton(
+            self, text='Hide  ›', width=56, height=22, corner_radius=3, font=theme.FONT_SMALL,
+            fg_color=theme.SURFACE, hover_color=theme.SURFACE_2, text_color=theme.TEXT_SOFT,
+            command=lambda: self.on_hide and self.on_hide())
+        self.hide_button.grid(row=0, column=1, sticky='e', padx=(0, 10), pady=(10, 0))
         self.body = None
         self.clear()
 
@@ -29,7 +35,7 @@ class Inspector(ctk.CTkFrame):
         if self.body is not None:
             self.body.destroy()
         self.body = ctk.CTkFrame(self, fg_color=theme.SURFACE, corner_radius=0)
-        self.body.grid(row=1, column=0, sticky='nsew', padx=14, pady=(4, 12))
+        self.body.grid(row=1, column=0, columnspan=2, sticky='nsew', padx=14, pady=(4, 12))
         self.body.grid_columnconfigure(1, weight=1)
         return self.body
 

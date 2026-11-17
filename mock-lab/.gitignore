@@ -1,0 +1,7 @@
+# generated while the mock lab runs: never commit
+keys/
+state/
+backups/
+__pycache__/
+
+lab_config.json

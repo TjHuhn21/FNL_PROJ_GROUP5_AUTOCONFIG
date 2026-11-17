@@ -42,13 +42,16 @@ class TopologyCanvas(tk.Frame):
         """on_select(kind, info): kind is 'device', 'link' or None (selection cleared)."""
         super().__init__(parent, background=theme.SURFACE)
         self.on_select = on_select
+        self.on_change = None            # called after the user drags a device
+        self.on_reset_request = None     # if set, the Reset button asks this instead
 
         bar = tk.Frame(self, background=theme.SURFACE)
         bar.pack(fill='x', pady=(0, 6))
+        self.bar = bar                   # the page adds its own buttons here (Save layout)
         self.buttons = {}
         for key, text, command in (('fit', 'Fit', self.fit), ('in', 'Zoom +', self.zoom_in),
                                    ('out', 'Zoom −', self.zoom_out),
-                                   ('reset', 'Reset layout', self.reset_layout)):
+                                   ('reset', 'Reset layout', self._reset_clicked)):
             self.buttons[key] = ttk.Button(bar, text=text, command=command)
             self.buttons[key].pack(side='left', padx=(0, 6))
         self.zoom_label = tk.Label(bar, text='', font=theme.mono(9), background=theme.SURFACE,
@@ -86,7 +89,8 @@ class TopologyCanvas(tk.Frame):
 
     def load(self, devices, links, sample=False, empty_text=''):
         """Show these devices and links. Reloading the same network keeps the
-        current positions and view (only states such as up/down are refreshed)."""
+        current positions and view (only states such as up/down are refreshed).
+        Returns 'new' (laid out from scratch), 'same' (kept) or 'empty'."""
         devices, links = list(devices), list(links)
         signature = (sorted(d['name'] for d in devices), sorted(tuple(l) for l in links), sample)
         same = signature == self._signature and self.nodes
@@ -97,14 +101,15 @@ class TopologyCanvas(tk.Frame):
         if not devices:
             self.nodes, self.edges, self.selected = {}, [], None
             self.render()
-            return
+            return 'empty'
         if same:
             self._refresh_states()
             self.render()
-            return
+            return 'same'
         self.selected, self.moved = None, False
         self._layout()
         self.fit()
+        return 'new'
 
     def _size(self):
         self.canvas.update_idletasks()
@@ -196,6 +201,12 @@ class TopologyCanvas(tk.Frame):
         self.fitted = False
         self.render()
 
+    def _reset_clicked(self):
+        if self.on_reset_request:        # the page may ask for confirmation first
+            self.on_reset_request()
+        else:
+            self.reset_layout()
+
     def reset_layout(self):
         """Put every device back where the automatic layout places it, then fit."""
         if not self.devices:
@@ -218,8 +229,13 @@ class TopologyCanvas(tk.Frame):
         n = self.nodes[name]
         n['x'], n['y'] = x, y
         self.moved = True
+        self._straighten({name})
+        self.render()
+
+    def _straighten(self, names):
+        """Links touching these devices become straight lines with their labels re-placed."""
         for e in self.edges:
-            if name in (e['a'], e['b']):
+            if e['a'] in names or e['b'] in names:
                 a, b = self.nodes[e['a']], self.nodes[e['b']]
                 e['points'] = [(a['x'], a['y']), (b['x'], b['y'])]
                 e.pop('bus', None)
@@ -227,7 +243,37 @@ class TopologyCanvas(tk.Frame):
                                           self.label_gap, self.px),
                                port_label(b, a, ', '.join(e['ports_b']), self.label_pt,
                                           self.label_gap, self.px)]
-        self.render()
+
+    # ---------------------------------------------------------------- saved positions
+    def positions(self):
+        """{name: (x, y)} in device-box units (x / box width, y / box height), which
+        bring back the same arrangement at any window size."""
+        return {name: (n['x'] / n['w'], n['y'] / n['h']) for name, n in self.nodes.items()}
+
+    def apply_positions(self, saved):
+        """Put the devices listed in `saved` ({name: (x, y)} in box units) where they
+        were saved. Devices not listed (new ones) keep their automatic place, moved
+        aside if a restored device now sits there. Returns the names restored."""
+        restored = [name for name in saved if name in self.nodes]
+        if not restored:
+            return []
+        for name in restored:
+            n = self.nodes[name]
+            n['x'], n['y'] = saved[name][0] * n['w'], saved[name][1] * n['h']
+        shifted, placed = set(), list(restored)
+        for name, n in self.nodes.items():
+            if name in restored:
+                continue
+            for _ in range(200):                     # step right until it is free
+                if not any(_boxes_touch(n, self.nodes[p]) for p in placed):
+                    break
+                n['x'] += n['w'] * 1.3
+                shifted.add(name)
+            placed.append(name)
+        self._straighten(set(restored) | shifted)
+        self.moved = True
+        self.fit()
+        return restored
 
     # ---------------------------------------------------------------- hit testing
     def node_at(self, sx, sy):
@@ -326,6 +372,8 @@ class TopologyCanvas(tk.Frame):
         self.canvas.configure(cursor='arrow')
         if p and not p['drag']:                 # a click, not a drag
             self._select(p['hit'])
+        elif p and p['hit'] and p['hit'][0] == 'node' and self.on_change:
+            self.on_change()                    # a device was moved by hand
 
     def _on_wheel(self, event):
         self.zoom_at(event.x, event.y, ZOOM_STEP if event.delta > 0 else 1 / ZOOM_STEP)
@@ -463,6 +511,12 @@ class TopologyCanvas(tk.Frame):
         (x1, y1), (x2, y2) = max(zip(pts, pts[1:]),
                                  key=lambda s: math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]))
         return (x1 + x2) / 2, (y1 + y2) / 2
+
+
+def _boxes_touch(a, b, gap=0.15):
+    """Do two device boxes overlap (or come closer than `gap` of a box size)?"""
+    return (abs(a['x'] - b['x']) < (a['w'] + b['w']) / 2 * (1 + gap) and
+            abs(a['y'] - b['y']) < (a['h'] + b['h']) / 2 * (1 + gap))
 
 
 def _segment_distance(px, py, x1, y1, x2, y2):

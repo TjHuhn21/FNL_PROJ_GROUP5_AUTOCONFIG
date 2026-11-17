@@ -57,6 +57,7 @@ PAD = 8
 RAIL_WIDTH = 64
 INSPECTOR_WIDTH = 300
 CONSOLE_HEIGHT = 170
+CONSOLE_HEIGHT_COMPACT = 110    # on Configure, which has its own SSH session console
 
 
 def mono(size=9, weight='normal'):

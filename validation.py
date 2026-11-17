@@ -67,3 +67,162 @@ def check_mask(text):
         return None
     except ValueError:
         return 'Enter a valid subnet mask, like 255.255.255.0'
+
+
+# ---------------------------------------------------------------- ports and port ranges
+def check_port_list(text):
+    """One port, a range or a list: Fa0/1 | Fa0/1-5 | Fa0/1-Fa0/5 | Fa0/1-5, Gi0/1."""
+    from config.interfaces import PortError, parse_ports
+    try:
+        parse_ports(text)
+        return None
+    except PortError as err:
+        return str(err)
+
+
+def check_single_interface(text):
+    """Exactly one interface (a router interface, for example Gi0/0)."""
+    from config.interfaces import PortError, is_single, parse_ports
+    try:
+        if not is_single(parse_ports(text)):
+            return 'Enter one interface here, for example Gi0/0 (not a range or a list).'
+        return None
+    except PortError as err:
+        return str(err)
+
+
+# ---------------------------------------------------------------- VLAN lists (trunks)
+def vlan_list(text):
+    """'10, 20,30-32' -> [10, 20, 30, 31, 32]. Raises ValueError with a clear message."""
+    numbers = set()
+    for part in (text or '').replace(' ', '').split(','):
+        if not part:
+            raise ValueError('There is an empty item in the VLAN list.')
+        if '-' in part:
+            a, _, b = part.partition('-')
+            if not (a.isdigit() and b.isdigit()):
+                raise ValueError(f'"{part}" is not a VLAN range like 30-40.')
+            a, b = int(a), int(b)
+            if b < a:
+                raise ValueError(f'"{part}" is reversed: write {b}-{a}.')
+            span = range(a, b + 1)
+        elif part.isdigit():
+            span = [int(part)]
+        else:
+            raise ValueError(f'"{part}" is not a VLAN number.')
+        for n in span:
+            if not 1 <= n <= 4094:
+                raise ValueError(f'VLAN {n} is outside 1 to 4094.')
+            numbers.add(n)
+    if not numbers:
+        raise ValueError('Enter at least one VLAN, for example 10,20,30-40.')
+    return sorted(numbers)
+
+
+def compress_vlans(numbers):
+    """[10, 20, 30, 31, 32] -> '10,20,30-32' (the way IOS prints a trunk's VLAN list)."""
+    out, start, prev = [], None, None
+    for n in sorted(numbers):
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append(f'{start}-{prev}' if prev > start else str(start))
+            start = prev = n
+    if start is not None:
+        out.append(f'{start}-{prev}' if prev > start else str(start))
+    return ','.join(out)
+
+
+def check_vlan_list(text):
+    try:
+        vlan_list(text)
+        return None
+    except ValueError as err:
+        return str(err)
+
+
+def check_vlan_number(text, allow_1=True):
+    """A VLAN number for a native VLAN (1 is allowed there) or a port assignment."""
+    try:
+        n = int(str(text).strip())
+    except ValueError:
+        return 'The VLAN must be a number.'
+    low = 1 if allow_1 else 2
+    if not low <= n <= 4094:
+        return f'The VLAN must be from {low} to 4094.'
+    return None
+
+
+# ---------------------------------------------------------------- names and text
+_HOSTNAME = re.compile(r'^[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$')
+
+
+def check_hostname(name):
+    name = (name or '').strip()
+    if not name:
+        return 'The hostname is required.'
+    if not _HOSTNAME.match(name):
+        return ('A hostname must start with a letter, use only letters, numbers and dashes, '
+                'not end with a dash, and be at most 63 characters.')
+    return None
+
+
+def check_description(text):
+    text = (text or '').strip()
+    if not text:
+        return 'The description is empty.'
+    if len(text) > 200:
+        return 'The description must be 200 characters or fewer.'
+    if '?' in text:
+        return 'A description cannot contain "?" (the device would show its help text instead).'
+    if any(ord(c) < 32 for c in text):
+        return 'The description must be one line of plain text.'
+    return None
+
+
+# ---------------------------------------------------------------- networks
+def check_network(address, mask):
+    """address must be the network address for mask (for routes and DHCP pools)."""
+    problem = check_ip(address) or check_mask(mask)
+    if problem:
+        return problem
+    try:
+        ipaddress.IPv4Network(f'{address.strip()}/{mask.strip()}', strict=True)
+        return None
+    except ValueError:
+        real = ipaddress.IPv4Network(f'{address.strip()}/{mask.strip()}', strict=False)
+        return (f'{address.strip()} is not a network address for mask {mask.strip()}. '
+                f'Did you mean {real.network_address}?')
+
+
+def check_ip_in_network(address, network, mask, what='The address'):
+    problem = check_ip(address)
+    if problem:
+        return problem
+    net = ipaddress.IPv4Network(f'{network.strip()}/{mask.strip()}', strict=False)
+    if ipaddress.IPv4Address(address.strip()) not in net:
+        return f'{what} {address.strip()} is not inside {net}.'
+    return None
+
+
+def check_host_address(address, mask):
+    """An interface address: valid, and not the network or broadcast address."""
+    problem = check_ip(address) or check_mask(mask)
+    if problem:
+        return problem
+    net = ipaddress.IPv4Network(f'{address.strip()}/{mask.strip()}', strict=False)
+    ip = ipaddress.IPv4Address(address.strip())
+    if net.prefixlen < 31 and ip in (net.network_address, net.broadcast_address):
+        return f'{ip} is the network or broadcast address of {net}; use a host address.'
+    return None
+
+
+def check_ip_order(first, last):
+    problem = check_ip(first) or check_ip(last)
+    if problem:
+        return problem
+    if ipaddress.IPv4Address(first.strip()) > ipaddress.IPv4Address(last.strip()):
+        return f'The range is reversed: {first.strip()} comes after {last.strip()}.'
+    return None

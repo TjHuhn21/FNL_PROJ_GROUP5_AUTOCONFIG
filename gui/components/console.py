@@ -97,7 +97,7 @@ class OperationsConsole(tk.Frame):
         t.configure(state='normal')
         t.insert('end', when, ('time',))
         t.insert('end', '  ')
-        t.insert('end', f'{source:<9}', ('source',))
+        t.insert('end', f'{source:<9} ', ('source',))     # 'configure' is 9 letters: keep a gap
         t.insert('end', message + '\n', (level,) if LEVEL_COLORS.get(level) else ())
         t.see('end')
         t.configure(state='disabled')

@@ -15,6 +15,7 @@
 All pages are created once at startup and only hidden or shown, so nothing a
 page holds (scan results, a command preview) is lost when you switch.
 """
+import os
 import tkinter as tk
 from tkinter import ttk
 
@@ -134,7 +135,7 @@ def build_main_window(root, store, demo_store=False):
         console.log('findings', f'Sent {len(commands)} suggested lines for {device_name} to Configure.')
 
     refs['devices'] = DevicesTab(host, store, on_change=after_data_change)
-    refs['configure'] = ConfigureTab(host, store)
+    refs['configure'] = ConfigureTab(host, store, log=console.log)
     refs['scan'] = ScanTab(host, store, services.run_discovery,
                            on_approved=after_approval, demo_default=demo_store,
                            sample_store=demo_store,
@@ -148,6 +149,7 @@ def build_main_window(root, store, demo_store=False):
         if kind is None:
             insp.clear()
             return
+        set_inspector(True)                     # something to inspect: make sure it is visible
         sample_note = 'SAMPLE DATA: example network, not registered in your database.'
         if kind == 'device':
             extra = [('Topology', 'single point of failure', False)] if info['spof'] else []
@@ -165,7 +167,12 @@ def build_main_window(root, store, demo_store=False):
                            info['info_a'], info['info_b'],
                            note=sample_note if info['sample'] else None)
 
-    refs['topology'] = TopologyTab(host, get_network, on_select=on_map_select)
+    # Saved map layouts are kept per data source; the database one is named after the
+    # database (no credentials), the sample one simply 'sample'.
+    layout_scope = 'sample' if demo_store else \
+        f"database:{os.getenv('DB_NAME', 'netcommand')}@{os.getenv('DB_HOST', 'localhost')}"
+    refs['topology'] = TopologyTab(host, get_network, on_select=on_map_select,
+                                   layout_scope=layout_scope, log=console.log)
     refs['findings'] = FindingsTab(host, store, lambda: services.collect_review_inputs(store, demo_store),
                                    send_to_configure)
     refs['logs'] = LogsTab(host, store)
@@ -173,16 +180,13 @@ def build_main_window(root, store, demo_store=False):
 
     # ---------------------------------------------------------------- inspector and command strip
     def select_for_configure(name):
-        """Pick a device in the Configure page's device box (managed devices only)."""
+        """Select only this device on the Configure page (managed devices only)."""
         conf = refs['configure']
         conf.refresh_devices()
-        names = [d['name'] for d in conf.devices]
-        if name not in names:
+        if not conf.select_device(name):
             console.log('configure', f'{name} is not a managed device, so it cannot be configured.',
                         'warn')
             return False
-        conf.device_box.current(names.index(name))
-        conf.device_box.event_generate('<<ComboboxSelected>>')
         return True
 
     def open_in_devices(name):
@@ -200,6 +204,7 @@ def build_main_window(root, store, demo_store=False):
     refs['inspector'].on_focus_device = lambda name: refs['topology'].interactive.select_node(name)
 
     def on_device(device_id):
+        set_inspector(True)
         d = refs['inspector'].show_device(device_id)
         if d:
             console.log('find', f"Selected {d['name']} ({d['ip']}).")
@@ -227,6 +232,54 @@ def build_main_window(root, store, demo_store=False):
     refs['status_devices'].pack(side='left', padx=(12, 0))
     ctk.CTkLabel(status, text='Ctrl+K  command strip', font=theme.mono(8), height=20,
                  text_color=theme.TEXT_SOFT).pack(side='right', padx=12)
+    refs['inspector_toggle'] = ctk.CTkButton(
+        status, text='Hide inspector', font=theme.mono(8), height=20, width=110,
+        corner_radius=3, fg_color=theme.SURFACE_2, hover_color=theme.BORDER,
+        text_color=theme.TEXT_SOFT, command=lambda: set_inspector(not inspector_shown(),
+                                                                   remember=True))
+    refs['inspector_toggle'].pack(side='right', padx=(0, 4))
+
+    # ---------------------------------------------------------------- collapsible inspector
+    # Each page remembers whether it shows the inspector; Configure starts without it
+    # (it needs the width). Selecting something to inspect always brings it back.
+    inspector_pref = {'configure': False}
+    console_size = {}                          # page -> console height (pixels) chosen there
+
+    def inspector_shown():
+        return str(refs['inspector']) in [str(p) for p in upper.panes()]
+
+    def set_inspector(visible, remember=False):
+        if remember or visible:
+            if state['current']:
+                inspector_pref[state['current']] = visible
+        if visible and not inspector_shown():
+            upper.add(refs['inspector'], weight=0)
+            root.update_idletasks()
+            width, wanted = upper.winfo_width(), int(theme.INSPECTOR_WIDTH * _scaling(root))
+            if width > 2 * wanted:
+                upper.sashpos(0, width - wanted)
+        elif not visible and inspector_shown():
+            upper.forget(refs['inspector'])
+        refs['inspector_toggle'].configure(text='Hide inspector' if inspector_shown()
+                                           else 'Show inspector')
+
+    refs['inspector'].on_hide = lambda: set_inspector(False, remember=True)
+    refs['set_inspector'] = set_inspector
+    refs['inspector_shown'] = inspector_shown
+
+    def remember_console(page):
+        height = outer.winfo_height()
+        if page and height > 200:
+            console_size[page] = height - outer.sashpos(0)
+
+    def restore_console(page):
+        height = outer.winfo_height()
+        if height <= 200:
+            return                                 # not laid out yet: place_dividers does it
+        s = _scaling(root)
+        default = theme.CONSOLE_HEIGHT_COMPACT if page == 'configure' else theme.CONSOLE_HEIGHT
+        wanted = console_size.get(page, int(default * s))
+        outer.sashpos(0, max(int(height * 0.35), height - wanted))
 
     def update_status():
         try:
@@ -248,12 +301,15 @@ def build_main_window(root, store, demo_store=False):
         nothing, exactly like clicking the tab that was already open."""
         if key == state['current']:
             return
+        remember_console(state['current'])
         for other, _label in PAGES:
             if other != key:
                 refs[other].grid_remove()
         refs[key].grid(row=0, column=0, sticky='nsew')
         refs['nav'].set_active(key)
         state['current'] = key
+        set_inspector(inspector_pref.get(key, True))
+        restore_console(key)
         if key in on_show:
             on_show[key]()
         update_status()
@@ -268,10 +324,10 @@ def build_main_window(root, store, demo_store=False):
         root.update_idletasks()
         s = _scaling(root)
         width, height = upper.winfo_width(), outer.winfo_height()
-        if width > 2 * theme.INSPECTOR_WIDTH * s:
+        if inspector_shown() and width > 2 * theme.INSPECTOR_WIDTH * s:
             upper.sashpos(0, int(width - theme.INSPECTOR_WIDTH * s))
         if height > 2 * theme.CONSOLE_HEIGHT * s:
-            outer.sashpos(0, int(height - theme.CONSOLE_HEIGHT * s))
+            restore_console(state['current'])
 
     show_page(FIRST_PAGE)
     root.after(50, place_dividers)
