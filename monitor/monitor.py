@@ -38,7 +38,13 @@ def is_up(ip):
 
 def check_all(store, fails, check=is_up):
     """One round. fails is a dict {device_id: failures in a row}, kept between rounds.
-    Returns the list of (device, new_status) that changed."""
+    Returns the list of (device, new_status) that changed AND were recorded.
+
+    The status and its event are saved together (store.record_status_change: one
+    transaction) or not at all. A failed save raises (the caller reports it); the status
+    in the database is then unchanged, so the next round tries again: no event is lost
+    and none is recorded twice. A device changed meanwhile by someone else is skipped."""
+    record = getattr(store, 'record_status_change', None)
     changed = []
     for d in store.get_devices('', 'name', 1, 1000):
         if check(d['ip']):
@@ -48,15 +54,26 @@ def check_all(store, fails, check=is_up):
             fails[d['id']] = fails.get(d['id'], 0) + 1
             new = 'down' if fails[d['id']] >= FAILS_BEFORE_DOWN else d['status']
         if new != d['status']:
-            store.set_status(d['id'], new)
-            store.add_event(d['id'], new, f"{d['name']} ({d['ip']}) is now {new}")
+            detail = f"{d['name']} ({d['ip']}) is now {new} (was {d['status']})"
+            if record is not None:
+                if not record(d['id'], d['status'], new, detail):
+                    continue                  # changed meanwhile: nothing recorded
+            else:                             # a store without it (older stand-ins)
+                store.set_status(d['id'], new)
+                store.add_event(d['id'], new, detail)
             changed.append((d, new))
     return changed
 
 
-def start_monitor(store, interval=INTERVAL, on_change=None, check=is_up):
-    """Start the background thread. Call stop.set() on the returned Event to stop it."""
+def start_monitor(store, interval=INTERVAL, on_change=None, check=is_up, on_error=None):
+    """Start the background thread. Call stop.set() on the returned Event to stop it.
+
+    on_error(err) is called (from the monitor thread, so it must be thread-safe) when a
+    round fails, for example because the database is unavailable: once per run of
+    failures, not every round. The monitor keeps running and carries on by itself when
+    the database is back; a failed round changes no status and records no event."""
     stop, fails = threading.Event(), {}
+    state = {'failing': False}
 
     def loop():
         while not stop.is_set():
@@ -64,8 +81,15 @@ def start_monitor(store, interval=INTERVAL, on_change=None, check=is_up):
                 for d, new in check_all(store, fails, check):
                     if on_change:
                         on_change(d, new)
-            except Exception:
-                pass                      # never let the monitor crash the app
+                state['failing'] = False
+            except Exception as err:      # never let the monitor crash the app...
+                if not state['failing']:  # ...but never hide the failure either
+                    state['failing'] = True
+                    if on_error:
+                        try:
+                            on_error(err)
+                        except Exception:
+                            pass
             stop.wait(interval)
 
     threading.Thread(target=loop, daemon=True).start()

@@ -28,12 +28,14 @@ from gui.components.console import OperationsConsole
 from gui.components.inspector import Inspector
 from gui.components.rail import Rail
 from gui.configure_tab import ConfigureTab
+from gui.db_status import DatabaseStatus, report_error
 from gui.devices_tab import DevicesTab
 from gui.findings_tab import FindingsTab
 from gui.logs_tab import LogsTab
 from gui.overview_page import OverviewPage
 from gui.scan_tab import ScanTab
 from gui.topology_tab import TopologyTab
+from store_errors import DatabaseError
 
 # (key, rail label) in rail order. 'dashboard' is the Overview workspace.
 PAGES = [('dashboard', 'Overview'), ('scan', 'Scan'), ('devices', 'Devices'),
@@ -50,9 +52,18 @@ def _scaling(widget):
         return 1.0
 
 
-def build_main_window(root, store, demo_store=False):
+SOURCE_CONNECTED = '●  database connected'
+SOURCE_UNAVAILABLE = '●  database unavailable'
+SOURCE_SAMPLE = '●  sample mode · in memory'
+SOURCE_FALLBACK = '●  sample mode · database unavailable at startup'
+
+
+def build_main_window(root, store, demo_store=False, startup_problem=None):
     """Builds the workbench and every page. Returns refs: one entry per page key,
-    plus 'nav', 'command', 'inspector', 'console', 'show_page', 'current_page'."""
+    plus 'nav', 'command', 'inspector', 'console', 'show_page', 'current_page', and in
+    database mode 'db_status' (gui.db_status.DatabaseStatus).
+    startup_problem: why the database could not be used at startup, when the app fell
+    back to sample mode (shown, so the fallback is never mistaken for the database)."""
     theme.apply(root)
     root.grid_columnconfigure(1, weight=1)
     root.grid_rowconfigure(2, weight=1)
@@ -77,8 +88,8 @@ def build_main_window(root, store, demo_store=False):
     ctk.CTkLabel(names, text='network engineering workbench', font=theme.mono(8), height=14,
                  text_color=theme.TEXT_MUTED, anchor='w').grid(row=1, column=0, sticky='w')
 
-    source_text = ('●  sample mode · in memory' if demo_store
-                   else '●  database connected')
+    source_text = (SOURCE_CONNECTED if not demo_store else
+                   SOURCE_FALLBACK if startup_problem else SOURCE_SAMPLE)
     refs['source_label'] = ctk.CTkLabel(
         header, text=source_text, font=theme.mono(9),
         text_color=theme.WARNING if demo_store else theme.SUCCESS)
@@ -92,10 +103,26 @@ def build_main_window(root, store, demo_store=False):
     upper = ttk.PanedWindow(outer, orient='horizontal', style='Workbench.TPanedwindow')
 
     page_area = tk.Frame(upper, background=theme.SURFACE)
-    if demo_store:
+    if demo_store and startup_problem:
+        ttk.Label(page_area, style='Sample.TLabel', padding=(12, 5), wraplength=900,
+                  justify='left',
+                  text=f'SAMPLE MODE: the database could not be used at startup. '
+                       f'{startup_problem} Data is kept in memory and lost on exit. '
+                       f'Restart NetCommand once the database is available.').pack(fill='x')
+    elif demo_store:
         ttk.Label(page_area, style='Sample.TLabel', padding=(12, 5),
                   text='No database connected: data is kept in memory and lost on exit '
                        '(sample mode).').pack(fill='x')
+    # Shown only while the database is unavailable at runtime (never in sample mode).
+    outage_bar = tk.Frame(page_area, background=theme.DANGER_SOFT)
+    refs['outage_text'] = ttk.Label(outage_bar, text='', wraplength=760, justify='left',
+                                    background=theme.DANGER_SOFT, foreground=theme.DANGER,
+                                    padding=(12, 5))
+    refs['outage_text'].pack(side='left', fill='x', expand=True)
+    refs['retry_button'] = ttk.Button(outage_bar, text='Retry now',
+                                      command=lambda: refs['db_status'].check_now())
+    refs['retry_button'].pack(side='right', padx=8, pady=4)
+    refs['outage_bar'] = outage_bar
     host = tk.Frame(page_area, background=theme.SURFACE)
     host.pack(fill='both', expand=True, padx=12, pady=10)
     host.grid_columnconfigure(0, weight=1)
@@ -103,6 +130,64 @@ def build_main_window(root, store, demo_store=False):
 
     console = OperationsConsole(outer, store)
     refs['console'] = console
+
+    # ---------------------------------------------------------------- database status
+    # Database mode only. A runtime outage NEVER switches to sample mode: the pages show
+    # 'unavailable' instead of their (now unverifiable) data, saving is blocked, and the
+    # connection is re-checked in the background. Recovery refreshes the pages; nothing
+    # that failed is repeated.
+    def on_db_down(reason):
+        refs['source_label'].configure(text=SOURCE_UNAVAILABLE, text_color=theme.DANGER)
+        refs['outage_text'].config(
+            text=f'{reason} Nothing can be saved until the connection is back; the lists are '
+                 f'hidden rather than shown out of date. NetCommand retries automatically.')
+        if not outage_bar.winfo_manager():
+            outage_bar.pack(fill='x', before=host)
+        for key in ('devices', 'logs', 'configure', 'topology'):
+            if key in refs:
+                refs[key].show_unavailable(reason)
+        if 'inspector' in refs:
+            insp = refs['inspector']
+            device_id = insp.device['id'] if insp.device else (
+                insp.selection[1] if insp.selection and insp.selection[0] == 'device' else None)
+            insp.show_unavailable(device_id)
+        if 'status_devices' in refs:
+            refs['status_devices'].configure(text='device count unavailable')
+        console.show_unavailable()                     # config log and status events
+        if 'findings' in refs:                         # kept on screen, marked not refreshed
+            refs['findings'].on_db_down(reason)
+
+    def on_db_up():
+        refs['source_label'].configure(text=SOURCE_CONNECTED, text_color=theme.SUCCESS)
+        outage_bar.pack_forget()
+        refs['devices'].refresh()
+        refs['logs'].refresh()
+        refs['configure'].refresh_devices()
+        if state['current'] == 'topology':      # other pages: refreshed when shown
+            refs['topology'].refresh()
+        insp = refs['inspector']
+        if insp.selection and insp.selection[0] == 'device' and insp.selection[1] is not None:
+            insp.show_device(insp.selection[1])
+        update_status()
+        console.refresh_current()                      # the stored-data tab shown, if any
+        refs['findings'].on_db_up()
+
+    if not demo_store:
+        refs['db_status'] = DatabaseStatus(root, store, on_down=on_db_down, on_up=on_db_up,
+                                           log=console.log)
+        default_handler = root.report_callback_exception
+
+        def on_callback_error(exc, val, tb):
+            """A database error that a screen did not handle itself: show the outage
+            (or the failed request) instead of a raw traceback. Anything else: as before."""
+            if report_error(root, val):
+                if isinstance(val, DatabaseError):
+                    from tkinter import messagebox
+                    messagebox.showerror('Database error', str(val))
+                return
+            default_handler(exc, val, tb)
+
+        root.report_callback_exception = on_callback_error
 
     # ---------------------------------------------------------------- the same page wiring as before
     def get_network():
@@ -285,7 +370,8 @@ def build_main_window(root, store, demo_store=False):
         try:
             n = store.count_devices()
             text = f'{n} registered device' + ('' if n == 1 else 's')
-        except Exception:
+        except Exception as err:
+            report_error(root, err)
             text = 'device count unavailable'
         refs['status_devices'].configure(text=text)
 
@@ -294,6 +380,7 @@ def build_main_window(root, store, demo_store=False):
                'logs': lambda: refs['logs'].refresh(),
                'configure': lambda: refs['configure'].refresh_devices(),
                'topology': lambda: refs['topology'].refresh(),
+               'findings': lambda: refs['findings'].on_page_shown(),
                'dashboard': lambda: refs['dashboard'].refresh()}
 
     def show_page(key):

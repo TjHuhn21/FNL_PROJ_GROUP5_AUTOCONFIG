@@ -5,6 +5,8 @@ from tkinter import ttk, messagebox
 
 import validation
 from gui import theme
+from gui.db_status import database_ready, report_error
+from store_errors import DatabaseUnavailable, DuplicateDeviceName
 
 SAMPLE_BLOCKED = ('These are sample devices. They can only be approved in sample mode '
                   '(python main.py --demo). Untick Demo mode and scan the real network '
@@ -166,33 +168,115 @@ class ScanTab(ttk.Frame):
         if not picked:
             messagebox.showinfo('Nothing selected', 'Select at least one device.')
             return
+        if not database_ready(self):
+            self.status.config(text='Database unavailable. Nothing was saved.')
+            return
         if self.found_is_sample and not self.sample_store:     # never into the real database
             messagebox.showerror('Sample devices', SAMPLE_BLOCKED)
             return
-        saved, added, updated, links = [], 0, 0, []
+        # The shared login is checked once, before anything is saved.
+        user, password = self.user.get().strip(), self.pw.get()
+        save_login = bool(self.save_login.get()) and not self.found_is_sample and bool(user)
+        if save_login:
+            problem = validation.check_login(user, password)       # never shows the password
+            if problem:
+                messagebox.showerror('Cannot save', f'Nothing was saved. {problem}')
+                return
+        # IPs that belong to soft-deleted devices are never restored silently: find them
+        # first (read-only) and let the user decide per device.
+        deleted = []
         try:
             for d in picked:
                 # A sample device is never looked up in a real database (no SQL at all for it).
+                if not (d.get('sample') and not self.sample_store):
+                    gone = self.store.get_deleted_device_by_ip(d['ip'])
+                    if gone:
+                        deleted.append((d, gone))
+        except Exception as err:
+            report_error(self, err)
+            self.last_result = {'ok': False, 'total': len(picked), 'saved': 0, 'error': str(err)}
+            self.status.config(text='Approval failed. Nothing was saved.')
+            messagebox.showerror('Could not save', f'Nothing was saved.\n\n{err}')
+            return
+        if deleted:
+            self.restore_dialog = ScanRestoreDialog(
+                self, deleted, can_replace=save_login,
+                on_done=lambda plan: self._save_approved(picked, user, password, save_login, plan))
+            return
+        self._save_approved(picked, user, password, save_login, {})
+
+    def _save_approved(self, picked, user, password, save_login, plan):
+        """Save the approved devices. plan: {ip: {'restore': bool, 'credentials': 'keep' |
+        'replace', 'device_id': id}} for IPs of deleted devices; None = the user cancelled."""
+        if plan is None:
+            self.status.config(text='Approval cancelled. Nothing was saved.')
+            return
+        saved, restored, skipped, added, updated, links = [], [], [], 0, 0, []
+        current = None
+        try:
+            for i, d in enumerate(picked):
+                current = i
+                if d['ip'] in plan:                     # the IP of a deleted device
+                    choice = plan[d['ip']]
+                    if not choice['restore']:
+                        skipped.append(d)               # stays deleted, nothing written
+                        continue
+                    if choice['credentials'] == 'replace':
+                        self.store.restore_device(choice['device_id'], d, credentials='replace',
+                                                  username=user, password=password)
+                    else:
+                        self.store.restore_device(choice['device_id'], d, credentials='keep')
+                    saved.append(d)
+                    restored.append(d)
+                    continue
                 existed = (not (d.get('sample') and not self.sample_store)
                            and self.store.get_device_by_ip(d['ip']) is not None)
-                did = self.store.upsert_device(d)
+                # One transaction per device: the device and its login, or neither.
+                if save_login and d['managed']:
+                    self.store.save_device(None, d, user, password)
+                else:
+                    self.store.save_device(None, d)
                 saved.append(d)
                 added, updated = (added, updated + 1) if existed else (added + 1, updated)
-                if self.save_login.get() and d['managed'] and not self.found_is_sample \
-                        and self.user.get().strip():
-                    self.store.save_credentials(did, self.user.get().strip(), self.pw.get())
-            names = {d['name'] for d in picked}
+            current = None
+            names = {d['name'] for d in saved}
             links = [l for l in self.found_links if l[0] in names and l[2] in names]
             self.store.save_links(links)
         except Exception as err:
             # Never report success: say exactly what was and was not saved.
+            report_error(self, err)
+            uncertain = isinstance(err, DatabaseUnavailable) and err.uncertain
             self.last_result = {'ok': False, 'total': len(picked), 'saved': len(saved),
                                 'error': str(err)}
+            failed = picked[current] if current is not None else None
+            not_tried = picked[current + 1:] if current is not None else []
             if saved:
                 detail = (f'{len(saved)} of {len(picked)} devices were saved before the error. '
                           f'The other devices and the links between them were not saved.')
             else:
-                detail = 'Nothing was saved.'
+                detail = ('No device was confirmed as saved.' if uncertain
+                          else 'Nothing was saved.')
+            lines = []
+            if saved:
+                lines.append('Saved: ' + ', '.join(
+                    d['name'] + (' (restored)' if d in restored else '') for d in saved) + '.')
+            if failed and uncertain:
+                lines.append(f"Failed: {failed['name']}. The connection was lost while it was "
+                             f"being committed, so it may or may not have been saved.")
+            elif failed and isinstance(err, DuplicateDeviceName):
+                lines.append(f"Failed (not saved, nothing of it kept): {failed['name']}: the "
+                             f"name is already used by {err.existing['name']} "
+                             f"(ID {err.existing['id']}).")
+            elif failed:
+                lines.append(f"Failed (not saved, nothing of it kept): {failed['name']}.")
+            elif saved:
+                lines.append('The devices were saved, but saving the links between them failed.')
+            if skipped:
+                lines.append('Not restored (still deleted): '
+                             + ', '.join(d['name'] for d in skipped) + '.')
+            if not_tried:
+                lines.append('Not attempted: ' + ', '.join(d['name'] for d in not_tried) + '.')
+            detail = detail + '\n' + '\n'.join(lines) if lines else detail
             self.status.config(text=f'Approval failed. {detail}')
             messagebox.showerror('Could not save', f'{detail}\n\n{err}')
             if saved and self.on_approved:          # some data did change: refresh the lists
@@ -200,11 +284,94 @@ class ScanTab(ttk.Frame):
             return
         self.last_result = {'ok': True, 'total': len(picked), 'added': added,
                             'updated': updated, 'links': len(links)}
-        count = f"{len(picked)} device{'' if len(picked) == 1 else 's'}"
+        if restored:
+            self.last_result['restored'] = len(restored)
+        if skipped:
+            self.last_result['skipped'] = len(skipped)
+        n = len(saved)
+        count = f"{n} device{'' if n == 1 else 's'}"
         message = f'{count} registered.'
         if updated:
             message = f'{count} registered ({added} new, {updated} already registered and updated).'
+        if restored:
+            message += ' Restored: ' + ', '.join(d['name'] for d in restored) + '.'
+        if skipped:
+            message += ' Not restored (still deleted): ' + ', '.join(d['name'] for d in skipped) + '.'
         self.status.config(text=f'{message} See the Devices page.')
         messagebox.showinfo('Approved', message)
         if self.on_approved:
             self.on_approved()
+
+
+class ScanRestoreDialog(tk.Toplevel):
+    """Some discovered IPs belong to soft-deleted devices. One dialog, one row per device:
+    the user ticks which to restore and, for each ticked one, chooses explicitly whether
+    to keep that device's own saved login or use this scan's login. Nothing is preselected.
+    Cancel stops the whole approval; nothing is saved."""
+
+    def __init__(self, parent, deleted, can_replace, on_done):
+        super().__init__(parent)
+        self.deleted, self.can_replace, self.on_done = deleted, can_replace, on_done
+        self.title('Deleted devices found')
+        self.configure(padx=theme.PAD * 2, pady=theme.PAD * 2, background=theme.BG)
+        self.resizable(False, False)
+        ttk.Label(self, wraplength=520, justify='left',
+                  text=f'{len(deleted)} discovered device(s) use the IP of a device that was '
+                       f'deleted. They are not restored unless you tick them. A restored device '
+                       f'gets back its history (logs and events). Unticked ones stay deleted '
+                       f'and are not saved.').grid(row=0, column=0, columnspan=3, sticky='w',
+                                                  pady=(0, theme.PAD))
+        self.rows = []
+        for r, (found, gone) in enumerate(deleted, start=1):
+            restore, choice = tk.IntVar(value=0), tk.StringVar(value='')
+            login = 'a login is saved' if gone['has_login'] else 'no login saved'
+            ttk.Checkbutton(self, variable=restore,
+                            text=f"Restore {gone['name']} ({gone['ip']}, {gone['type']}; "
+                                 f"{login}) as {found['name']}").grid(row=r, column=0, sticky='w')
+            ttk.Radiobutton(self, text='Keep its saved login', value='keep',
+                            variable=choice).grid(row=r, column=1, sticky='w', padx=(10, 0))
+            replace = ttk.Radiobutton(self, text="Use this scan's login", value='replace',
+                                      variable=choice)
+            replace.grid(row=r, column=2, sticky='w', padx=(10, 0))
+            if not can_replace:
+                replace.state(['disabled'])
+            self.rows.append({'found': found, 'gone': gone, 'restore': restore, 'choice': choice})
+        btns = ttk.Frame(self)
+        btns.grid(row=len(deleted) + 1, column=0, columnspan=3, sticky='e', pady=(theme.PAD, 0))
+        ttk.Button(btns, text='Cancel approval', command=self.cancel).pack(side='right')
+        ttk.Button(btns, text='Continue', style='Accent.TButton',
+                   command=self.confirm).pack(side='right', padx=4)
+        self.protocol('WM_DELETE_WINDOW', self.cancel)
+        self.transient(parent.winfo_toplevel())
+        self.grab_set()
+
+    def confirm(self):
+        missing = [row['gone']['name'] for row in self.rows
+                   if row['restore'].get() and row['choice'].get() not in ('keep', 'replace')]
+        if missing:
+            messagebox.showerror('Choose a login option', 'For each device you restore, choose '
+                                 'whether to keep its saved login or use this scan\'s login: '
+                                 + ', '.join(missing) + '.', parent=self)
+            return
+        bad = [row['gone']['name'] for row in self.rows
+               if row['restore'].get() and row['choice'].get() == 'replace' and not self.can_replace]
+        if bad:
+            messagebox.showerror('No scan login', 'There is no scan login to use for: '
+                                 + ', '.join(bad) + '.', parent=self)
+            return
+        chosen = [row for row in self.rows if row['restore'].get()]
+        if chosen:
+            names = ', '.join(row['gone']['name'] for row in chosen)
+            if not messagebox.askyesno('Restore deleted devices',
+                                       f'Restore {names}?', parent=self):
+                return
+        plan = {row['found']['ip']: {'restore': bool(row['restore'].get()),
+                                     'credentials': row['choice'].get() or 'keep',
+                                     'device_id': row['gone']['id']}
+                for row in self.rows}
+        self.destroy()
+        self.on_done(plan)
+
+    def cancel(self):
+        self.destroy()
+        self.on_done(None)

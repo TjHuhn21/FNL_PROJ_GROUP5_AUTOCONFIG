@@ -30,10 +30,13 @@ from config import commands_router, commands_switch
 from config import connect, multi
 from config.interfaces import parse_ports, port_count
 from gui import theme
+from gui.db_status import database_ready, report_error
 from gui.components.device_picker import DevicePicker, plural
 from gui.components.list_editor import ListEditor, wrap_to_width
 from gui.components.scroll_frame import ScrollFrame
 from gui.components.ssh_console import SshConsole
+from security import CredentialError
+from store_errors import DATABASE_ERRORS
 
 PORT_HINT = 'One port, a range or a list: Fa0/1   Fa0/1-5   Fa0/1-Fa0/5   Fa0/1-5, Gi0/1'
 KIND_OF_TAB = ['switch', 'router']              # self.forms tab index -> configuration kind
@@ -356,12 +359,34 @@ class ConfigureTab(ttk.Frame):
     # ------------------------------------------------------------ devices
     def refresh_devices(self):
         """Offer the devices we can log in to (managed ones). Ticks are kept."""
-        self.devices = [d for d in self.store.get_devices('', 'name', 1, 1000) if d['managed']]
+        try:
+            rows = self.store.get_devices('', 'name', 1, 1000)
+        except DATABASE_ERRORS as err:
+            self.show_unavailable(str(err))
+            report_error(self, err)
+            return
+        self.devices = [d for d in rows if d['managed']]
         self.picker.set_devices(self.devices)
+        held = getattr(self, '_ticks_held', None)
+        if held is not None:                       # back after an outage: same ticks as before
+            self._ticks_held = None
+            self.picker.set_checked(held, notify=False)
         if self.devices and not self._auto_selected and not self.picker.checked:
             self._auto_selected = True             # the first time: one device, as before
             self.picker.set_checked([self.devices[0]['id']], notify=False)
         self._show_forms_for_device()
+
+    def show_unavailable(self, reason=''):
+        """The device list could not be read: offer no devices (never an old list as if
+        it were current). A run already in progress finishes; its results are still shown."""
+        if getattr(self, '_ticks_held', None) is None:
+            self._ticks_held = set(self.picker.checked)   # given back when the list returns
+        self.devices = []
+        self.picker.set_devices([])
+        self.picker.empty.config(text='Database unavailable: no device list.')
+        if not self.busy and hasattr(self, 'status'):
+            self.status.config(text='Database unavailable: the device list cannot be shown and '
+                                    'nothing can be applied until the connection is back.')
 
     def selected_devices(self):
         return self.picker.selected()
@@ -770,14 +795,29 @@ class ConfigureTab(ttk.Frame):
         return text
 
     def _collect_creds(self, devices):
-        """{device id: creds}, asking once for devices without a saved login. None = cancelled."""
-        creds, missing = {}, []
+        """{device id: creds}, asking once for devices without a usable saved login.
+        A saved login that cannot be decrypted is explained, then treated like a missing
+        one, so the user can type it for this Apply. None = cancelled."""
+        creds, missing, unreadable = {}, [], []
         for d in devices:
-            user, password = self.store.get_credentials(d['id'])
+            try:
+                user, password = self.store.get_credentials(d['id'])
+            except CredentialError:
+                unreadable.append(d)
+                missing.append(d)
+                continue
             if user:
                 creds[d['id']] = {'host': d['ip'], 'username': user, 'password': password}
             else:
                 missing.append(d)
+        if unreadable:                       # names only: never the login, the key or the stored value
+            names = ', '.join(d['name'] for d in unreadable)
+            messagebox.showwarning(
+                'Saved login cannot be read',
+                f"The saved login for {names} could not be decrypted (the encryption key may "
+                f"have changed).\n\nYou can type the login now; it is used for this Apply only "
+                f"and is not saved. To save it again, edit the device under Devices.",
+                parent=self)
         if missing:
             who = missing[0]['name'] if len(missing) == 1 else \
                 f"{len(missing)} devices without a saved login ({', '.join(d['name'] for d in missing)})"
@@ -805,10 +845,18 @@ class ConfigureTab(ttk.Frame):
             else:
                 messagebox.showerror('Cannot apply', '\n'.join(problems))
             return
+        if not database_ready(self):        # logins and the result log live in the database
+            return
         if not messagebox.askyesno('Apply to devices' if len(jobs) > 1 else 'Apply to device',
                                    self._confirm_text(jobs)):
             return
-        creds = self._collect_creds([j['device'] for j in jobs])
+        try:
+            creds = self._collect_creds([j['device'] for j in jobs])
+        except DATABASE_ERRORS as err:
+            report_error(self, err)
+            messagebox.showerror('Cannot apply', f'The saved logins could not be read, so '
+                                                 f'nothing was sent to any device. {err}')
+            return
         if not creds:
             return
         for j in jobs:
@@ -879,6 +927,7 @@ class ConfigureTab(ttk.Frame):
             self.store.add_log(d['id'], 'Configuration', 'success' if r['ok'] else 'failed',
                                r['message'])
         except Exception as err:
+            report_error(self, err)
             r['message'] += f'  (could not write the log: {err})'
         self.log('configure', f"{d['name']}: {r['status']}. {r['message']}",
                  'ok' if r['ok'] else 'error')

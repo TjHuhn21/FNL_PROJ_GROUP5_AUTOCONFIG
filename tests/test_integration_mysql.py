@@ -1,6 +1,7 @@
 """Whole app on REAL MySQL with the fake lab instead of real switches.
-Runs only with NETCOMMAND_TEST_DB=1 (it WIPES the tables). Needs a display
-(on Linux: xvfb-run python -m pytest tests/test_integration_mysql.py)."""
+Runs only with NETCOMMAND_TEST_DB=1 (it WIPES the tables), and only on a separate test
+database: DB_NAME must be set in the shell to a name ending in '_test' (mysql_guard).
+Needs a display (on Linux: xvfb-run python -m pytest tests/test_integration_mysql.py)."""
 import os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
@@ -25,6 +26,8 @@ def pump(root, cond, timeout=10):
 
 
 def test_scan_register_review_configure_on_mysql(monkeypatch):
+    import mysql_guard
+    mysql_guard.fail_unless_test_database()       # BEFORE any connection or DELETE
     import db
     from cryptography.fernet import Fernet
     from config import connect

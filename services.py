@@ -1,5 +1,6 @@
 """Glue between the tabs and the other parts (kept out of the GUI code)."""
 import sample_data
+from security import CredentialError
 
 
 NO_DEVICES = 'No registered devices yet'
@@ -28,7 +29,12 @@ def fetch_configs(store, devices):
     for d in devices:
         if not d.get('managed'):
             continue
-        user, pw = store.get_credentials(d['id'])
+        try:
+            user, pw = store.get_credentials(d['id'])
+        except CredentialError:              # only this device is skipped; the review goes on
+            notes.append(f"{d['name']}: saved login could not be decrypted (the encryption key "
+                         f"may have changed), skipped. Re-enter its login under Devices")
+            continue
         if not user:
             notes.append(f"{d['name']}: no saved login, skipped")
             continue

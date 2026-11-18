@@ -4,5 +4,5 @@ python-dotenv
 cryptography
 networkx
 matplotlib
-pytest
+pytest>=8,<9    # pytest 9 does not run on this project's Python 3.10.0
 customtkinter==5.2.2

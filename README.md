@@ -12,20 +12,37 @@ Scan -> review found devices -> Approve -> Devices (database)
 
 ## Install
 
-1. Python 3.10 to 3.12 (tick "Add to PATH"). Git. MySQL Server + Workbench (Part 2).
+1. Python 3.10 to 3.12 (tick "Add to PATH"). Git. MySQL Community Server 8.4 (LTS).
 2. ```
    python -m venv venv
    venv\Scripts\activate          (Mac/Linux: source venv/bin/activate)
    pip install -r requirements.txt
    ```
-3. Database: open `schema.sql` in Workbench as root, **change the password on the
-   `CREATE USER` line**, and run it. The app connects as the limited `netcommand` user.
-4. Copy `.env.example` to `.env` and fill in the `DB_` lines. Then make the encryption key
+3. Database (MySQL 8.4, done once by the database administrator):
+   * MySQL listens on **127.0.0.1, port 3307** (a non-default port, so it does not clash
+     with another MySQL/MariaDB on 3306).
+   * Create the `netcommand` database and a restricted application account,
+     `netcommand_app`, with privileges on `netcommand.*` only (no global privileges, never
+     root). The app connects with this account, so a leaked app password cannot touch other
+     databases or administer the server. Creating the tables also needs the `REFERENCES`
+     privilege (three tables have foreign keys), unless the administrator creates them.
+   * Create the tables with the tables-only `schema.sql` (it creates no users and changes
+     no existing table or data). The app does **not** create tables by itself:
+     ```
+     mysql -h 127.0.0.1 -P 3307 -u netcommand_app -p netcommand < schema.sql
+     ```
+     (`-p` asks for the password; never put it on the command line.)
+4. Copy `.env.example` to `.env` **on your own computer** and fill in the `DB_` lines
+   (`DB_HOST=127.0.0.1`, `DB_PORT=3307`, `DB_USER=netcommand_app`, your password,
+   `DB_NAME=netcommand`). `.env` is excluded from Git and must never be committed.
+   Then make the encryption key
    (it is written straight into `.env` and never shown, so it cannot be cut short by copy-paste):
    ```
    python security.py --new-key     # refuses if Git could expose .env, or if a valid key is already there
    python security.py --check       # FERNET_KEY is valid (read from the .env file).
    ```
+   `FERNET_KEY` encrypts and decrypts the device logins stored in the database, so it must stay
+   the same: with a different key the saved logins can no longer be read.
    Everyone sharing a database needs the **same** `FERNET_KEY`: send the `.env` line privately.
    Never commit `.env`. A `FERNET_KEY` environment variable, if set, is used before `.env`.
    The app also checks the key at startup and warns (but keeps running) if it is missing or invalid.
@@ -62,7 +79,9 @@ images, use Packet Tracer for the topology screenshot and demo mode for the app 
 
 ```
 python -m pytest -q                       # unit tests (no lab, no MySQL needed)
-NETCOMMAND_TEST_DB=1 python -m pytest -q  # also tests db.py against MySQL (WIPES the tables!)
+NETCOMMAND_TEST_DB=1 python -m pytest -q  # also tests db.py against MySQL (WIPES the tables!
+                                          # only ever point .env at a separate test database
+                                          # for this, never at the real netcommand database)
 xvfb-run python -m pytest tests/test_gui.py   # Linux without a display; on Windows the GUI tests just run
 ```
 

@@ -14,12 +14,16 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from gui import theme
+from gui.db_status import report_error
 from gui.topology_canvas import TopologyCanvas
 from topology.graph import build_graph, draw_map, find_single_points
 from topology.layout_store import LayoutStore
+from store_errors import DATABASE_ERRORS
 
 EMPTY_MESSAGE = ('No registered devices yet.\n'
                  'Run a scan and approve the devices you find to see your network here.')
+UNAVAILABLE_MESSAGE = ('Database unavailable: the map cannot be shown right now.\n'
+                       'It is redrawn when the connection is back.')
 SAMPLE_BANNER = 'SAMPLE DATA: example network, not your registered devices'
 DEFAULT_SIZE = (900, 520)        # used before the page has been laid out
 RESIZE_DELAY_MS = 250
@@ -87,7 +91,12 @@ class TopologyTab(ttk.Frame):
 
     # ---------------------------------------------------------------- loading
     def refresh(self):
-        devices, links, source = self.get_data()
+        try:
+            devices, links, source = self.get_data()
+        except DATABASE_ERRORS as err:
+            self.show_unavailable(str(err))
+            report_error(self, err)
+            return
         self._data = (devices, links, source)
         is_sample = source.startswith('SAMPLE')
         self.source.config(text=source, style='Sample.TLabel' if is_sample else 'TLabel')
@@ -105,6 +114,17 @@ class TopologyTab(ttk.Frame):
         points = find_single_points(devices, links)
         self.single.config(text=('Single points of failure: ' + ', '.join(points))
                            if points else '')
+
+    def show_unavailable(self, reason=''):
+        """The devices could not be read: show no map at all (never the old one as if it
+        were current). Saved layouts are not touched."""
+        self._data = ([], [], 'Database unavailable')
+        self.source.config(text='Database unavailable', style='TLabel')
+        self.interactive.load([], [], sample=False, empty_text=UNAVAILABLE_MESSAGE)
+        self._set_state(None)
+        self.img, self.shown_names, self.drawn_size = None, [], None
+        self.label.config(image='', text=UNAVAILABLE_MESSAGE)
+        self.single.config(text='')
 
     # ---------------------------------------------------------------- saved layouts
     def device_key(self, name):

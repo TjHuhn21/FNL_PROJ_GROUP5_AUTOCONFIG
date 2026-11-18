@@ -79,6 +79,17 @@ def _fernet():
 
 
 # ---------------------------------------------------------------- encrypting
+class CredentialError(RuntimeError):
+    """A saved login cannot be read: the stored value is damaged, or FERNET_KEY is missing,
+    invalid or different from the key that encrypted it. The message never contains the
+    key, the stored value or the password. It is a RuntimeError, so code that already
+    catches RuntimeError keeps working."""
+
+
+DECRYPT_FAILED = ('A saved login could not be decrypted with the current FERNET_KEY '
+                  '(the key was changed). Edit the device and enter its login again.')
+
+
 def encrypt(text):
     return _fernet().encrypt(text.encode()).decode()
 
@@ -86,11 +97,13 @@ def encrypt(text):
 def decrypt(token):
     from cryptography.fernet import InvalidToken
     try:
-        return _fernet().decrypt(token.encode()).decode()
-    except InvalidToken:                  # its own message is empty, so say what happened
-        raise RuntimeError('A saved login could not be decrypted with the current FERNET_KEY '
-                           '(the key was changed). Edit the device and enter its login '
-                           'again.') from None
+        fernet = _fernet()
+    except RuntimeError as err:           # key missing/invalid: _key_problem's text has no key in it
+        raise CredentialError(str(err)) from None
+    try:
+        return fernet.decrypt(str(token).encode()).decode()
+    except (InvalidToken, UnicodeError):  # wrong key or damaged value; InvalidToken's text is empty
+        raise CredentialError(DECRYPT_FAILED) from None
 
 
 # ---------------------------------------------------------------- making a new key
