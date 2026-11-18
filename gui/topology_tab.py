@@ -27,6 +27,24 @@ UNAVAILABLE_MESSAGE = ('Database unavailable: the map cannot be shown right now.
 SAMPLE_BANNER = 'SAMPLE DATA: example network, not your registered devices'
 DEFAULT_SIZE = (900, 520)        # used before the page has been laid out
 RESIZE_DELAY_MS = 250
+RENDER_PREFIX = 'netcommand_topology_'   # + a unique part per render (tempfile.mkstemp)
+
+
+def map_error_text(err):
+    """The reason a map failed, never blank: some exceptions have an empty message."""
+    message = str(err).strip()
+    name = type(err).__name__
+    return f'{name}: {message}' if message else f'{name} (no further details were given)'
+
+
+def remove_render_file(path):
+    """Remove one render's own temporary PNG. A file that cannot be removed right now
+    (for example briefly locked by a virus scanner) is left in the temp folder; its name
+    is unique, so it can never be confused with another render's file."""
+    try:
+        os.remove(path)
+    except OSError:                  # already gone, or locked for a moment: nothing to do
+        pass
 
 
 class TopologyTab(ttk.Frame):
@@ -234,17 +252,26 @@ class TopologyTab(ttk.Frame):
         return (w, h) if w > 200 and h > 150 else DEFAULT_SIZE
 
     def _render(self):
+        """Draw the static map. Each render uses its OWN new temporary PNG (created
+        exclusively by mkstemp), so two renders, in this window or in another NetCommand
+        process, can never overwrite or read each other's file. Tk reads the whole image
+        when PhotoImage is created, so the file is removed right after, also on failure.
+        A failed render keeps the previous map."""
         devices, links, source = self._data
         size = self._area_size()
         dpi = float(self.tk.call('tk', 'scaling')) * 72      # text the same size as the app's
-        path = os.path.join(tempfile.gettempdir(), 'netcommand_topology.png')
+        fd, path = tempfile.mkstemp(prefix=RENDER_PREFIX, suffix='.png')
+        os.close(fd)                                          # draw_map writes it by name
         try:
             draw_map(devices, links, path, size=size, dpi=dpi,
                      banner=SAMPLE_BANNER if source.startswith('SAMPLE') else None)
-            self.img = tk.PhotoImage(file=path)   # keep a reference, or it vanishes
+            img = tk.PhotoImage(file=path)   # read completely now
         except Exception as err:
-            messagebox.showerror('Map failed', str(err))
+            messagebox.showerror('Map failed', map_error_text(err))
             return
+        finally:
+            remove_render_file(path)         # only this render's own file
+        self.img = img                       # keep a reference, or it vanishes
         self.label.config(image=self.img, text='')
         self.drawn_size = size
         self.shown_names = list(build_graph(devices, links).nodes)
