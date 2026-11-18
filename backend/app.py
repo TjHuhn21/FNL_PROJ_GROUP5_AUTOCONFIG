@@ -1,6 +1,9 @@
 """The NetCommand backend application (FastAPI).
 
-Phase 4B: only GET /health. No database, no authentication, no email yet.
+  GET /health   liveness only: the process is running (never touches the database)
+  GET /ready    readiness: the runtime account can reach the database and the schema
+                matches this code (read-only; backend/database/health.py)
+No authentication or email yet, and migrations never run on startup.
 
 Start it with:  python -m backend          (see backend/README.md)
 Or with uvicorn directly:  uvicorn --factory backend.app:app_factory
@@ -53,6 +56,17 @@ def create_app(settings: Settings = None, *, setup_logging=False):
         """The backend process is running. Touches no database or other service and
         reveals nothing about the system."""
         return {'status': 'ok'}
+
+    @app.get('/ready', tags=['health'], responses={503: {'description': 'Not ready'}})
+    def ready():
+        """Can the backend use its database? 200 {"status": "ready"}, or 503 with a
+        generic reason code. Read-only (runtime account, SELECT only); never migrates.
+        The database code is imported here, not at module import, so GET /health never
+        loads it."""
+        from backend.database.health import check_database
+        result = check_database(app.state.settings)
+        return JSONResponse(status_code=200 if result.ready else 503, content=result.public(),
+                            headers={'Cache-Control': 'no-store'})
 
     return app
 

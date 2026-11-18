@@ -109,6 +109,9 @@ class Settings:
     smtp: SmtpSettings = None                   # None unless BACKEND_SMTP_ENABLED=true
     fernet_key: Secret = field(default=None, repr=False)
     otp_pepper: Secret = field(default=None, repr=False)
+    # The MIGRATION account (python -m backend.database.migrate only; never the web app).
+    migrate_user: str = ''
+    migrate_password: Secret = field(default=None, repr=False)
 
     @property
     def docs_enabled(self):
@@ -116,7 +119,8 @@ class Settings:
 
     def secret_values(self):
         """Every secret value that is set (for the logging redaction filter)."""
-        found = [s.reveal() for s in (self.fernet_key, self.otp_pepper) if s]
+        found = [s.reveal() for s in (self.fernet_key, self.otp_pepper,
+                                      self.migrate_password) if s]
         for group in (self.database, self.smtp):
             if group is not None and group.password:
                 found.append(group.password.reveal())
@@ -239,11 +243,19 @@ def parse_settings(raw):
             problems.append(f'{PREFIX}OTP_PEPPER must be at least {OTP_PEPPER_MIN_LENGTH} '
                             f'characters.')
 
+    migrate_user = text('MIGRATE_USER')
+    migrate_password = Secret(get('MIGRATE_PASSWORD')) if get('MIGRATE_PASSWORD') else None
+    if (migrate_user and database is not None and database.user
+            and migrate_user.lower() == database.user.lower()):
+        problems.append(f'{PREFIX}MIGRATE_USER must be a different account from {PREFIX}DB_USER '
+                        f'(the runtime account must not be able to create or drop tables).')
+
     if problems:
         raise SettingsError(problems)
     return Settings(environment=environment, host=bind_host, port=bind_port,
                     log_level=log_level, database=database, smtp=smtp,
-                    fernet_key=fernet_key, otp_pepper=otp_pepper)
+                    fernet_key=fernet_key, otp_pepper=otp_pepper,
+                    migrate_user=migrate_user, migrate_password=migrate_password)
 
 
 def _valid_fernet_key(value):
