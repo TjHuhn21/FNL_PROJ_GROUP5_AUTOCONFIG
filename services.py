@@ -1,5 +1,6 @@
 """Glue between the tabs and the other parts (kept out of the GUI code)."""
 import sample_data
+import ssh_options
 from security import CredentialError
 
 
@@ -41,8 +42,9 @@ def fetch_configs(store, devices):
         try:
             configs[d['name']] = get_config({'host': d['ip'], 'username': user,
                                              'password': pw})
-        except Exception as err:
-            notes.append(f"{d['name']}: {type(err).__name__}, skipped")
+        except Exception as err:            # fixed text from ssh_options, never err's own text
+            _, reason = ssh_options.describe_error(err, d['ip'])
+            notes.append(f"{d['name']}: {reason}, skipped")
     return configs, notes
 
 
@@ -61,8 +63,10 @@ def collect_review_inputs(store, demo=False):
     return devices, links, configs, notes, source
 
 
-def run_discovery(username, password, seed_ip, demo):
+def run_discovery(username, password, seed_ip, demo, login_neighbours=False):
+    """Demo: the sample network. Otherwise a real scan from the seed IP (required):
+    only the seed is logged in to, unless login_neighbours is explicitly True."""
     from discovery import crawler
     if demo:
         return crawler.discover_demo()
-    return crawler.discover(username, password, seed_ip)
+    return crawler.discover(username, password, seed_ip, login_neighbours=login_neighbours)

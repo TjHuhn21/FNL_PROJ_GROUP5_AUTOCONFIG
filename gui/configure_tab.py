@@ -17,13 +17,22 @@ devices one after the other through config.multi.run_devices, which calls
 apply_config for each: every device gets its own backup, checks and save. The
 SSH session console shows each device's real commands and replies; the worker
 thread only posts into queues, and only the window's own thread touches widgets.
+
+After an Apply, what SUCCEEDED (applied, verified and saved) is done:
+  * a `hostname X` a device accepted renames that device in the device list (same record,
+    so its links, findings and history stay with it);
+  * the form sections the preview was built from are cleared - only when every device in
+    the preview succeeded, the preview was not edited by hand, and the fields still hold
+    the values that were previewed; and the applied sections leave the preview.
+Anything that failed, was only partly applied or could not be verified keeps its inputs
+and its preview section, so it can be corrected and retried.
 """
 import inspect
 import queue
 import re
 import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 
 import validation
 from config import commands_router, commands_switch
@@ -32,13 +41,39 @@ from config.interfaces import parse_ports, port_count
 from gui import theme
 from gui.db_status import database_ready, report_error
 from gui.components.device_picker import DevicePicker, plural
+from gui.components import login_dialog
 from gui.components.list_editor import ListEditor, wrap_to_width
 from gui.components.scroll_frame import ScrollFrame
 from gui.components.ssh_console import SshConsole
 from security import CredentialError
-from store_errors import DATABASE_ERRORS
+from store_errors import DATABASE_ERRORS, DuplicateDeviceName
 
-PORT_HINT = 'One port, a range or a list: Fa0/1   Fa0/1-5   Fa0/1-Fa0/5   Fa0/1-5, Gi0/1'
+_HOSTNAME_COMMAND = re.compile(r'^\s*hostname\s+(\S+)\s*$', re.IGNORECASE)
+
+
+def login_refused(result):
+    """The device refused the SSH login (so nothing was changed on it)."""
+    return result['status'] == multi.FAILED and \
+        (result.get('message') or '').startswith('Wrong username or password')
+
+
+def login_worked(result):
+    """The device accepted the SSH login (whatever happened to the commands after it)."""
+    return result['status'] in (multi.SUCCESS, multi.PARTIAL, multi.NOT_VERIFIED) or \
+        'The device rejected a command' in (result.get('message') or '')
+
+
+def applied_hostname(commands):
+    """The hostname the last `hostname X` command sets, or None."""
+    name = None
+    for command in commands or ():
+        m = _HOSTNAME_COMMAND.match(command)
+        if m:
+            name = m.group(1)
+    return name
+
+
+PORT_HINT ='One port, a range or a list: Fa0/1   Fa0/1-5   Fa0/1-Fa0/5   Fa0/1-5, Gi0/1'
 KIND_OF_TAB = ['switch', 'router']              # self.forms tab index -> configuration kind
 # '# ===== SW1  10.0.0.2  switch  |  Switch settings =====' starts a device's section
 HEADER = re.compile(r'^#\s*=====\s*(\S+)\s+(\S+)\s+(\S+)\s+\|\s*(.+?)\s*=====\s*$')
@@ -87,11 +122,21 @@ def _caption(parent, text):
 
 
 class ConfigureTab(ttk.Frame):
-    def __init__(self, parent, store, log=None):
-        """log(source, message, level): the workbench console, for one-line summaries."""
+    def __init__(self, parent, store, log=None, on_change=None, on_applied=None):
+        """log(source, message, level): the workbench console, for one-line summaries.
+        on_change(): called after an Apply changed device data (a renamed device), so
+        the other pages (Devices, inspector...) show the new data.
+        on_applied(): called after every finished Apply (new configuration log entries)."""
         super().__init__(parent, padding=(theme.PAD, 4, theme.PAD, theme.PAD))
         self.store = store
         self.log = log or (lambda *a, **k: None)
+        self.on_change = on_change or (lambda: None)
+        self.on_applied = on_applied or (lambda: None)
+        self._pending = None                      # what the current preview was built from
+        self._applied = {}                        # device id -> edited?, SUCCESS since Preview
+        self._jobs = {}                           # device id -> job of the running Apply
+        self._pending_saves = {}                  # device id -> (user, password) to save if accepted
+        self._cred_source = {}                    # device id -> 'saved' / 'typed' (this Apply)
         self.apply_fn = connect.apply_config      # tests replace this with a fake
         self.results = queue.Queue()
         self.busy = False
@@ -672,6 +717,10 @@ class ConfigureTab(ttk.Frame):
             else:
                 lines.append(('#   no automatic check for these commands', 'comment'))
             self._built[d['id']] = (list(commands), list(checks))
+        sections = self._sections(kind)
+        self._applied = {}                        # a new preview: nothing applied yet
+        self._pending = {'kind': kind, 'targets': {d['id'] for d in targets},
+                         'values': {f: sections[f][0]() for f in features if f in sections}}
         self._set_preview_lines(lines)
         text = f'{len(commands)} commands for {plural(len(targets), "device")}'
         if skipped:
@@ -720,6 +769,8 @@ class ConfigureTab(ttk.Frame):
         else:
             self._set_preview(commands)
             self._built = {}
+        self._pending = None                      # not built from the forms
+        self._applied = {}
         self.status.config(text=f'Loaded {len(commands)} suggested lines for {device_name}. '
                                 f'Check and edit them, then click Apply.')
 
@@ -795,10 +846,13 @@ class ConfigureTab(ttk.Frame):
         return text
 
     def _collect_creds(self, devices):
-        """{device id: creds}, asking once for devices without a usable saved login.
-        A saved login that cannot be decrypted is explained, then treated like a missing
-        one, so the user can type it for this Apply. None = cancelled."""
+        """{device id: creds}. Saved logins are used as they are; for devices without a
+        usable saved login, ONE dialog (gui.components.login_dialog) asks for the login.
+        A saved login that cannot be decrypted is explained in that dialog. A login the
+        user asks to save is remembered in self._pending_saves and saved only after the
+        device accepted it (see _save_confirmed_logins). None = cancelled."""
         creds, missing, unreadable = {}, [], []
+        self._cred_source = {}
         for d in devices:
             try:
                 user, password = self.store.get_credentials(d['id'])
@@ -808,29 +862,32 @@ class ConfigureTab(ttk.Frame):
                 continue
             if user:
                 creds[d['id']] = {'host': d['ip'], 'username': user, 'password': password}
+                self._cred_source[d['id']] = 'saved'
             else:
                 missing.append(d)
-        if unreadable:                       # names only: never the login, the key or the stored value
-            names = ', '.join(d['name'] for d in unreadable)
-            messagebox.showwarning(
-                'Saved login cannot be read',
-                f"The saved login for {names} could not be decrypted (the encryption key may "
-                f"have changed).\n\nYou can type the login now; it is used for this Apply only "
-                f"and is not saved. To save it again, edit the device under Devices.",
-                parent=self)
         if missing:
-            who = missing[0]['name'] if len(missing) == 1 else \
-                f"{len(missing)} devices without a saved login ({', '.join(d['name'] for d in missing)})"
-            user = simpledialog.askstring('Login', f'Username for {who}:', parent=self)
-            if not user:
+            typed = self._ask_login(missing, 'unreadable' if unreadable else 'missing',
+                                    replaces=unreadable)
+            if typed is None:
                 return None
-            password = simpledialog.askstring('Login', f'Password for {who}:', show='*',
-                                              parent=self)
-            if password is None:
-                return None
-            for d in missing:
-                creds[d['id']] = {'host': d['ip'], 'username': user, 'password': password}
+            creds.update(typed)
         return creds
+
+    def _ask_login(self, devices, reason, replaces=()):
+        """Ask for one login for these devices. {device id: creds}, or None (cancelled)."""
+        answer = login_dialog.ask_device_login(self, devices, reason=reason, replaces=replaces)
+        if not answer:
+            return None
+        out = {}
+        for d in devices:
+            out[d['id']] = {'host': d['ip'], 'username': answer['username'],
+                            'password': answer['password']}
+            self._cred_source[d['id']] = 'typed'
+            if answer.get('save'):
+                self._pending_saves[d['id']] = (answer['username'], answer['password'])
+            else:
+                self._pending_saves.pop(d['id'], None)
+        return out
 
     def apply(self):
         if self.busy:
@@ -850,6 +907,7 @@ class ConfigureTab(ttk.Frame):
         if not messagebox.askyesno('Apply to devices' if len(jobs) > 1 else 'Apply to device',
                                    self._confirm_text(jobs)):
             return
+        self._pending_saves = {}
         try:
             creds = self._collect_creds([j['device'] for j in jobs])
         except DATABASE_ERRORS as err:
@@ -858,6 +916,7 @@ class ConfigureTab(ttk.Frame):
                                                  f'nothing was sent to any device. {err}')
             return
         if not creds:
+            self.status.config(text='Apply cancelled: no login was entered. Nothing was sent.')
             return
         for j in jobs:
             j['creds'] = creds[j['device']['id']]
@@ -865,6 +924,11 @@ class ConfigureTab(ttk.Frame):
         kind = self.config_kind()
         self._skipped = [(d, multi.incompatibility(d, kind) or 'not in the preview')
                          for d in self.selected_devices() if d['id'] not in targets]
+        self._start(jobs)
+
+    def _start(self, jobs):
+        """Run the jobs (each with its 'creds') in the background thread."""
+        self._jobs = {j['device']['id']: j for j in jobs}
         self.busy = True
         self._stop = threading.Event()
         self._expected = len(jobs)
@@ -946,6 +1010,12 @@ class ConfigureTab(ttk.Frame):
                 self.session.post(kind, line)
         self.session.flush()
         self.last_results = results
+        refused = [self._jobs[r['device']['id']] for r in results
+                   if login_refused(r) and r['device']['id'] in self._jobs]
+        if results:
+            self._after_apply(results)
+            self._save_confirmed_logins(results)
+            self.on_applied()
         if not results:
             self.status.config(text='The change did not complete. See the SSH session.')
             messagebox.showerror('Apply failed', 'Something went wrong before any device was '
@@ -956,19 +1026,229 @@ class ConfigureTab(ttk.Frame):
             r = results[0]
             self.status.config(text='Done.' if r['ok'] else
                                'The change did not complete. See the SSH session.')
-            if not r['ok']:
+            if not r['ok'] and not refused:            # a refused login gets the retry question
                 messagebox.showerror('Apply failed', r['message'])
+        else:
+            text = f"{c['completed']} of {c['total']} devices configured"
+            if c['failed']:
+                text += f", {c['failed']} failed"
+            if c['not_run']:
+                text += f", {c['not_run']} not run"
+            self.status.config(text=text + '. The summary is in the SSH session.')
+            self.log('configure', text + '.', 'ok' if c['completed'] == c['total'] else 'error')
+            if c['completed'] != c['total']:
+                messagebox.showerror('Some devices were not configured',
+                                     multi.summary_text(results, skipped))
+        if refused:
+            self._offer_login_retry(refused)
+
+    # ------------------------------------------------------------ logins after an Apply
+    def _save_confirmed_logins(self, results):
+        """Save the logins the user asked to save, but only for devices that accepted
+        them. Uses the store's normal save (validated, encrypted, one transaction)."""
+        for r in results:
+            pending = self._pending_saves.pop(r['device']['id'], None)
+            if not pending:
+                continue
+            if not login_worked(r):
+                self.log('configure', f"{r['device']['name']}: the typed login was not saved "
+                                      f"because the device did not accept it.", 'warn')
+                continue
+            self._save_login(r['device'], *pending)
+
+    def _save_login(self, device, username, password):
+        name = device['name']
+        try:
+            current = self.store.get_device(device['id'])
+            if current is None:
+                self.log('configure', f'{name}: the device is no longer registered, so its '
+                                      f'login was not saved.', 'warn')
+                return False
+            data = {'name': current['name'], 'ip': current['ip'], 'type': current['type'],
+                    'status': current['status'], 'managed': current['managed']}
+            self.store.save_device(device['id'], data, username, password)
+        except DATABASE_ERRORS as err:
+            report_error(self, err)
+            self.log('configure', f'{name}: the login could not be saved ({err}). It was used '
+                                  f'for this Apply only.', 'warn')
+            return False
+        except Exception as err:                    # e.g. an encryption key problem
+            self.log('configure', f'{name}: the login could not be saved '
+                                  f'({type(err).__name__}). It was used for this Apply only.',
+                     'warn')
+            return False
+        self._cred_source[device['id']] = 'saved'
+        self.log('configure', f'{name}: SSH login saved (encrypted) for future use.', 'ok')
+        return True
+
+    def _offer_login_retry(self, jobs):
+        """Some devices refused the SSH login (nothing was changed on them): offer to
+        enter the login again and run those devices once more."""
+        devices = [j['device'] for j in jobs]
+        names = ', '.join(d['name'] for d in devices)
+        it = 'them' if len(devices) > 1 else 'it'
+        if not messagebox.askyesno(
+                'SSH login refused',
+                f'{names} refused the SSH login, so nothing was changed on {it}.\n\n'
+                f'Enter the login again and retry {it}?', parent=self):
+            self.log('configure', f'The SSH login was refused by {names}; not retried. Nothing '
+                                  f'was changed on {it}.', 'warn')
             return
-        text = f"{c['completed']} of {c['total']} devices configured"
-        if c['failed']:
-            text += f", {c['failed']} failed"
-        if c['not_run']:
-            text += f", {c['not_run']} not run"
-        self.status.config(text=text + '. The summary is in the SSH session.')
-        self.log('configure', text + '.', 'ok' if c['completed'] == c['total'] else 'error')
-        if c['completed'] != c['total']:
-            messagebox.showerror('Some devices were not configured',
-                                 multi.summary_text(results, skipped))
+        replaces = [d for d in devices if self._cred_source.get(d['id']) == 'saved']
+        typed = self._ask_login(devices, 'refused', replaces=replaces)
+        if typed is None:
+            self.log('configure', f'Retry for {names} cancelled. Nothing was sent.', 'warn')
+            return
+        for j in jobs:
+            j['creds'] = typed[j['device']['id']]
+        self._skipped = []
+        self._start(jobs)
+
+    # ------------------------------------------------------------ after an Apply
+    def _sections(self, kind):
+        """{feature name (as in the preview): (read its inputs, clear them)} for one kind."""
+        def var(v):
+            return v.get, lambda: v.set('')
+
+        def editor(e):
+            def clear():
+                e.items.clear()
+                e.show()
+            return (lambda: [dict(i) for i in e.items]), clear
+
+        if kind == 'router':
+            def clear_dhcp():
+                for v in self.dhcp.values():
+                    v.set('')
+            return {'Hostname': var(self.hostname), 'Default route': var(self.default_route),
+                    'DNS servers': var(self.dns_servers), 'NTP': var(self.ntp_server),
+                    'DHCP': ((lambda: {k: v.get() for k, v in self.dhcp.items()}), clear_dhcp),
+                    'Interfaces': editor(self.router_if_editor),
+                    'Static routes': editor(self.route_editor)}
+
+        def clear_vlans():
+            self.vlans = []
+            self._show_lists()
+
+        def clear_ports():
+            self.ports = []
+            self._show_lists()
+        return {'VLANs': ((lambda: list(self.vlans)), clear_vlans),
+                'Access ports': ((lambda: list(self.ports)), clear_ports),
+                'Trunk ports': editor(self.trunk_editor),
+                'Port security': editor(self.security_editor),
+                'Interface settings': editor(self.switch_if_editor)}
+
+    def _after_apply(self, results):
+        """What succeeded is done: rename devices whose hostname changed, clear the form
+        sections that were applied, and take the applied devices out of the preview.
+        Failed, partly applied or unverified results keep everything for a retry."""
+        jobs = self._jobs or {}
+        done = [r for r in results if r['status'] == multi.SUCCESS]
+        renamed = False
+        for r in done:
+            job = jobs.get(r['device']['id'])
+            self._applied[r['device']['id']] = job.get('edited', True) if job else True
+            new_name = applied_hostname(job['commands']) if job else None
+            if new_name and new_name != r['device']['name']:
+                renamed = self._rename_device(r['device'], new_name) or renamed
+        cleared = self._clear_applied_sections()
+        self._drop_applied_from_preview(done, cleared=cleared)
+        self._jobs = {}
+        if renamed:
+            self.on_change()                  # Devices, inspector, status bar, this picker
+        return cleared
+
+    def _rename_device(self, device, new_name):
+        """The device accepted `hostname new_name`: give its record the same name. The same
+        record (same id) is updated, so links, findings and history stay with it. Never
+        raises: a name that cannot be used is reported, and the record is left as it was."""
+        old = device['name']
+        keep = f'The device list keeps the name {old}; you can rename it on the Devices page.'
+        problem = validation.check_name(new_name)
+        if problem:
+            self.log('configure', f'{old}: the hostname is now {new_name}, but it cannot be used '
+                                  f'as a device name here ({problem}). {keep}', 'warn')
+            return False
+        try:
+            current = self.store.get_device(device['id'])
+            if current is None:
+                self.log('configure', f'{old}: the device is no longer registered, so its new '
+                                      f'hostname {new_name} was not recorded.', 'warn')
+                return False
+            data = {'name': new_name, 'ip': current['ip'], 'type': current['type'],
+                    'status': current['status'], 'managed': current['managed']}
+            self.store.save_device(device['id'], data)
+        except DuplicateDeviceName:
+            self.log('configure', f'{old}: the hostname is now {new_name}, but another registered '
+                                  f'device already uses that name. {keep}', 'warn')
+            return False
+        except DATABASE_ERRORS as err:
+            report_error(self, err)
+            self.log('configure', f'{old}: the new hostname {new_name} could not be saved in the '
+                                  f'device list ({err}). {keep}', 'warn')
+            return False
+        except ValueError as err:
+            self.log('configure', f'{old}: the new hostname {new_name} could not be saved in the '
+                                  f'device list ({err}). {keep}', 'warn')
+            return False
+        self.log('configure', f'{old} is now {new_name} (hostname applied; same device record, '
+                              f'links and history kept).', 'ok')
+        return True
+
+    def _clear_applied_sections(self):
+        """Clear the form sections the applied preview was built from. Only when EVERY
+        device the preview was built for has succeeded since that Preview (in this Apply,
+        or in a retry after a refused login) with exactly the previewed commands, and only
+        the sections whose fields still hold the previewed values (anything typed since
+        then is a new, pending change). Returns the cleared section names."""
+        pending = self._pending
+        if not pending or not pending['values']:
+            return []
+        if not pending['targets'] or not pending['targets'] <= set(self._applied):
+            return []                                       # failed / partial / not run: keep
+        if any(self._applied[i] for i in pending['targets']):
+            return []                                       # edited by hand: not the forms' commands
+        sections = self._sections(pending['kind'])
+        cleared = []
+        for feature, value in pending['values'].items():
+            read, clear = sections[feature]
+            if read() == value:
+                clear()
+                cleared.append(feature)
+        self._pending = None
+        return cleared
+
+    def _drop_applied_from_preview(self, done, cleared):
+        """The preview shows only what is still pending: the sections of the devices that
+        succeeded leave it; when no device section is left, a short note replaces it."""
+        if not done:
+            return
+        names = {r['device']['name'] for r in done}
+        ids = {r['device']['id'] for r in done}
+        for i in ids:
+            self._built.pop(i, None)
+        blocks, _loose = self.blocks_from_preview()
+        if not any(b['name'] not in names for b in blocks):     # nothing left to send
+            note = f"# Applied and saved: {', '.join(sorted(names))}."
+            if cleared:
+                note += f" Cleared from the form: {', '.join(cleared)}."
+            self._set_preview_lines([(note, 'comment'),
+                                     ('# Fill in new settings and click Preview.', 'comment')])
+            return
+        lines, skipping = [], False
+        for raw in self.preview.get('1.0', 'end').splitlines():
+            m = HEADER.match(raw.strip())
+            if m:
+                skipping = m.group(1) in names
+            if skipping:
+                continue
+            tag = 'header' if m else 'skipped' if raw.startswith('# SKIPPED') else \
+                'comment' if raw.strip().startswith('#') else None
+            lines.append((raw, tag))
+        lines.insert(0, (f"# Applied and saved (removed below): {', '.join(sorted(names))}. "
+                         f"The sections left are still pending.", 'comment'))
+        self._set_preview_lines(lines)
 
 
 def _port_set(spec):

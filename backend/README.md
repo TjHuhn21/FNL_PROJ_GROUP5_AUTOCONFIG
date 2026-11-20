@@ -1,10 +1,26 @@
 # NetCommand backend
 
-The future server for NetCommand: desktop clients → HTTPS → this FastAPI backend → MySQL.
-So far it has: settings, safe logging, `GET /health` (liveness), `GET /ready` (read-only
-database readiness), versioned migrations for the authentication tables (run only by an
-operator, never on startup), audit-log protection and least-privilege accounts.
-There is **no** login, email, or HTTPS yet: no endpoint reads or writes account data.
+The FastAPI server behind the desktop's **sign-in and account management**: desktop →
+HTTP (this computer only) → this backend → MySQL (`netcommand_test`).
+
+What it does today:
+
+* **Accounts and sign-in:** registration with an emailed verification code, administrator
+  approval, two-step sign-in (password, then an emailed six-digit code), sessions, roles
+  (viewer, operator, admin) and the admin endpoints used by the desktop's *Accounts* page
+  (approve, reject, disable, change role). Passwords are hashed with Argon2id.
+* **Email delivery** of the codes through SMTP (for example Gmail), or a development-only
+  outbox that writes `.eml` files.
+* **Operations:** settings checked at start-up, redacting logs, `GET /health` (liveness),
+  `GET /ready` (read-only database readiness), versioned migrations (run only by an
+  operator, never on start-up), audit-log protection and least-privilege accounts.
+* A command to create the **first administrator** (`python -m backend.auth.bootstrap_admin`).
+
+Not yet: **HTTPS** (the backend listens on `127.0.0.1` only, so each team member runs their
+own backend), and device operations behind the backend (the desktop still talks to its own
+`netcommand` database and to the devices directly).
+
+Installing everything from scratch, step by step: **[../docs/TEAM_INSTALLATION_GUIDE.md](../docs/TEAM_INSTALLATION_GUIDE.md)**.
 
 ## Install
 
@@ -91,6 +107,159 @@ yourself, in **single quotes** (`BACKEND_DB_PASSWORD='...'`): the file is read w
 python-dotenv, which would change an unquoted or double-quoted value containing `${...}`
 and can cut one at ` #`. Leave `BACKEND_MIGRATE_PASSWORD` empty so migrations ask for it.
 
+## Authentication building blocks (Phase 1)
+
+Pure functions in `backend/auth/`, with no database, email or network access. The
+authentication service and API below are built on them.
+
+| Module | What it does |
+|---|---|
+| `policy.py` | The approved limits, validated: passwords of 12+ characters; lockout after 5 failed passwords for 15 minutes; 6-digit codes valid 5 minutes with 5 attempts; 60 s resend cooldown; sessions of 8 hours with a 30-minute idle timeout. `BACKEND_AUTH_*` settings can only make them stricter. |
+| `passwords.py` | Argon2id (argon2-cffi, explicit parameters m=64 MiB, t=3, p=4): hash, verify, parameter check (refuses non-Argon2id and weak hashes), rehash detection, and a dummy check so an unknown email takes as long as a wrong password. |
+| `otp.py` | Six-digit email codes from `secrets`, stored only as HMAC-SHA256 keyed with `BACKEND_OTP_PEPPER` and bound to the purpose (`register` or `login`) and the account; compared in constant time. |
+| `tokens.py` | 256-bit session tokens (`secrets.token_urlsafe(32)`); only their SHA-256 is stored. |
+
+Account passwords are **hashed** (one-way). They are unrelated to the device passwords
+the desktop **encrypts** with `FERNET_KEY` (`security.py`), which are not changed.
+
+## First administrator (Phase 7)
+
+New accounts must be approved by an administrator, so the first one is created with a
+local, one-time command (there is no API endpoint for it). From the project folder, with
+the backend's runtime database settings in `backend/.env` (`BACKEND_DB_*`) and the
+migrations applied:
+
+```powershell
+.\venv\Scripts\python.exe -m backend.auth.bootstrap_admin
+```
+
+It asks for the email address, full name and password (typed twice, not shown), checks
+them with the normal rules (password policy, plain-ASCII email), **emails a six-digit code
+to that address and asks for it**, and only then creates an **active admin with a verified
+email address**. Nothing is written to the database before the code is confirmed (the code
+is kept only in the command's memory). It refuses if an active administrator already exists
+(disabled or other inactive admin accounts do not block it, so it can also recover a
+database whose only admin was disabled; they are left unchanged). Two runs at the same time
+cannot both succeed: a per-database `GET_LOCK` is held until after the commit, the active
+admins are re-read with `SELECT ... FOR UPDATE`, and the account and its
+`user.bootstrap_admin` audit record are one transaction. It never prints the password, its
+hash, the code or any setting's secret value. Email delivery (`BACKEND_MAIL_BACKEND`) must
+work before it is run.
+
+Database names follow the migration rules: `*_test` is allowed; any other name needs
+`--authorize-database NAME`, and the main `netcommand` database also
+`--allow-main-database`. Exit codes: 0 done, 1 refused, 2 invalid input, 3 settings,
+database or email unavailable, 4 email code not confirmed (nothing created or changed),
+130 cancelled. The new administrator then signs in from the desktop (password, then the
+emailed sign-in code).
+
+### Every account verifies its email address
+
+No account can be active, wait for approval, sign in or keep a session until its email
+address has been verified with an emailed one-time code: registration does it with the
+registration code, the first administrator with the bootstrap command's code. Approving,
+re-activating (`set_status`) and creating accounts all refuse unverified addresses, and
+sign-in and session checks require `email_verified_at` (an active but unverified account
+gets `403 account_not_active`).
+
+An administrator created **before** this rule (by the earlier bootstrap command) has no
+verified address and therefore cannot sign in until it is verified, once, with:
+
+```powershell
+.\venv\Scripts\python.exe -m backend.auth.bootstrap_admin verify-existing
+```
+
+It asks for the administrator's email address (no password), emails a code to it and,
+after the right code, records the verification time. Nothing else about the account
+changes (id, password, role, status and history are kept); it only works for an active
+admin whose address is not yet verified, and it is audited (`auth.email_verified`).
+(A database CHECK constraint enforcing the rule is planned as a later migration.)
+
+## Authentication API (Phase 5)
+
+`backend/api/auth_routes.py`: a thin HTTP layer over `AuthService` (all rules live there).
+
+| Endpoint | Success | Notes |
+|---|---|---|
+| `POST /auth/register` | 202 | `{email, full_name, password}`; same answer for any address |
+| `POST /auth/register/verify` | 200 | `{challenge_id, code}` → `{"status": "pending_approval"}` |
+| `POST /auth/register/resend` | 202 | `{email}`; same answer for any address |
+| `POST /auth/login` | 202 | `{email, password}` → a login code is emailed; **no session yet** |
+| `POST /auth/login/verify` | 200 | `{challenge_id, code}` → `{token, token_type: "bearer", ...}` (the only response with a token) |
+| `POST /auth/login/resend` | 202 | `{challenge_id}` of the open login challenge |
+| `POST /auth/logout` | 204 | `Authorization: Bearer <token>` |
+| `GET /auth/session` | 200 | `Authorization: Bearer <token>` → `{user_id, role, session_id}` |
+| `GET /admin/users?status=&limit=&after_id=` | 200 | admin only |
+| `POST /admin/users/{id}/approve` | 200 | admin only; optional `{role}`; 409 if not pending approval |
+| `POST /admin/users/{id}/reject` | 200 | admin only |
+| `POST /admin/users/{id}/disable` | 200 | admin only; ends the account's sessions |
+| `POST /admin/users/{id}/role` | 200 | admin only; `{"role": "viewer"\|"operator"\|"admin"}` → `{user_id, previous_role, role, sessions_ended}`; never one's own role (400), never the last active admin (400), 409 if unchanged; the account is signed out everywhere and signs in again with the new role; audited as `user.role_changed` (acting admin, target, `role old -> new`) |
+
+* **Tokens** only in the `Authorization: Bearer` header, never in URLs; every response is
+  `Cache-Control: no-store`.
+* **Errors** are `{"detail": <fixed message>, "error": <code>}`: 400 `invalid_request` /
+  `code_invalid`, 401 `login_failed` / `not_authenticated`, 403 `account_not_active` /
+  `not_permitted`, 409 `no_change`, 413 `too_large`, 422 malformed body (values are never
+  echoed), 429 `rate_limited` (with `Retry-After`), 503 `delivery_failed` / `unavailable`
+  (database, mail or settings problems; details only in the server log, as a class name).
+  Unknown address, wrong password and locked account all give the same 401.
+* **Bodies:** JSON only, unknown fields refused, every string length-capped, at most 8 KiB.
+* **Roles:** reusable dependencies `current_session`, `require_roles(...)`,
+  `require_admin`, `require_operator` (operator or admin) and `require_viewer`.
+* The service is built on the **first** `/auth` or `/admin` request: creating the app,
+  `/health`, `/ready` and `/docs` never connect for it. Without database settings,
+  `BACKEND_OTP_PEPPER` and a mail backend, these routes answer 503.
+* An optional `X-NetCommand-Workstation` header names the workstation in the audit log
+  and the login email.
+* **Run ONE backend process.** The request limits (per IP for these routes, and the
+  service's per-address and per-IP limits) are kept in that process's memory.
+  `python -m backend` runs one process; do not start uvicorn with `--workers`. Several
+  processes would each count separately (the database-side lockout, resend cooldown and
+  hourly code limit would still hold).
+
+## Authentication service (Phase 4)
+
+`backend/auth/service.py` (`AuthService`) joins the pieces above; the API endpoints
+(Authentication API, above) are a thin layer over it.
+
+* **Registration:** `register()` creates a `pending_verification` account and emails a
+  registration code; `verify_registration()` moves it to `pending_approval`; an admin then
+  approves it. A taken address gets the same answer (a challenge id that can never be
+  verified) and no email, so registration never reveals which addresses exist.
+* **Login:** `login()` counts the attempt (lockout) **before** checking the password, uses a
+  dummy Argon2id check for unknown or locked accounts, and for an active account emails a
+  login code. **No session yet.** `verify_login()` checks the login code and only then
+  creates the session; the raw token is returned once, only its SHA-256 is stored.
+* **Codes:** registration and login codes never mix. Each code allows 5 checks (reserved
+  before checking, so parallel guesses gain nothing), expires after 5 minutes, works once,
+  at most one per 60 s and 5 per hour per account. A code that could not be emailed is
+  voided. Login codes can be resent only with the open login challenge.
+* **Sessions:** 8 hours at most, ended after 30 minutes without activity, on logout, and
+  when the account is disabled (`disable_account()` also cancels open codes).
+* **Rate limits** (in memory, per process) are keyed on the address and IP the client
+  sent, so unknown addresses are limited exactly like registered ones.
+* Every security event goes to `audit_log`; passwords, codes, tokens and hashes never do.
+
+## Email delivery of codes (Phase 3)
+
+`backend/mail/` sends the six-digit codes: one message for **registration** (verify your
+email address; an admin approves afterwards) and a different one for **login** (finish
+signing in; "if this was not you, contact your administrator"). The code is never in the
+subject, never logged, never returned and never stored. A code is sent only to the
+account's own address, and only when the account may receive it: registration codes to
+`pending_verification` accounts, login codes to `active` accounts.
+
+| `BACKEND_MAIL_BACKEND` | What happens |
+|---|---|
+| `none` (default) | No email can be sent. |
+| `outbox` | Development/test only: each message is written to an `.eml` file in `BACKEND_MAIL_OUTBOX_DIR` (default `%TEMP%\netcommand-dev-outbox`, never inside the project folder). Refused when `BACKEND_ENV=production`, both at start-up and on every use. |
+| `smtp` | Real email through `BACKEND_SMTP_*` (needs `BACKEND_SMTP_ENABLED=true`). Always encrypted: port 465 uses TLS from the start; other ports must accept STARTTLS before the password is sent. The certificate is verified. |
+
+Failures give a fixed reason (for example "the mail server refused the sender account"),
+never the server's reply, the SMTP password or the code. Logs show only the purpose and a
+masked address (`a***@example.com`). Codes in the development outbox are readable by
+anyone who can open that folder: delete it when you are done.
+
 ## Logging
 
 All log lines pass through a redacting formatter (`backend/logging_config.py`):
@@ -138,6 +307,33 @@ the five application tables (`devices`, `links`, `findings`, `status_events`,
 * **Exit codes:** 0 ok, 1 inconsistent state, 2 refused/failed, 3 status ok but
   `audit_log` NOT confirmed protected, 4 runtime grants unsafe, 5 runtime grants
   missing, 6 runtime connection not ready, 130 interrupted.
+
+### Production database safety
+
+`netcommand_backend` is the **production** database (`backend/database/production.py`).
+On top of the rules above (which are unchanged), every `migrate` command except `plan`, and
+`python -m backend.auth.bootstrap_admin`, refuse it unless **all** of these are given:
+
+* `BACKEND_ENV=production` in the settings,
+* `--production`,
+* `--authorize-database netcommand_backend`,
+* `--confirm-database netcommand_backend` (also for read-only commands such as `status`).
+
+`--production` with any other database, and `BACKEND_ENV=production` with any other
+database, are refused too. The settings themselves refuse `netcommand_backend` without
+`BACKEND_ENV=production`, `BACKEND_ENV=production` with a test or other database, and the
+production database without `BACKEND_DB_SERVER_UUID`.
+
+**Identity check.** Right after connecting, and before any other statement, the tools run
+one read-only `SELECT DATABASE(), @@server_uuid`: the database must be `BACKEND_DB_NAME`
+and the server UUID must be `BACKEND_DB_SERVER_UUID` (the DBA reads it once with
+`SELECT @@server_uuid;`). This is a safeguard against reaching the wrong server, port,
+tunnel or database; it is **not** authentication or proof of identity. It also runs for any
+other database when `BACKEND_DB_SERVER_UUID` is set.
+
+**No rollback on production.** `migrate down` is refused on the production database (with
+or without `--allow-data-loss`); a production rollback means restoring a verified backup.
+`down --dry-run` stays available. Automated tests never connect to any database.
 
 ### Audit log protection
 

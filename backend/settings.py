@@ -24,6 +24,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from backend.auth.policy import AuthPolicy, parse_policy
+
 PREFIX = 'BACKEND_'
 ENV_FILE_VARIABLE = 'NETCOMMAND_BACKEND_ENV_FILE'
 DEFAULT_ENV_FILE = Path(__file__).resolve().parent / '.env'
@@ -36,6 +38,35 @@ _EMAIL = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 _HOST = re.compile(r'^[A-Za-z0-9.\-:]+$')          # name, IPv4 or IPv6 literal; no spaces
 _DB_NAME = re.compile(r'^[A-Za-z0-9_]{1,64}$')
 OTP_PEPPER_MIN_LENGTH = 32
+# How email codes are delivered: none (default: no email), outbox (development only:
+# messages are written to files, refused in production) or smtp (BACKEND_SMTP_*).
+MAIL_BACKENDS = ('none', 'outbox', 'smtp')
+
+# Database classes (names compared ignoring case). Kept here, free of database imports,
+# because the settings are loaded by the web app and GET /health must not load the
+# database layer; backend/database/production.py builds its checks on these.
+PRODUCTION_DATABASES = ('netcommand_backend',)
+LEGACY_MAIN_DATABASE = 'netcommand'
+TEST_DATABASE_SUFFIX = '_test'
+_SERVER_UUID = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                          r'[0-9a-fA-F]{12}$')
+
+
+def classify_database(name):
+    """'production', 'test' (ends in _test), 'legacy_main' ('netcommand') or 'other'."""
+    lower = (name or '').lower()
+    if lower in PRODUCTION_DATABASES:
+        return 'production'
+    if lower.endswith(TEST_DATABASE_SUFFIX) and len(lower) > len(TEST_DATABASE_SUFFIX):
+        return 'test'
+    if lower == LEGACY_MAIN_DATABASE:
+        return 'legacy_main'
+    return 'other'
+
+
+def valid_server_uuid(value):
+    """A MySQL server UUID as shown by SELECT @@server_uuid (8-4-4-4-12 hex digits)."""
+    return isinstance(value, str) and bool(_SERVER_UUID.match(value))
 
 
 class SettingsError(ValueError):
@@ -88,6 +119,9 @@ class DatabaseSettings:
     user: str
     password: Secret = field(repr=False)
     name: str
+    # BACKEND_DB_SERVER_UUID: the expected MySQL @@server_uuid ('' = not configured). A
+    # safeguard against connecting to the wrong server/port/tunnel, NOT proof of identity.
+    server_uuid: str = ''
 
 
 @dataclass(frozen=True)
@@ -112,6 +146,11 @@ class Settings:
     # The MIGRATION account (python -m backend.database.migrate only; never the web app).
     migrate_user: str = ''
     migrate_password: Secret = field(default=None, repr=False)
+    # Authentication limits (BACKEND_AUTH_*; defaults = the approved policy).
+    auth_policy: AuthPolicy = field(default_factory=AuthPolicy)
+    # Email delivery (BACKEND_MAIL_BACKEND, BACKEND_MAIL_OUTBOX_DIR).
+    mail_backend: str = 'none'
+    mail_outbox_dir: str = ''
 
     @property
     def docs_enabled(self):
@@ -216,9 +255,24 @@ def parse_settings(raw):
         name = required('DB_NAME')
         if name and not _DB_NAME.match(name):
             problems.append(f'{PREFIX}DB_NAME may only use letters, numbers and underscores.')
+        server_uuid = text('DB_SERVER_UUID')
+        if server_uuid and not valid_server_uuid(server_uuid):
+            problems.append(f'{PREFIX}DB_SERVER_UUID must be a MySQL server UUID, as shown by '
+                            f'SELECT @@server_uuid (8-4-4-4-12 hexadecimal digits).')
+        kind = classify_database(name)
+        if environment == 'production' and kind != 'production':
+            problems.append(f'{PREFIX}ENV=production requires {PREFIX}DB_NAME to be the '
+                            f'production database ({", ".join(PRODUCTION_DATABASES)}).')
+        if kind == 'production' and environment != 'production':
+            problems.append(f'{PREFIX}DB_NAME is the production database; it is used only with '
+                            f'{PREFIX}ENV=production.')
+        if kind == 'production' and not server_uuid:
+            problems.append(f'{PREFIX}DB_SERVER_UUID is required for the production database '
+                            f'(a safeguard against connecting to the wrong server).')
         database = DatabaseSettings(host=host('DB_HOST'), port=port('DB_PORT'),
                                     user=required('DB_USER'),
-                                    password=required_secret('DB_PASSWORD'), name=name)
+                                    password=required_secret('DB_PASSWORD'), name=name,
+                                    server_uuid=(server_uuid or '').lower())
 
     smtp = None
     if flag('SMTP_ENABLED'):
@@ -250,12 +304,28 @@ def parse_settings(raw):
         problems.append(f'{PREFIX}MIGRATE_USER must be a different account from {PREFIX}DB_USER '
                         f'(the runtime account must not be able to create or drop tables).')
 
+    auth_policy, policy_problems = parse_policy(raw)
+    problems.extend(policy_problems)
+
+    mail_backend = text('MAIL_BACKEND', 'none').lower()
+    mail_outbox_dir = text('MAIL_OUTBOX_DIR')
+    if mail_backend not in MAIL_BACKENDS:
+        problems.append(f'{PREFIX}MAIL_BACKEND must be one of: {", ".join(MAIL_BACKENDS)}.')
+    elif mail_backend == 'smtp' and smtp is None:
+        problems.append(f'{PREFIX}MAIL_BACKEND=smtp needs {PREFIX}SMTP_ENABLED=true and the '
+                        f'{PREFIX}SMTP_* settings.')
+    elif mail_backend == 'outbox' and environment == 'production':
+        problems.append(f'{PREFIX}MAIL_BACKEND=outbox is for development only and is refused '
+                        f'when {PREFIX}ENV=production.')
+
     if problems:
         raise SettingsError(problems)
     return Settings(environment=environment, host=bind_host, port=bind_port,
                     log_level=log_level, database=database, smtp=smtp,
                     fernet_key=fernet_key, otp_pepper=otp_pepper,
-                    migrate_user=migrate_user, migrate_password=migrate_password)
+                    migrate_user=migrate_user, migrate_password=migrate_password,
+                    auth_policy=auth_policy, mail_backend=mail_backend,
+                    mail_outbox_dir=mail_outbox_dir)
 
 
 def _valid_fernet_key(value):
@@ -271,6 +341,7 @@ def describe(settings):
              f'log_level={settings.log_level}',
              f"database={'enabled' if settings.database else 'disabled'}",
              f"smtp={'enabled' if settings.smtp else 'disabled'}",
+             f'mail={settings.mail_backend}',
              f"fernet_key={'set' if settings.fernet_key else 'not set'}",
              f"otp_pepper={'set' if settings.otp_pepper else 'not set'}"]
     return ' '.join(parts)

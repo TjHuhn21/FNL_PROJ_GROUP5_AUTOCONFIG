@@ -220,3 +220,50 @@ def test_module_runner_refuses_bad_settings_without_values(capsys, monkeypatch):
     err = capsys.readouterr().err
     assert 'NetCommand backend not started' in err and 'BACKEND_DB_HOST is required' in err
     assert DB_SECRET not in err
+
+
+# ---------------------------------------------------------------- production database safety
+PROD_UUID = '3e11fa47-71ca-11e1-9e33-c80aa9429562'
+
+
+def test_server_uuid_is_optional_validated_and_stored_lower_case():
+    assert parse_settings(db_settings()).database.server_uuid == ''
+    s = parse_settings(db_settings(BACKEND_DB_SERVER_UUID=PROD_UUID.upper()))
+    assert s.database.server_uuid == PROD_UUID
+    with pytest.raises(SettingsError) as err:
+        parse_settings(db_settings(BACKEND_DB_SERVER_UUID='not-a-uuid'))
+    assert 'BACKEND_DB_SERVER_UUID must be a MySQL server UUID' in str(err.value)
+
+
+def test_production_database_needs_the_production_environment_and_a_uuid():
+    s = parse_settings(db_settings(BACKEND_DB_NAME='netcommand_backend', BACKEND_ENV='production',
+                                   BACKEND_DB_SERVER_UUID=PROD_UUID))
+    assert (s.environment, s.database.name, s.database.server_uuid) == (
+        'production', 'netcommand_backend', PROD_UUID)
+    for raw, problem in [
+        (db_settings(BACKEND_DB_NAME='netcommand_backend', BACKEND_DB_SERVER_UUID=PROD_UUID),
+         'used only with BACKEND_ENV=production'),
+        (db_settings(BACKEND_DB_NAME='netcommand_backend', BACKEND_ENV='test',
+                     BACKEND_DB_SERVER_UUID=PROD_UUID), 'used only with BACKEND_ENV=production'),
+        (db_settings(BACKEND_DB_NAME='netcommand_backend', BACKEND_ENV='production'),
+         'BACKEND_DB_SERVER_UUID is required for the production database'),
+        (db_settings(BACKEND_ENV='production'), 'BACKEND_ENV=production requires BACKEND_DB_NAME'),
+        (db_settings(BACKEND_ENV='production', BACKEND_DB_NAME='netcommand'),
+         'BACKEND_ENV=production requires BACKEND_DB_NAME'),
+        (db_settings(BACKEND_ENV='production', BACKEND_DB_NAME='other_db'),
+         'BACKEND_ENV=production requires BACKEND_DB_NAME'),
+    ]:
+        with pytest.raises(SettingsError) as err:
+            parse_settings(raw)
+        assert problem in str(err.value) and DB_SECRET not in str(err.value)
+
+
+def test_current_development_configuration_is_unchanged():
+    s = parse_settings(db_settings(BACKEND_DB_USER='netcommand_api'))
+    assert (s.environment, s.database.name, s.database.server_uuid) == (
+        'development', 'netcommand_test', '')
+
+
+def test_production_without_a_database_behaves_as_before():
+    s = parse_settings({'BACKEND_ENV': 'production'})
+    assert s.environment == 'production' and s.database is None and not s.docs_enabled

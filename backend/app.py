@@ -3,7 +3,9 @@
   GET /health   liveness only: the process is running (never touches the database)
   GET /ready    readiness: the runtime account can reach the database and the schema
                 matches this code (read-only; backend/database/health.py)
-No authentication or email yet, and migrations never run on startup.
+  /auth/..., /admin/...   sign-in and account administration (backend/api/auth_routes.py)
+Migrations never run on startup, and nothing connects to the database until a route
+that needs it is called.
 
 Start it with:  python -m backend          (see backend/README.md)
 Or with uvicorn directly:  uvicorn --factory backend.app:app_factory
@@ -18,15 +20,18 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from backend import __version__
+from backend.api import auth_routes
 from backend.logging_config import configure_logging
 from backend.settings import Settings, load_settings
 
 log = logging.getLogger('backend')
 
 
-def create_app(settings: Settings = None, *, setup_logging=False):
+def create_app(settings: Settings = None, *, setup_logging=False, auth_service=None):
     """The FastAPI application. settings: backend Settings (default: load_settings()).
-    setup_logging: configure process-wide logging (the server does; tests do not)."""
+    setup_logging: configure process-wide logging (the server does; tests do not).
+    auth_service: the AuthService to use (tests); default: built from the settings the
+    first time an /auth or /admin route is called (never when the app is created)."""
     if settings is None:
         settings = load_settings()
     if setup_logging:
@@ -68,6 +73,7 @@ def create_app(settings: Settings = None, *, setup_logging=False):
         return JSONResponse(status_code=200 if result.ready else 503, content=result.public(),
                             headers={'Cache-Control': 'no-store'})
 
+    auth_routes.install(app, auth_service=auth_service)
     return app
 
 

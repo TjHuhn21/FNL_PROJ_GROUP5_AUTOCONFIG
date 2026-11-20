@@ -19,13 +19,26 @@ concurrent changes cannot both pass the check (and cannot deadlock on it).
 
 Rows returned for users never include password_hash (get_password_hash() is separate),
 and session rows never include token_hash.
+
+Password attempts and lockout (begin_password_attempt / record_password_success): an
+attempt is COUNTED BEFORE the password is checked, under a row lock on the user, and is
+refused while the account is locked. The attempt that reaches the threshold locks the
+account at once. So however many attempts run at the same time, at most `threshold`
+passwords are ever checked per lockout period; a correct password then clears the count
+(and a lock set by its own attempt). Locking and clearing a lock are audited in the same
+transaction.
+
+Resend cooldown: create_challenge(..., resend_cooldown_seconds=N) locks the user row and
+refuses (ResendTooSoon) when a code for the same purpose was created less than N seconds
+ago, so two simultaneous requests cannot both send a code.
 """
 import secrets
 
 from backend.database import auth_records as R
 from backend.database.connection import close_quietly, connect_runtime, driver_error_code, \
     is_driver_error, translate
-from backend.database.errors import DuplicateEmail, InvalidValue, LastActiveAdmin
+from backend.database.errors import (AdminExists, DuplicateEmail, InvalidValue, LastActiveAdmin,
+                                     ResendTooSoon, SetupBusy)
 
 _USER_COLUMNS = ('id, email, full_name, role, status, email_verified_at, approved_by, '
                  'approved_at, failed_logins, locked_until, created_at, updated_at')
@@ -37,10 +50,21 @@ _SESSION_COLUMNS = ('s.id, s.user_id, s.workstation_label, s.client_ip, s.create
 _AUDIT_COLUMNS = ('id, created_at, actor_user_id, actor_email, action, target_type, '
                   'target_id, outcome, client_ip, workstation_label, detail')
 NOW = 'UTC_TIMESTAMP(6)'
+# list_users(): what an admin needs to review accounts. No password hash and no failure
+# counter; 'locked' (true/false) instead of the lock time.
+LIST_USER_FIELDS = ('id', 'email', 'full_name', 'role', 'status', 'email_verified_at',
+                    'approved_by', 'approved_at', 'created_at', 'updated_at', 'locked')
+_LOCK_ACTIVE = f'(locked_until IS NOT NULL AND locked_until > {NOW})'
 
 USER_NOT_FOUND = 'The user does not exist.'
 TOKEN_IN_USE = 'This session token hash is already in use.'
 LAST_ADMIN = 'This change would leave no active admin. Nothing was changed.'
+ADMIN_EXISTS = 'An active administrator already exists. Nothing was created.'
+SETUP_BUSY = ('Another first-administrator setup is running on this database. Nothing was '
+              'created; try again in a moment.')
+# One named lock per database (GET_LOCK names are server-wide, at most 64 characters).
+FIRST_ADMIN_LOCK = "LEFT(CONCAT('netcommand.first_admin.', DATABASE()), 64)"
+LOCK_WAIT_SECONDS = 10
 
 
 class AuthRepository:
@@ -53,11 +77,20 @@ class AuthRepository:
         return cls(lambda: connect_runtime(settings))
 
     # ------------------------------------------------------------ transactions
-    def _tx(self, work):
+    def _tx(self, work, named_lock=None):
+        """One transaction. named_lock (an SQL expression for a GET_LOCK name): taken
+        BEFORE the work and released only AFTER the commit or rollback, so whoever waits
+        for it next sees everything this transaction committed."""
         conn = self._connect()
-        committing = False
+        committing, locked = False, False
         try:
             with conn.cursor() as cur:
+                if named_lock is not None:
+                    cur.execute(f'SELECT GET_LOCK({named_lock}, %s) AS got', (LOCK_WAIT_SECONDS,))
+                    row = cur.fetchone()
+                    if not row or row.get('got') != 1:
+                        raise SetupBusy(SETUP_BUSY)
+                    locked = True
                 result = work(cur)
             committing = True
             conn.commit()
@@ -71,6 +104,12 @@ class AuthRepository:
                 raise self._translate(err, committing) from None
             raise
         finally:
+            if locked:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f'SELECT RELEASE_LOCK({named_lock}) AS released', ())
+                except Exception:
+                    pass                      # the server also releases it when we disconnect
             close_quietly(conn)
 
     @staticmethod
@@ -87,17 +126,24 @@ class AuthRepository:
 
     # ------------------------------------------------------------ users
     def create_user(self, email, full_name, password_hash, role='viewer',
-                    status='pending_verification'):
+                    status='pending_verification', *, email_verified=False):
+        """A new account. Registration creates pending_verification accounts.
+        email_verified=True (the address was proved with a one-time code) records the
+        verification time; it is REQUIRED for an active or pending_approval account
+        (EmailNotVerified otherwise)."""
         email, normalized = R.check_email(email), R.normalize_email(email)
         name = R.check_full_name(full_name)
         R.check_password_hash(password_hash)
         R.check_choice(role, R.ROLES, 'role')
         R.check_choice(status, R.STATUSES, 'status')
+        R.check_verified_for_status(status, email_verified)
+        verified_at = NOW if email_verified else 'NULL'
 
         def work(cur):
             cur.execute('INSERT INTO users (email, email_normalized, full_name, password_hash, '
-                        f'role, status, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, '
-                        f'{NOW}, {NOW})', (email, normalized, name, password_hash, role, status))
+                        f'role, status, email_verified_at, created_at, updated_at) VALUES (%s, '
+                        f'%s, %s, %s, %s, %s, {verified_at}, {NOW}, {NOW})',
+                        (email, normalized, name, password_hash, role, status))
             return cur.lastrowid
         return self._tx(work)
 
@@ -121,7 +167,8 @@ class AuthRepository:
                    client_ip=None, workstation_label=None):
         """Change the status (only from expected_status, when given) and audit it in the same
         transaction. True if changed; False if the user is missing, already has it, or is
-        not in expected_status. LastActiveAdmin if it would leave no active admin."""
+        not in expected_status. LastActiveAdmin if it would leave no active admin;
+        EmailNotVerified when making an unverified account active or pending approval."""
         R.check_id(user_id, 'user_id')
         R.check_choice(status, R.STATUSES, 'status')
         if expected_status is not None:
@@ -130,11 +177,12 @@ class AuthRepository:
 
         def work(cur):
             admins = self._lock_active_admins(cur)
-            row = self._one(cur, 'SELECT role, status FROM users WHERE id = %s FOR UPDATE',
-                            (user_id,))
+            row = self._one(cur, 'SELECT role, status, email_verified_at FROM users '
+                                 'WHERE id = %s FOR UPDATE', (user_id,))
             if (not row or row['status'] == status
                     or (expected_status is not None and row['status'] != expected_status)):
                 return False
+            R.check_verified_for_status(status, row.get('email_verified_at') is not None)
             if row['role'] == 'admin' and row['status'] == 'active' and status != 'active':
                 self._guard_last_admin(admins, user_id)
             cur.execute(f'UPDATE users SET status = %s, updated_at = {NOW} WHERE id = %s',
@@ -196,7 +244,8 @@ class AuthRepository:
             changed = self._changed(cur, f"UPDATE users SET status = 'active', approved_by = %s, "
                                          f"approved_at = {NOW}, role = COALESCE(%s, role), "
                                          f"updated_at = {NOW} WHERE id = %s "
-                                         f"AND status = 'pending_approval'",
+                                         f"AND status = 'pending_approval' "
+                                         f"AND email_verified_at IS NOT NULL",
                                     (approved_by, role, user_id))
             if changed:
                 self._insert_audit(cur, 'user.approved', 'success', target_type='user',
@@ -219,22 +268,178 @@ class AuthRepository:
         if not [i for i in active_admin_ids if i != user_id]:
             raise LastActiveAdmin(LAST_ADMIN)
 
+    def create_first_admin(self, email, full_name, password_hash, *, workstation_label=None):
+        """The first administrator (role admin, status active), for the local bootstrap
+        command only. AdminExists if an active admin exists; SetupBusy if another setup
+        holds the lock. Protected against two simultaneous runs twice over: a per-database
+        GET_LOCK held until after the commit, and the active admin rows read with FOR
+        UPDATE (a locking read, so it sees committed rows). The account and its audit
+        record are one transaction. Returns {'user_id', 'inactive_admins'}."""
+        email, normalized = R.check_email(email), R.normalize_email(email)
+        name = R.check_full_name(full_name)
+        R.check_password_hash(password_hash)
+        label = R.check_optional_text(workstation_label, R.LABEL_MAX, 'workstation_label')
+
+        def work(cur):
+            if self._lock_active_admins(cur):
+                raise AdminExists(ADMIN_EXISTS)
+            cur.execute("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'", ())
+            inactive = int((cur.fetchone() or {}).get('n') or 0)
+            cur.execute('INSERT INTO users (email, email_normalized, full_name, password_hash, '
+                        f"role, status, email_verified_at, created_at, updated_at) VALUES (%s, "
+                        f"%s, %s, %s, 'admin', 'active', {NOW}, {NOW}, {NOW})",
+                        (email, normalized, name, password_hash))
+            uid = cur.lastrowid
+            self._insert_audit(cur, 'user.bootstrap_admin', 'success', actor_email=normalized,
+                               target_type='user', target_id=str(uid), workstation_label=label,
+                               detail=f'first administrator created by the local bootstrap '
+                                      f'command after its email address was verified with a '
+                                      f'one-time code; {inactive} inactive admin account(s) '
+                                      f'existed')
+            return {'user_id': uid, 'inactive_admins': inactive}
+        return self._tx(work, named_lock=FIRST_ADMIN_LOCK)
+
+    def mark_existing_admin_email_verified(self, user_id, *, workstation_label=None):
+        """For the local verify-existing command, after the administrator entered the code
+        emailed to the account's address: record the verification time of an ACTIVE ADMIN
+        whose address was never verified. Nothing else changes (not the status, role,
+        password or updated_at). Audited in the same transaction. True if it was marked;
+        False if the account is not an active admin or is already verified."""
+        R.check_id(user_id, 'user_id')
+        label = R.check_optional_text(workstation_label, R.LABEL_MAX, 'workstation_label')
+
+        def work(cur):
+            changed = self._changed(
+                cur, f"UPDATE users SET email_verified_at = {NOW} WHERE id = %s "
+                     f"AND role = 'admin' AND status = 'active' AND email_verified_at IS NULL",
+                (user_id,))
+            if changed:
+                self._insert_audit(cur, 'auth.email_verified', 'success',
+                                   actor_user_id=user_id, target_type='user',
+                                   target_id=str(user_id), workstation_label=label,
+                                   detail='existing administrator verified its email address '
+                                          'with a one-time code (local command)')
+            return changed
+        return self._tx(work)
+
+    def list_users(self, status=None, limit=100, after_id=None):
+        """Accounts for an admin, oldest first (status='pending_approval' is the approval
+        queue). Fields: LIST_USER_FIELDS. Page with after_id = the last id received."""
+        if status is not None:
+            R.check_choice(status, R.STATUSES, 'status')
+        R.check_limit(limit)
+        if after_id is not None:
+            R.check_id(after_id, 'after_id')
+        columns = ', '.join(LIST_USER_FIELDS[:-1])
+        sql, params = f'SELECT {columns}, {_LOCK_ACTIVE} AS locked FROM users WHERE 1 = 1', []
+        if status is not None:
+            sql += ' AND status = %s'
+            params.append(status)
+        if after_id is not None:
+            sql += ' AND id > %s'
+            params.append(after_id)
+        sql += ' ORDER BY id LIMIT %s'
+        params.append(limit)
+        rows = self._tx(lambda cur: self._all(cur, sql, params))
+        for row in rows:
+            row['locked'] = bool(row['locked'])
+        return rows
+
+    # ------------------------------------------------------------ password attempts
+    def begin_password_attempt(self, user_id, threshold, lockout_seconds, *, client_ip=None,
+                               workstation_label=None):
+        """Call BEFORE checking a password. Returns None if the user does not exist, else
+        {'allowed', 'failed_logins', 'locked_until', 'newly_locked'}:
+          * allowed False: the account is locked; do not check the password. Nothing changes.
+          * allowed True: this attempt has been counted. If it reached `threshold`, the
+            account is now locked for lockout_seconds (newly_locked True, audited); check
+            the password, and on success call record_password_success().
+        A lock that has expired starts a fresh count. One transaction, user row locked."""
+        R.check_id(user_id, 'user_id')
+        R.check_lockout(threshold, lockout_seconds)
+        audit = R.audit_context(None, client_ip, workstation_label)
+
+        def work(cur):
+            row = self._one(cur, f'SELECT failed_logins, locked_until, {_LOCK_ACTIVE} AS locked '
+                                 f'FROM users WHERE id = %s FOR UPDATE', (user_id,))
+            if not row:
+                return None
+            if row['locked']:
+                return {'allowed': False, 'failed_logins': row['failed_logins'],
+                        'locked_until': row['locked_until'], 'newly_locked': False}
+            count = (0 if row['locked_until'] is not None else row['failed_logins']) + 1
+            if count < threshold:
+                cur.execute('UPDATE users SET failed_logins = %s, locked_until = NULL '
+                            'WHERE id = %s', (count, user_id))
+                return {'allowed': True, 'failed_logins': count, 'locked_until': None,
+                        'newly_locked': False}
+            cur.execute(f'UPDATE users SET failed_logins = %s, locked_until = {NOW} + INTERVAL '
+                        f'%s SECOND WHERE id = %s', (count, lockout_seconds, user_id))
+            self._insert_audit(cur, 'auth.account_locked', 'denied', target_type='user',
+                               target_id=str(user_id),
+                               detail=f'{count} password attempts; locked for {lockout_seconds} s '
+                                      f'unless this attempt succeeds', **audit)
+            until = self._one(cur, 'SELECT locked_until FROM users WHERE id = %s', (user_id,))
+            return {'allowed': True, 'failed_logins': count, 'locked_until': until['locked_until'],
+                    'newly_locked': True}
+        return self._tx(work)
+
+    def record_password_success(self, user_id, *, client_ip=None, workstation_label=None):
+        """Call after the password was verified for an attempt that begin_password_attempt()
+        allowed: clears the failure count and lock. Clearing an active lock is audited in
+        the same transaction. True if the user exists."""
+        R.check_id(user_id, 'user_id')
+        audit = R.audit_context(user_id, client_ip, workstation_label)
+
+        def work(cur):
+            row = self._one(cur, f'SELECT failed_logins, locked_until, {_LOCK_ACTIVE} AS locked '
+                                 f'FROM users WHERE id = %s FOR UPDATE', (user_id,))
+            if not row:
+                return False
+            if row['failed_logins'] or row['locked_until'] is not None:
+                cur.execute('UPDATE users SET failed_logins = 0, locked_until = NULL '
+                            'WHERE id = %s', (user_id,))
+            if row['locked']:
+                self._insert_audit(cur, 'auth.lock_cleared', 'success', target_type='user',
+                                   target_id=str(user_id),
+                                   detail='correct password on an allowed attempt; failure '
+                                          'count and lock cleared',
+                                   **audit)
+            return True
+        return self._tx(work)
+
     # ------------------------------------------------------------ email challenges
     def create_challenge(self, user_id, purpose, code_hmac, ttl_seconds, max_attempts=5,
-                         requester_ip=None, workstation_label=None):
+                         requester_ip=None, workstation_label=None,
+                         resend_cooldown_seconds=None):
         """A new challenge; returns its random public id (given to that workstation only).
-        Other challenges of the same user are NOT touched (workstations are independent)."""
+        Other challenges of the same user are NOT touched (workstations are independent).
+        With resend_cooldown_seconds: the user row is locked and ResendTooSoon is raised
+        (nothing created) if a code for this purpose was created within the cooldown."""
         R.check_id(user_id, 'user_id')
         R.check_choice(purpose, R.PURPOSES, 'purpose')
         R.check_hex64(code_hmac, 'code_hmac')
         R.check_seconds(ttl_seconds, R.MAX_CHALLENGE_TTL, 'ttl_seconds')
         R.check_max_attempts(max_attempts)
+        if resend_cooldown_seconds is not None:
+            R.check_resend(resend_cooldown_seconds)
         ip = R.check_optional_text(requester_ip, R.IP_MAX, 'requester_ip')
         label = R.check_optional_text(workstation_label, R.LABEL_MAX, 'workstation_label')
         public_id = secrets.token_urlsafe(32)
 
         def work(cur):
-            self._require_user(cur, user_id)
+            if resend_cooldown_seconds is None:
+                self._require_user(cur, user_id)
+            else:
+                # FOR UPDATE (not FOR SHARE): a second request for the same user waits here
+                # until the first has committed, then sees its code and is refused.
+                cur.execute('SELECT id FROM users WHERE id = %s FOR UPDATE', (user_id,))
+                if not cur.fetchone():
+                    raise InvalidValue(USER_NOT_FOUND)
+                state = self._resend_facts(cur, user_id, purpose, resend_cooldown_seconds)
+                wait = R.retry_after(state['seconds_since_last'], resend_cooldown_seconds)
+                if wait:
+                    raise ResendTooSoon(wait)
             cur.execute('INSERT INTO email_challenges (public_id, user_id, purpose, code_hmac, '
                         'max_attempts, created_at, expires_at, requester_ip, workstation_label) '
                         f'VALUES (%s, %s, %s, %s, %s, {NOW}, {NOW} + INTERVAL %s SECOND, %s, %s)',
@@ -242,6 +447,32 @@ class AuthRepository:
                          ip, label))
             return public_id
         return self._tx(work)
+
+    def challenge_resend_state(self, user_id, purpose, cooldown_seconds, window_seconds=3600):
+        """For the resend button: {'recent_count' (codes for this user and purpose created
+        in the last window_seconds), 'seconds_since_last' (the newest of those, whole
+        seconds, or None), 'retry_after_seconds' (0 = a code may be sent now)}. Never
+        returns codes, HMACs or challenge ids. create_challenge(resend_cooldown_seconds=)
+        enforces the same rule atomically."""
+        R.check_id(user_id, 'user_id')
+        R.check_choice(purpose, R.PURPOSES, 'purpose')
+        R.check_resend(cooldown_seconds, window_seconds)
+        facts = self._tx(lambda cur: self._resend_facts(cur, user_id, purpose, window_seconds))
+        return {'recent_count': facts['recent_count'],
+                'seconds_since_last': facts['seconds_since_last'],
+                'retry_after_seconds': R.retry_after(facts['seconds_since_last'],
+                                                     cooldown_seconds)}
+
+    @staticmethod
+    def _resend_facts(cur, user_id, purpose, window_seconds):
+        cur.execute(f'SELECT COUNT(*) AS recent_count, TIMESTAMPDIFF(SECOND, MAX(created_at), '
+                    f'{NOW}) AS seconds_since_last FROM email_challenges WHERE user_id = %s '
+                    f'AND purpose = %s AND created_at > {NOW} - INTERVAL %s SECOND',
+                    (user_id, purpose, window_seconds))
+        row = cur.fetchone() or {}
+        last = row.get('seconds_since_last')
+        return {'recent_count': int(row.get('recent_count') or 0),
+                'seconds_since_last': None if last is None else max(0, int(last))}
 
     def get_challenge(self, public_id):
         R.check_public_id(public_id)
@@ -321,14 +552,16 @@ class AuthRepository:
 
     def get_active_session(self, token_hash, idle_timeout_seconds):
         """The session with this token hash if it is not revoked, not past its absolute
-        expiry, not idle for longer than idle_timeout_seconds, and its user is active."""
+        expiry, not idle for longer than idle_timeout_seconds, and its user is active with
+        a verified email address."""
         R.check_hex64(token_hash, 'token_hash')
         R.check_seconds(idle_timeout_seconds, R.MAX_SESSION_LIFETIME, 'idle_timeout_seconds')
         return self._tx(lambda cur: self._one(
             cur, f'SELECT {_SESSION_COLUMNS}, u.role, u.status AS user_status FROM sessions s '
                  f'JOIN users u ON u.id = s.user_id WHERE s.token_hash = %s '
                  f'AND s.revoked_at IS NULL AND s.expires_at > {NOW} '
-                 f'AND s.last_seen_at > {NOW} - INTERVAL %s SECOND AND u.status = \'active\'',
+                 f'AND s.last_seen_at > {NOW} - INTERVAL %s SECOND AND u.status = \'active\' '
+                 f'AND u.email_verified_at IS NOT NULL',
             (token_hash, idle_timeout_seconds)))
 
     def touch_session(self, session_id, idle_timeout_seconds):

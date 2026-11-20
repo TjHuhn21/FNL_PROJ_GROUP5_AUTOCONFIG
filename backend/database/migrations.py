@@ -140,15 +140,16 @@ def check_definitions(migrations=MIGRATIONS):
         raise MigrationError('Invalid migration definitions: ' + ' '.join(problems))
 
 
-def check_database_name(name, authorized=None, allow_main_database=False):
+def check_database_name(name, authorized=None, allow_main_database=False, action='migrate'):
     """Allowed by default: names ending in _test. Any other name must be repeated with
-    --authorize-database NAME; the main database also needs --allow-main-database."""
+    --authorize-database NAME; the main database also needs --allow-main-database.
+    action: the verb used in the messages (the bootstrap command passes its own)."""
     if not name:
         raise MigrationError('No database name is configured (BACKEND_DB_NAME).')
     lower = name.lower()
     if lower == MAIN_DATABASE:
         if not (allow_main_database and authorized == name):
-            raise MigrationError(f"Refusing to migrate '{name}', the main NetCommand database. "
+            raise MigrationError(f"Refusing to {action} '{name}', the main NetCommand database. "
                                  f"It needs a backup and explicit approval first, then both "
                                  f"--authorize-database {name} and --allow-main-database.")
         return
@@ -156,7 +157,7 @@ def check_database_name(name, authorized=None, allow_main_database=False):
         return
     if authorized != name:
         raise MigrationError(f"'{name}' does not end in '{TEST_SUFFIX}', so it is not a test "
-                             f"database. To migrate it anyway, add --authorize-database {name}.")
+                             f"database. To {action} it anyway, add --authorize-database {name}.")
 
 
 # ---------------------------------------------------------------- state

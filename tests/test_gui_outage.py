@@ -93,7 +93,8 @@ def ui(monkeypatch):
         monkeypatch.setattr(messagebox, name,
                             lambda t, m, _n=name, **k: shown.append((_n, t, m)))
     monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: True)
-    monkeypatch.setattr(simpledialog, 'askstring', lambda *a, **k: 'admin')
+    monkeypatch.setattr('gui.components.login_dialog.ask_device_login',
+                        lambda *a, **k: {'username': 'admin', 'password': 'admin', 'save': False})
     db_fake.reset()
     db_fake.upsert_device(dev('SW1', '10.0.0.1'))
     db_fake.upsert_device(dev('SW2', '10.0.0.2'))

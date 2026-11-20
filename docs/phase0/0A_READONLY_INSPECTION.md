@@ -186,8 +186,10 @@ everything **stops** until you approve the next step.
 
 ## 0A-1 Step 1 — Running server and candidate option files
 
+`<project folder>` in the commands below stands for the folder where you cloned NetCommand (for example `C:\Projects\netcommand`); replace it with your own path.
+
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Tj Huhn\Downloads\NetCommand_60percent\netcommand\docs\phase0\0A1_step1_discover.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<project folder>\docs\phase0\0A1_step1_discover.ps1"
 ```
 
 (`-ExecutionPolicy Bypass` applies to this single run only and changes no setting.)
@@ -197,13 +199,13 @@ Result: `0A1_step1_server_and_config.txt`. Note the **bin folder** (the folder o
 ## 0A-1 Step 2 — Active server values (read-only SQL)
 
 The MariaDB client's `tee` and `source` commands do not handle paths with spaces
-reliably (`Tj Huhn` has one), so the script is copied into the report folder and the
+reliably (a Windows user name such as `First Last` has one), so the script is copied into the report folder and the
 client is started **from there**. Use the bin folder from Step 1 (here
 `C:\xampp\mysql\bin`):
 
 ```powershell
 $r = "$env:USERPROFILE\Documents\NetCommand-0A"
-Copy-Item "C:\Users\Tj Huhn\Downloads\NetCommand_60percent\netcommand\docs\phase0\0A1_readonly_server.sql" $r
+Copy-Item "<project folder>\docs\phase0\0A1_readonly_server.sql" $r
 Set-Location $r
 & 'C:\xampp\mysql\bin\mysql.exe' -u root -p --force --table --no-auto-rehash
 ```
@@ -231,7 +233,7 @@ exit
 Run after Step 2 (it reads the active values from `0A1_report.txt`):
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Tj Huhn\Downloads\NetCommand_60percent\netcommand\docs\phase0\0A1_step3_errorlog.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<project folder>\docs\phase0\0A1_step3_errorlog.ps1"
 ```
 
 Result: `0A1_errorlog.txt`. If the report says a file is larger than 512 MB and was
@@ -261,7 +263,7 @@ is reasonable to open the system tables, **and** you approve it.
 
 ```powershell
 $r = "$env:USERPROFILE\Documents\NetCommand-0A"
-Copy-Item "C:\Users\Tj Huhn\Downloads\NetCommand_60percent\netcommand\docs\phase0\0A2_readonly_tables.sql" $r
+Copy-Item "<project folder>\docs\phase0\0A2_readonly_tables.sql" $r
 Set-Location $r
 & 'C:\xampp\mysql\bin\mysql.exe' -u root -p --force --table --no-auto-rehash
 ```

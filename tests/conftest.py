@@ -22,3 +22,19 @@ def private_layout_file(tmp_path, monkeypatch):
     path = tmp_path / 'topology_layout.json'
     monkeypatch.setenv('NETCOMMAND_LAYOUT_FILE', str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def no_unanswered_login_dialog(monkeypatch):
+    """The SSH login dialog is modal: opened in a test without an answer it would wait
+    forever. Tests that reach it must replace login_dialog.ask_device_login themselves;
+    any other test that opens it fails at once instead of hanging."""
+    try:
+        from gui.components import login_dialog
+    except Exception:                       # no tkinter here: nothing can open it
+        return
+
+    def unanswered(*args, **kwargs):
+        raise AssertionError('the SSH login dialog was opened, but this test does not answer '
+                             'it (replace login_dialog.ask_device_login)')
+    monkeypatch.setattr(login_dialog, 'ask_device_login', unanswered)

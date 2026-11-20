@@ -205,9 +205,12 @@ def configure(monkeypatch):
         monkeypatch.setattr(messagebox, name, lambda t, m, _n=name, **k: shown.append((_n, t, m)))
     monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: True)
     answers = {'Username': 'typed-user', 'Password': 'Typed-Pa55'}
-    monkeypatch.setattr(simpledialog, 'askstring',
-                        lambda t, prompt, **k: asked.append(prompt) or
-                        answers['Password' if prompt.startswith('Password') else 'Username'])
+    monkeypatch.setattr('gui.components.login_dialog.ask_device_login',
+                        lambda parent, devices, reason='missing', replaces=(): asked.append(
+                            ([d['name'] for d in devices], reason,
+                             [d['name'] for d in replaces])) or
+                        {'username': answers['Username'], 'password': answers['Password'],
+                         'save': False})
     store = ConfigureStore()
     conf = ConfigureTab(root, store)
     conf.pack()
@@ -221,19 +224,20 @@ def test_configure_explains_and_asks_for_the_unreadable_login(configure):
     creds = conf._collect_creds(store.devices)
     assert creds[1] == {'host': '10.9.0.1', 'username': 'typed-user', 'password': 'Typed-Pa55'}
     assert creds[2] == {'host': '10.9.0.2', 'username': 'admin', 'password': PASSWORD}
-    warnings = [s for s in shown if s[0] == 'showwarning']
-    assert len(warnings) == 1 and warnings[0][1] == 'Saved login cannot be read'
-    assert 'SW1' in warnings[0][2] and 'SW2' not in warnings[0][2]
-    assert asked == ['Username for SW1:', 'Password for SW1:']
+    # the login dialog itself explains the unreadable login (no separate warning box);
+    # its saved (unreadable) login is the one a 'save' would replace
+    assert asked == [(['SW1'], 'unreadable', ['SW1'])]
+    from gui.components.login_dialog import explanation
+    text = explanation([store.devices[0]], 'unreadable')
+    assert 'SW1' in text and 'cannot be read' in text and 'SW2' not in text
     assert secrets_absent(str(shown), PASSWORD, answers['Password'])
 
 
 def test_configure_cancel_after_the_warning_stops_the_apply(configure, monkeypatch):
-    from tkinter import simpledialog
     root, conf, store, shown, asked, answers = configure
-    monkeypatch.setattr(simpledialog, 'askstring', lambda *a, **k: None)
+    monkeypatch.setattr('gui.components.login_dialog.ask_device_login', lambda *a, **k: None)
     assert conf._collect_creds(store.devices) is None
-    assert [s[1] for s in shown] == ['Saved login cannot be read']
+    assert shown == []                                     # cancelled: nothing else happens
 
 
 def test_configure_apply_runs_with_the_typed_login(configure):
@@ -248,7 +252,8 @@ def test_configure_apply_runs_with_the_typed_login(configure):
     conf.apply()
     assert pump(root, lambda: not conf.busy, 10)
     assert [c['username'] for c in calls] == ['typed-user', 'admin']
-    assert [s[1] for s in shown if s[0] != 'showinfo'] == ['Saved login cannot be read']
+    # the unreadable login is explained inside the login dialog (no separate warning box)
+    assert [s[1] for s in shown if s[0] != 'showinfo'] == []
     visible = str(shown) + conf.session.content() + conf.status.cget('text') + str(store.logs)
     assert secrets_absent(visible, PASSWORD, answers['Password'])
 

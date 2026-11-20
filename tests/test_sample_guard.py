@@ -23,7 +23,7 @@ def test_discover_demo_marks_every_device_and_leaves_sample_data_alone():
 
 def test_real_discovery_has_no_marker(monkeypatch):
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
-    devices, _ = crawler.discover('admin', 'cisco123', '192.168.1.2')
+    devices, _ = crawler.discover('admin', 'cisco123', '192.168.1.2', login_neighbours=True)
     assert len(devices) == 5 and all('sample' not in d for d in devices)
 
 

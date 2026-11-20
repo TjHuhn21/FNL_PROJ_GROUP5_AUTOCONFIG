@@ -136,6 +136,57 @@ def clean_detail(detail):
     return text[:DETAIL_MAX] or None
 
 
+MAX_LOCKOUT_THRESHOLD = 100         # sanity caps (policy: 5 attempts, 15 minutes, 60 s)
+MAX_LOCKOUT_SECONDS = 24 * 3600
+MAX_RESEND_COOLDOWN = 3600
+MAX_RESEND_WINDOW = 24 * 3600
+LIST_LIMIT_MAX = 1000
+
+
+def check_lockout(threshold, lockout_seconds):
+    if (not isinstance(threshold, int) or isinstance(threshold, bool)
+            or not 1 <= threshold <= MAX_LOCKOUT_THRESHOLD):
+        raise InvalidValue(f'threshold must be from 1 to {MAX_LOCKOUT_THRESHOLD}.')
+    check_seconds(lockout_seconds, MAX_LOCKOUT_SECONDS, 'lockout_seconds')
+
+
+def check_resend(cooldown_seconds, window_seconds=None):
+    check_seconds(cooldown_seconds, MAX_RESEND_COOLDOWN, 'cooldown_seconds')
+    if window_seconds is not None:
+        check_seconds(window_seconds, MAX_RESEND_WINDOW, 'window_seconds')
+        if window_seconds < cooldown_seconds:
+            raise InvalidValue('window_seconds must not be shorter than cooldown_seconds.')
+
+
+def check_limit(limit):
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= LIST_LIMIT_MAX:
+        raise InvalidValue(f'limit must be from 1 to {LIST_LIMIT_MAX}.')
+    return limit
+
+
+def retry_after(seconds_since_last, cooldown_seconds):
+    """Whole seconds to wait before another code may be sent: 0 when no code was sent
+    within the cooldown. seconds_since_last is truncated (59.9 s counts as 59), so the
+    wait is never rounded down to zero too early."""
+    if seconds_since_last is None:
+        return 0
+    return max(0, cooldown_seconds - max(0, int(seconds_since_last)))
+
+
+# Every account must prove its email address (an emailed one-time code) before it may be
+# active or wait for approval. Registration does it with the registration code, the first
+# administrator with the bootstrap command's code.
+REQUIRES_VERIFIED_EMAIL = ('active', 'pending_approval')
+EMAIL_NOT_VERIFIED = ('The email address of this account has not been verified, so it cannot '
+                      'be active or await approval. Nothing was changed.')
+
+
+def check_verified_for_status(status, email_verified):
+    from backend.database.errors import EmailNotVerified
+    if status in REQUIRES_VERIFIED_EMAIL and not email_verified:
+        raise EmailNotVerified(EMAIL_NOT_VERIFIED)
+
+
 def check_max_attempts(value):
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 20:
         raise InvalidValue('max_attempts must be from 1 to 20.')

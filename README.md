@@ -10,13 +10,20 @@ Scan -> review found devices -> Approve -> Devices (database)
      -> Topology map -> Findings (config review) -> Configure (preview, backup, apply, check, log)
 ```
 
+> **New team member?** Follow **[docs/TEAM_INSTALLATION_GUIDE.md](docs/TEAM_INSTALLATION_GUIDE.md)**:
+> a step-by-step Windows/PowerShell installation of the desktop app, the backend, both
+> databases and the first administrator, with expected results and troubleshooting.
+> The sections below are the short version.
+
 ## Install
 
-1. Python 3.10 to 3.12 (tick "Add to PATH"). Git. MySQL Community Server 8.4 (LTS).
-2. ```
+1. Python **3.10** (tested on 3.10.0; tick "Add to PATH" and "tcl/tk"). Git. MySQL Community
+   Server 8.4 (LTS).
+2. In PowerShell, from the project folder (calling the venv's Python directly needs no
+   activation, so PowerShell's script policy does not matter):
+   ```powershell
    python -m venv venv
-   venv\Scripts\activate          (Mac/Linux: source venv/bin/activate)
-   pip install -r requirements.txt
+   .\venv\Scripts\python.exe -m pip install -r requirements.txt -r backend\requirements.txt
    ```
 3. Database (MySQL 8.4, done once by the database administrator):
    * MySQL listens on **127.0.0.1, port 3307** (a non-default port, so it does not clash
@@ -24,35 +31,61 @@ Scan -> review found devices -> Approve -> Devices (database)
    * Create the `netcommand` database and a restricted application account,
      `netcommand_app`, with privileges on `netcommand.*` only (no global privileges, never
      root). The app connects with this account, so a leaked app password cannot touch other
-     databases or administer the server. Creating the tables also needs the `REFERENCES`
-     privilege (three tables have foreign keys), unless the administrator creates them.
+     databases or administer the server. At runtime it needs `SELECT, INSERT, UPDATE,
+     DELETE`; whoever creates the tables also needs `CREATE` and `REFERENCES` (three tables
+     have foreign keys).
    * Create the tables with the tables-only `schema.sql` (it creates no users and changes
-     no existing table or data). The app does **not** create tables by itself:
+     no existing table or data). The app does **not** create tables by itself. Windows
+     PowerShell has no `<` input redirection, so use the `mysql` client's `source` command,
+     from the project folder (`-p` asks for the password; never put it on the command line):
+     ```powershell
+     & 'C:\Program Files\MySQL\MySQL Server 8.4\bin\mysql.exe' --host=127.0.0.1 --port=3307 --user=root -p --execute="source schema.sql"
      ```
-     mysql -h 127.0.0.1 -P 3307 -u netcommand_app -p netcommand < schema.sql
-     ```
-     (`-p` asks for the password; never put it on the command line.)
+     (In `cmd.exe`, `mysql ... < schema.sql` also works.)
 4. Copy `.env.example` to `.env` **on your own computer** and fill in the `DB_` lines
    (`DB_HOST=127.0.0.1`, `DB_PORT=3307`, `DB_USER=netcommand_app`, your password,
    `DB_NAME=netcommand`). `.env` is excluded from Git and must never be committed.
    Then make the encryption key
    (it is written straight into `.env` and never shown, so it cannot be cut short by copy-paste):
-   ```
-   python security.py --new-key     # refuses if Git could expose .env, or if a valid key is already there
-   python security.py --check       # FERNET_KEY is valid (read from the .env file).
+   ```powershell
+   .\venv\Scripts\python.exe security.py --new-key   # refuses if Git could expose .env, or if a valid key is already there
+   .\venv\Scripts\python.exe security.py --check     # FERNET_KEY is valid (read from the .env file).
    ```
    `FERNET_KEY` encrypts and decrypts the device logins stored in the database, so it must stay
    the same: with a different key the saved logins can no longer be read.
    Everyone sharing a database needs the **same** `FERNET_KEY`: send the `.env` line privately.
    Never commit `.env`. A `FERNET_KEY` environment variable, if set, is used before `.env`.
    The app also checks the key at startup and warns (but keeps running) if it is missing or invalid.
+5. The sign-in backend (its own database `netcommand_test`, accounts, migrations, email and the
+   first administrator): see `backend/README.md` and the team installation guide.
 
 ## Run
 
 ```
-python main.py            # uses MySQL; if it is not reachable, starts in SAMPLE mode
-python main.py --demo     # force sample mode (no database, no lab)
+python main.py            # sign in, then uses MySQL; if it is not reachable, starts in SAMPLE mode
+python main.py --demo     # DEMO MODE: sample data, no sign-in (no database, no lab)
 ```
+
+**Signing in.** Without `--demo`, NetCommand first opens a sign-in window that talks to the
+NetCommand backend (`python -m backend`, see `backend/README.md`) at `NETCOMMAND_API_URL`
+(in `.env` or the environment; default `http://127.0.0.1:8000`; a server on another computer
+must use `https://`). Sign in with your email address and password, then the code emailed
+to you. New accounts: *Create account*, enter the emailed verification code, then wait for an
+administrator to approve the account. The session token is kept in memory only, never on
+disk; the session ends on *Sign out*, when the window closes, after 30 minutes without
+activity, after 8 hours, or when an administrator disables the account.
+
+Roles: **Viewer** can look but not change anything (no Scan or Configure, devices read-only,
+stored review only); **Operator** can also scan, configure and edit devices; **Admin** can
+also manage accounts (*Accounts* page: approve, reject, disable, and change another
+account's role after a confirmation; the account is then signed out and signs in again with
+the new role; nobody can change their own role, and the last active admin cannot be
+demoted). The sign-in and account
+actions are checked by the backend; device actions still go straight to MySQL, so for those
+the role limits are applied by this application (an access gate, not yet a security
+boundary). NetCommand accounts have nothing to do with the device logins used for SSH.
+`--demo` never requires sign-in and is always labelled DEMO MODE; a normal start never falls
+back to it.
 
 Sample mode keeps data in memory only and labels everything as sample data. Use it if the
 lab or MySQL fails: the Scan tab's *Demo mode* box loads `sample_data.py`.
@@ -61,7 +94,11 @@ be approved into the real database (Approve is disabled, and `db.py` refuses the
 
 ## The five-minute demo path
 
-1. **Scan** tab: username, password, optional seed IP (blank = default gateway), Scan.
+1. **Scan** tab: username, password, **Seed IP** (required: the device to log in to), Scan.
+   Only the seed is logged in to; its CDP/LLDP neighbours are listed as unmanaged. To log
+   in to them too, tick *Also log in to CDP/LLDP neighbours* (off by default; it sends the
+   login to every neighbour). Older IOS that only offers SHA-1 SSH: see
+   `NETCOMMAND_LEGACY_SSH_HOSTS` in `.env.example`.
 2. Select devices, **Approve selected**. They appear in **Devices**.
 3. **Topology** shows the map (gray = seen but not managed). Single points of failure are listed.
 4. **Findings**: Run review (reads each device's config over SSH). Health score + fixes.
@@ -122,26 +159,33 @@ tests/  lab/  backups/ (config backups, not in Git)
 Only scan and configure networks and devices you own or have permission to use. The app uses
 only the login the admin types and never tries guessed passwords.
 
-## Status: the 60% build
+## Status
 
 | Part | State |
 |---|---|
-| 1 Discovery crawl (`discovery/crawler.py`), SSH engine (`config/connect.py`), Configure tab | Built and tested against a fake lab (`tests/fakes.py`) |
-| 2 MySQL (`schema.sql`, `db.py`), sample-mode twin (`db_fake.py`), `security.py`, `validation.py`, `monitor/monitor.py` | Built and tested, `db.py` also against a real MySQL-compatible server |
-| 3 Review rules, topology map, command builders | Teammates' work, unchanged |
-| 4 Findings and Topology tabs, lab, README | Teammates' work, unchanged |
-| 5 Window, Devices, Logs, Scan tabs | Teammates' work, unchanged |
+| Discovery (`discovery/crawler.py`) | Built. Seed-only by default (the login goes to the Seed IP only; CDP/LLDP neighbours are listed unmanaged), optional neighbour login after a confirmation, device type from the model in `show version` (router / switch / unknown) |
+| SSH engine (`config/connect.py`, `ssh_options.py`), Configure | Built: preview, backup, one command at a time, checks, `write mem` only when the checks pass; strict SSH algorithms with per-device legacy SHA-1 support; SSH login dialog with optional encrypted saving; hostname changes rename the device record; applied form sections are cleared |
+| Database (`schema.sql`, `db.py`), sample store (`db_fake.py`), `security.py`, `validation.py`, monitor | Built; `db.py` also tested against a real MySQL server |
+| Review rules, Findings, Topology, Devices, Logs, Overview dashboard | Built |
+| Sign-in and accounts (`backend/`, `desktop_auth/`) | Built: FastAPI backend, registration with email verification, administrator approval, two-step sign-in with emailed codes, roles (viewer / operator / admin), *Accounts* page |
+| Automated tests | About 1,670 offline tests (no MySQL, network or devices needed), including a simulated Cisco mock lab (`mock-lab/`) |
 
-**Not yet tested on real Cisco devices.** The crawl and apply logic are tested with fake switches
-that answer the same commands. On the real GNS3 lab, run T1 first. If the scan finds the
-starting switch but no neighbors, paste the output of `show cdp neighbors detail` into
-`tests/test_crawler.py` (`parse_cdp`) to see why. Also confirm CDP is on (`show cdp neighbors`).
+**Real hardware.** The app has been used against a physical Cisco 1900 router (scan, then a
+hostname and a DHCP change through Configure). The fixes made after that test (router
+classification, renaming the device after a hostname change, clearing applied form
+sections, seed-only scanning, per-device legacy SSH, the login dialog) are covered by the
+automated tests but have **not yet been re-run on the router**, and no physical **switch**
+has been tested yet. If a scan finds the starting device but no neighbours, paste the
+output of `show cdp neighbors detail` into `tests/test_crawler.py` (`parse_cdp`) to see
+why, and confirm CDP is on (`show cdp neighbors`).
 
 **The monitor** pings every registered device every 30 seconds (real database mode only) and
-saves an event only when a device changes between up and down. The Devices tab shows the
-status. Start with `python main.py --no-monitor` to turn it off.
+saves an event only when a device changes between up and down. The Devices tab and the
+Overview show the status. Start with `python main.py --no-monitor` to turn it off.
 
-**Left for the remaining 40%:** learning extra subnets from router tables, MAC addresses and
-end devices, scheduled rescans, an Events screen for the monitor, more review rules (unused ports,
-native VLAN mismatch, user ports in VLAN 1, duplicate IPs), restore from a backup, and the
-optional console-cable setup mode.
+**Not done yet:** HTTPS for the backend (today each member runs their own backend on
+`127.0.0.1`); moving device operations behind the backend (device permissions are applied
+by the desktop app only); verifying device SSH host keys; restoring a configuration from a
+backup; learning extra subnets from router tables, MAC addresses and end devices; scheduled
+rescans; more review rules (unused ports, native VLAN mismatch, user ports in VLAN 1,
+duplicate IPs); and the optional console-cable setup mode.

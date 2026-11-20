@@ -49,7 +49,8 @@ def test_scan_register_review_configure_on_mysql(monkeypatch):
     for name in ('showinfo', 'showerror', 'showwarning'):
         monkeypatch.setattr(messagebox, name, lambda t, m, _n=name, **k: shown.append((_n, t, m)))
     monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: True)
-    monkeypatch.setattr(simpledialog, 'askstring', lambda *a, **k: 'admin')
+    monkeypatch.setattr('gui.components.login_dialog.ask_device_login',
+                        lambda *a, **k: {'username': 'admin', 'password': 'admin', 'save': False})
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
     configs = {'192.168.1.3': sample_data.CONFIGS['SW1'], '192.168.1.4': sample_data.CONFIGS['SW2'],
                '192.168.1.2': 'hostname CORE\nservice password-encryption\n', '192.168.1.1': 'hostname R1\n'}

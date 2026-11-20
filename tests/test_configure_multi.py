@@ -48,10 +48,13 @@ def env(monkeypatch):
     shown, asked, confirms = [], [], []
     for name in ('showinfo', 'showerror', 'showwarning'):
         monkeypatch.setattr(messagebox, name, lambda t, m, _n=name, **k: shown.append((_n, t, m)))
-    monkeypatch.setattr(messagebox, 'askyesno', lambda t, m, **k: confirms.append((t, m)) or True)
-    monkeypatch.setattr(simpledialog, 'askstring',
-                        lambda t, prompt, **k: asked.append(prompt) or ('pw' if 'Password' in prompt
-                                                                        else 'admin'))
+    # yes to every question, except the offer to retry a refused login (the fakes refuse it again)
+    monkeypatch.setattr(messagebox, 'askyesno',
+                        lambda t, m, **k: confirms.append((t, m)) or t != 'SSH login refused')
+    monkeypatch.setattr('gui.components.login_dialog.ask_device_login',
+                        lambda parent, devices, reason='missing', replaces=(): asked.append(
+                            ([d['name'] for d in devices], reason)) or
+                        {'username': 'admin', 'password': 'pw', 'save': False})
     from gui.configure_tab import ConfigureTab
     store, summary = Store(), []
     conf = ConfigureTab(root, store, log=lambda *a, **k: summary.append(a))
@@ -265,8 +268,7 @@ def test_login_is_asked_once_for_devices_without_one(env):
     conf.apply_fn = fake_apply(calls)
     conf.apply()
     assert pump(root, lambda: not conf.busy)
-    assert env['asked'] == ['Username for 2 devices without a saved login (CORE, SW2):',
-                            'Password for 2 devices without a saved login (CORE, SW2):']
+    assert env['asked'] == [(['CORE', 'SW2'], 'missing')]      # ONE dialog for both
     assert [c['creds']['password'] for c in calls] == ['pw', PASSWORD, 'pw']
 
 

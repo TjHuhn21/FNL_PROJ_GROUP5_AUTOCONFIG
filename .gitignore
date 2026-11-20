@@ -27,6 +27,25 @@ backups/
 *.sqlite3
 *.db
 
+# Device configuration backups, database dumps and generated SQL (never commit:
+# they can contain password hashes, account data or device configurations).
+# schema.sql and docs/phase0/*.sql are source files and stay tracked.
+*.bak
+*.dump
+*dump*.sql
+*_backup.sql
+*-backup.sql
+backup_*.sql
+audit_triggers.sql
+audit_purge*.sql
+
+# Logs (PuTTY / switch session logs, backend logs) and development email outbox files
+*.log
+*.eml
+
+# Group documents kept outside the code repository (they contain members' names)
+GROUP-5-PROPOSAL (2).docx
+
 # Operating system files
 .DS_Store
 Thumbs.db

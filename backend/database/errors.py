@@ -41,6 +41,29 @@ class MigrationError(RepositoryError):
     """The migration state is unknown, inconsistent or unsafe: nothing more was run."""
 
 
+class ResendTooSoon(RepositoryError):
+    """A new code was requested within the resend cooldown. Nothing was created.
+    retry_after_seconds: whole seconds until another code may be requested."""
+
+    def __init__(self, retry_after_seconds):
+        self.retry_after_seconds = int(retry_after_seconds)
+        super().__init__(f'A code was sent recently. Wait {self.retry_after_seconds} seconds '
+                         f'before requesting another one.')
+
+
+class EmailNotVerified(InvalidValue):
+    """The account's email address has not been verified, so it cannot be (or become)
+    active or await approval. Nothing was changed."""
+
+
+class AdminExists(RepositoryError):
+    """The first-administrator setup was refused: an active admin already exists."""
+
+
+class SetupBusy(RepositoryError):
+    """Another first-administrator setup holds the database lock right now."""
+
+
 class LastActiveAdmin(InvalidValue):
     """The change would leave no active admin (demoting or disabling the last one).
     Nothing was changed."""

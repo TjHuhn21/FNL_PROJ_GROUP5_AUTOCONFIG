@@ -180,4 +180,5 @@ def test_the_notice_disappears_for_a_normal_scan(real, monkeypatch):
     root.update()
     assert not scan.block_note.winfo_ismapped() and not scan.approve_btn.instate(['disabled'])
     scan.approve()
-    assert shown[-1] == ('showinfo', 'Approved', '5 devices registered.')
+    # seed-only (the default): CORE plus its three CDP neighbours, which were not logged in to
+    assert shown[-1] == ('showinfo', 'Approved', '4 devices registered.')

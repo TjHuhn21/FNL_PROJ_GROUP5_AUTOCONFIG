@@ -11,8 +11,10 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from backend.database import auth_records as R
-from backend.database.auth_repository import LAST_ADMIN, TOKEN_IN_USE, USER_NOT_FOUND
-from backend.database.errors import DuplicateEmail, InvalidValue, LastActiveAdmin
+from backend.database.auth_repository import (ADMIN_EXISTS, LAST_ADMIN, LIST_USER_FIELDS,
+                                              TOKEN_IN_USE, USER_NOT_FOUND)
+from backend.database.errors import (AdminExists, DuplicateEmail, InvalidValue, LastActiveAdmin,
+                                     ResendTooSoon)
 
 
 def utc_now():
@@ -39,19 +41,21 @@ class InMemoryAuthRepository:
 
     # ------------------------------------------------------------ users
     def create_user(self, email, full_name, password_hash, role='viewer',
-                    status='pending_verification'):
+                    status='pending_verification', *, email_verified=False):
         email, normalized = R.check_email(email), R.normalize_email(email)
         name = R.check_full_name(full_name)
         R.check_password_hash(password_hash)
         R.check_choice(role, R.ROLES, 'role')
         R.check_choice(status, R.STATUSES, 'status')
+        R.check_verified_for_status(status, email_verified)
         with self._lock:
             if any(u['email_normalized'] == normalized for u in self._users.values()):
                 raise DuplicateEmail('An account with this email address already exists.')
             now, uid = self.clock(), self._id('user')
             self._users[uid] = {'id': uid, 'email': email, 'email_normalized': normalized,
                                 'full_name': name, 'password_hash': password_hash, 'role': role,
-                                'status': status, 'email_verified_at': None, 'approved_by': None,
+                                'status': status, 'email_verified_at': now if email_verified
+                                else None, 'approved_by': None,
                                 'approved_at': None, 'failed_logins': 0, 'locked_until': None,
                                 'created_at': now, 'updated_at': now}
             return uid
@@ -96,6 +100,7 @@ class InMemoryAuthRepository:
             if (not u or u['status'] == status
                     or (expected_status is not None and u['status'] != expected_status)):
                 return False
+            R.check_verified_for_status(status, u['email_verified_at'] is not None)
             if u['role'] == 'admin' and u['status'] == 'active' and status != 'active':
                 self._guard_last_admin(user_id)
             record = R.audit_values('user.status_changed', 'success', target_type='user',
@@ -146,7 +151,7 @@ class InMemoryAuthRepository:
             if not approver or approver['role'] != 'admin' or approver['status'] != 'active':
                 raise InvalidValue('Only an active admin can approve an account.')
             u = self._users.get(user_id)
-            if not u or u['status'] != 'pending_approval':
+            if not u or u['status'] != 'pending_approval' or u['email_verified_at'] is None:
                 return False
             record = R.audit_values('user.approved', 'success', target_type='user',
                                     target_id=user_id, detail=f'role {role}' if role else None,
@@ -157,19 +162,152 @@ class InMemoryAuthRepository:
             self._append_audit(record)
             return True
 
+    def create_first_admin(self, email, full_name, password_hash, *, workstation_label=None):
+        email, normalized = R.check_email(email), R.normalize_email(email)
+        name = R.check_full_name(full_name)
+        R.check_password_hash(password_hash)
+        label = R.check_optional_text(workstation_label, R.LABEL_MAX, 'workstation_label')
+        with self._lock:                               # check and create: one atomic step
+            if self._active_admins():
+                raise AdminExists(ADMIN_EXISTS)
+            inactive = sum(1 for u in self._users.values() if u['role'] == 'admin')
+            uid = self.create_user(email, name, password_hash, role='admin', status='active',
+                                   email_verified=True)
+            self._append_audit(R.audit_values(
+                'user.bootstrap_admin', 'success', actor_email=normalized, target_type='user',
+                target_id=uid, workstation_label=label,
+                detail=f'first administrator created by the local bootstrap command after its '
+                       f'email address was verified with a one-time code; {inactive} inactive '
+                       f'admin account(s) existed'))
+            return {'user_id': uid, 'inactive_admins': inactive}
+
+    def mark_existing_admin_email_verified(self, user_id, *, workstation_label=None):
+        R.check_id(user_id, 'user_id')
+        label = R.check_optional_text(workstation_label, R.LABEL_MAX, 'workstation_label')
+        with self._lock:
+            u = self._users.get(user_id)
+            if (not u or u['role'] != 'admin' or u['status'] != 'active'
+                    or u['email_verified_at'] is not None):
+                return False
+            record = R.audit_values(
+                'auth.email_verified', 'success', actor_user_id=user_id, target_type='user',
+                target_id=user_id, workstation_label=label,
+                detail='existing administrator verified its email address with a one-time '
+                       'code (local command)')
+            u['email_verified_at'] = self.clock()          # nothing else changes
+            self._append_audit(record)
+            return True
+
+    def list_users(self, status=None, limit=100, after_id=None):
+        if status is not None:
+            R.check_choice(status, R.STATUSES, 'status')
+        R.check_limit(limit)
+        if after_id is not None:
+            R.check_id(after_id, 'after_id')
+        with self._lock:
+            now, rows = self.clock(), []
+            for uid in sorted(self._users):
+                u = self._users[uid]
+                if (status is not None and u['status'] != status) or (
+                        after_id is not None and uid <= after_id):
+                    continue
+                row = {k: copy.copy(u[k]) for k in LIST_USER_FIELDS if k != 'locked'}
+                row['locked'] = self._lock_active(u, now)
+                rows.append(row)
+                if len(rows) == limit:
+                    break
+            return rows
+
+    # ------------------------------------------------------------ password attempts
+    @staticmethod
+    def _lock_active(u, now):
+        return u['locked_until'] is not None and u['locked_until'] > now
+
+    def begin_password_attempt(self, user_id, threshold, lockout_seconds, *, client_ip=None,
+                               workstation_label=None):
+        R.check_id(user_id, 'user_id')
+        R.check_lockout(threshold, lockout_seconds)
+        audit = R.audit_context(None, client_ip, workstation_label)
+        with self._lock:
+            u, now = self._users.get(user_id), self.clock()
+            if not u:
+                return None
+            if self._lock_active(u, now):
+                return {'allowed': False, 'failed_logins': u['failed_logins'],
+                        'locked_until': u['locked_until'], 'newly_locked': False}
+            count = (0 if u['locked_until'] is not None else u['failed_logins']) + 1
+            if count < threshold:
+                u.update(failed_logins=count, locked_until=None)
+                return {'allowed': True, 'failed_logins': count, 'locked_until': None,
+                        'newly_locked': False}
+            record = R.audit_values('auth.account_locked', 'denied', target_type='user',
+                                    target_id=user_id,
+                                    detail=f'{count} password attempts; locked for '
+                                           f'{lockout_seconds} s unless this attempt succeeds',
+                                    **audit)
+            u.update(failed_logins=count, locked_until=now + timedelta(seconds=lockout_seconds))
+            self._append_audit(record)
+            return {'allowed': True, 'failed_logins': count, 'locked_until': u['locked_until'],
+                    'newly_locked': True}
+
+    def record_password_success(self, user_id, *, client_ip=None, workstation_label=None):
+        R.check_id(user_id, 'user_id')
+        audit = R.audit_context(user_id, client_ip, workstation_label)
+        with self._lock:
+            u, now = self._users.get(user_id), self.clock()
+            if not u:
+                return False
+            record = None
+            if self._lock_active(u, now):
+                record = R.audit_values('auth.lock_cleared', 'success', target_type='user',
+                                        target_id=user_id,
+                                        detail='correct password on an allowed attempt; failure '
+                                               'count and lock cleared', **audit)
+            u.update(failed_logins=0, locked_until=None)
+            if record:
+                self._append_audit(record)
+            return True
+
     # ------------------------------------------------------------ email challenges
+    def _resend_facts(self, user_id, purpose, window_seconds, now):
+        since = now - timedelta(seconds=window_seconds)
+        recent = [c['created_at'] for c in self._challenges.values()
+                  if c['user_id'] == user_id and c['purpose'] == purpose
+                  and c['created_at'] > since]
+        last = None if not recent else max(0, int((now - max(recent)).total_seconds()))
+        return {'recent_count': len(recent), 'seconds_since_last': last}
+
+    def challenge_resend_state(self, user_id, purpose, cooldown_seconds, window_seconds=3600):
+        R.check_id(user_id, 'user_id')
+        R.check_choice(purpose, R.PURPOSES, 'purpose')
+        R.check_resend(cooldown_seconds, window_seconds)
+        with self._lock:
+            facts = self._resend_facts(user_id, purpose, window_seconds, self.clock())
+        return {'recent_count': facts['recent_count'],
+                'seconds_since_last': facts['seconds_since_last'],
+                'retry_after_seconds': R.retry_after(facts['seconds_since_last'],
+                                                     cooldown_seconds)}
+
     def create_challenge(self, user_id, purpose, code_hmac, ttl_seconds, max_attempts=5,
-                         requester_ip=None, workstation_label=None):
+                         requester_ip=None, workstation_label=None,
+                         resend_cooldown_seconds=None):
         R.check_id(user_id, 'user_id')
         R.check_choice(purpose, R.PURPOSES, 'purpose')
         R.check_hex64(code_hmac, 'code_hmac')
         R.check_seconds(ttl_seconds, R.MAX_CHALLENGE_TTL, 'ttl_seconds')
         R.check_max_attempts(max_attempts)
+        if resend_cooldown_seconds is not None:
+            R.check_resend(resend_cooldown_seconds)
         ip = R.check_optional_text(requester_ip, R.IP_MAX, 'requester_ip')
         label = R.check_optional_text(workstation_label, R.LABEL_MAX, 'workstation_label')
         with self._lock:
             if user_id not in self._users:
                 raise InvalidValue(USER_NOT_FOUND)
+            if resend_cooldown_seconds is not None:
+                facts = self._resend_facts(user_id, purpose, resend_cooldown_seconds, self.clock())
+                wait = R.retry_after(facts['seconds_since_last'], resend_cooldown_seconds)
+                if wait:
+                    raise ResendTooSoon(wait)
             now, public_id = self.clock(), secrets.token_urlsafe(32)
             self._challenges[public_id] = {
                 'id': self._id('challenge'), 'public_id': public_id, 'user_id': user_id,
@@ -269,7 +407,7 @@ class InMemoryAuthRepository:
             if not self._usable(s, now, idle_timeout_seconds):
                 return None
             u = self._users.get(s['user_id'])
-            if not u or u['status'] != 'active':
+            if not u or u['status'] != 'active' or u['email_verified_at'] is None:
                 return None
             row = {k: s[k] for k in _SESSION_PUBLIC}
             row.update(role=u['role'], user_status=u['status'])

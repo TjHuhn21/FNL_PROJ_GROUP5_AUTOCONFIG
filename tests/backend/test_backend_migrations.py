@@ -867,3 +867,22 @@ def test_the_web_app_never_loads_the_migrations():
                          text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout.strip().splitlines()[-1]) == []
+
+
+# ---------------------------------------------------------------- production flag (Phase 1)
+@pytest.mark.parametrize('name', ['netcommand_test', 'netcommand_prod'])
+def test_production_flag_is_refused_for_non_production_databases(monkeypatch, name):
+    no_connection(monkeypatch)
+    code, text = run_cli(['status', '--production', '--authorize-database', name],
+                         settings_for(name))
+    assert code == 2 and '--production was given' in text
+
+
+def test_test_database_commands_are_unchanged_by_the_new_options():
+    schema = FakeSchema()
+    code, text = run_cli(['up', '--confirm-database', 'netcommand_test'], settings_for(), schema)
+    assert code == 0 and 'Identity checked' not in text
+    code, text = run_cli(['down', '--to', '0', '--confirm-database', 'netcommand_test'],
+                         settings_for(), schema)
+    assert 'restoring a verified backup' not in text   # the production rule does not apply
+    assert 'administrator' in text                      # the existing audit_log rule does

@@ -1,5 +1,6 @@
 import queue
 import threading
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -12,12 +13,22 @@ SAMPLE_BLOCKED = ('These are sample devices. They can only be approved in sample
                   '(python main.py --demo). Untick Demo mode and scan the real network '
                   'to register devices.')
 BLOCK_NOTE = 'Sample devices cannot be added to the database'
+SEED_NEEDED = ('Type the management IP address of the switch or router to log in to. '
+               'NetCommand logs in only to that device; its CDP/LLDP neighbours are '
+               'listed without logging in to them.')
+NEIGHBOUR_WARNING = ('NetCommand will also try this username and password on EVERY '
+                     'CDP/LLDP neighbour that has a management IP address, so the login is '
+                     'sent to those devices too.\n\nOnly do this on a network you control, '
+                     'where all neighbours are expected to use this login.\n\nContinue?')
 
 
-def run_scan(results, discover, username, password, seed_ip, demo):
-    """Worker thread: never touches the window, reports through the queue."""
+def run_scan(results, discover, username, password, seed_ip, demo, login_neighbours=False):
+    """Worker thread: never touches the window, reports through the queue.
+    The neighbour option is passed only when it is on (older discover callables
+    take four arguments)."""
     try:
-        devices, links = discover(username, password, seed_ip, demo)
+        args = (username, password, seed_ip, demo) + ((True,) if login_neighbours else ())
+        devices, links = discover(*args)
         results.put(('done', devices, links))
     except Exception as err:
         results.put(('error', str(err)))
@@ -25,31 +36,38 @@ def run_scan(results, discover, username, password, seed_ip, demo):
 
 class ScanTab(ttk.Frame):
     def __init__(self, parent, store, discover, on_approved=None,
-                 demo_default=False, find_gateway=None, sample_store=None):
+                 demo_default=False, sample_store=None):
         """sample_store: True when store is the in-memory sample store (db_fake),
         False for the real database. Defaults to demo_default."""
         super().__init__(parent, padding=theme.PAD)
         self.store, self.discover, self.on_approved = store, discover, on_approved
-        self.find_gateway = find_gateway
         self.sample_store = demo_default if sample_store is None else bool(sample_store)
         self.results = queue.Queue()
         self.found, self.found_links, self.scanning = [], [], False
         # Where the CURRENT results came from, fixed when they arrive. The Demo
         # checkbox can be changed afterwards, so it must not decide this.
         self.found_is_sample, self._scan_is_demo = False, False
+        # This session's scans and approvals, newest last (memory only: a scan that is not
+        # approved leaves nothing in the database). Read by the Overview page.
+        self.history = []
+        self.on_activity = None                  # called after each entry (Overview refresh)
+        self._scan_seed = ''
 
         ttk.Label(self, text='Scan the network', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(self, text='Plug in, type one login, and scan. The login is used '
-                  'for this scan only unless you tick the box below.',
-                  foreground='#555').pack(anchor='w', pady=(0, theme.PAD))
+        ttk.Label(self, text='Type the device login and its management IP (Seed IP), then '
+                  'scan. Only that device is logged in to; its neighbours are listed from '
+                  'CDP/LLDP. The login is used for this scan only unless you tick the box below.',
+                  foreground='#555', wraplength=760, justify='left').pack(
+                      anchor='w', pady=(0, theme.PAD))
 
         form = ttk.Frame(self); form.pack(fill='x')
         self.user, self.pw, self.seed = tk.StringVar(), tk.StringVar(), tk.StringVar()
         self.demo = tk.IntVar(value=int(demo_default))
         self.save_login = tk.IntVar(value=1)
+        self.login_neighbours = tk.IntVar(value=0)       # off: only the seed gets the login
         for col, (label, var, show) in enumerate(
                 [('Username', self.user, ''), ('Password', self.pw, '*'),
-                 ('Seed IP (optional)', self.seed, '')]):
+                 ('Seed IP', self.seed, '')]):
             ttk.Label(form, text=label).grid(row=0, column=col * 2, sticky='w', padx=(0, 4))
             ttk.Entry(form, textvariable=var, show=show, width=18).grid(
                 row=0, column=col * 2 + 1, padx=(0, theme.PAD * 2))
@@ -62,6 +80,9 @@ class ScanTab(ttk.Frame):
                         variable=self.demo).pack(side='left')
         ttk.Checkbutton(opts, text='Save the login (encrypted) with approved devices',
                         variable=self.save_login).pack(side='left', padx=theme.PAD * 2)
+        ttk.Checkbutton(self, text='Also log in to CDP/LLDP neighbours with this login '
+                        '(sends the login to every neighbour; off = seed device only)',
+                        variable=self.login_neighbours).pack(anchor='w', pady=(0, theme.PAD))
 
         self.status = ttk.Label(self, text='Ready.'); self.status.pack(anchor='w')
         cols = [('name', 'Name', 150), ('ip', 'IP', 130), ('type', 'Type', 90),
@@ -93,29 +114,31 @@ class ScanTab(ttk.Frame):
             return
         demo = bool(self.demo.get())
         seed = self.seed.get().strip()
+        neighbours = False
         if not demo:
             if not self.user.get().strip() or not self.pw.get():
                 messagebox.showerror('Login needed', 'Enter the username and password.')
                 return
-            if not seed and self.find_gateway:
-                seed = self.find_gateway() or ''
-            if not seed:
-                messagebox.showerror('Starting point needed',
-                                     'Could not find the default gateway. Type a seed IP '
-                                     '(for example the core switch).')
+            if not seed:                     # never guessed (no default-gateway fallback)
+                messagebox.showerror('Seed IP needed', SEED_NEEDED)
                 return
             problem = validation.check_ip(seed)
             if problem:
                 messagebox.showerror('Seed IP', problem)
                 return
+            neighbours = bool(self.login_neighbours.get())
+            if neighbours and not messagebox.askyesno('Log in to neighbours?',
+                                                      NEIGHBOUR_WARNING, icon='warning'):
+                return
         self.scanning = True
+        self._scan_seed = seed
         self._scan_is_demo = demo
         self.scan_btn.state(['disabled'])
         self.status.config(text='Scanning... this can take a minute.' if not demo
                            else 'Loading sample data...')
         threading.Thread(target=run_scan, daemon=True,
                          args=(self.results, self.discover, self.user.get().strip(),
-                               self.pw.get(), seed, demo)).start()
+                               self.pw.get(), seed, demo, neighbours)).start()
         self.after(200, self.check_queue)
 
     def check_queue(self):
@@ -128,9 +151,18 @@ class ScanTab(ttk.Frame):
         self.scan_btn.state(['!disabled'])
         if msg[0] == 'error':
             self.status.config(text='Scan failed.')
+            self._remember({'kind': 'scan', 'seed': self._scan_seed, 'failed': True,
+                            'sample': self._scan_is_demo})
             messagebox.showerror('Scan failed', msg[1])
         else:
             self.show_found(msg[1], msg[2], sample=self._scan_is_demo)
+
+    def _remember(self, entry):
+        """Add one entry to this session's scan history (kept to the last 20)."""
+        entry['when'] = datetime.now()
+        self.history = (self.history + [entry])[-20:]
+        if self.on_activity:
+            self.on_activity()
 
     def show_found(self, devices, links, sample=False):
         self.found, self.found_links = list(devices), list(links)
@@ -154,6 +186,9 @@ class ScanTab(ttk.Frame):
             'Select the ones to register and click Approve.'
         self.status.config(text=f'Found {len(self.found)} devices ({n_managed} managed) '
                                 f'and {len(self.found_links)} links{sample_note}. {next_step}')
+        self._remember({'kind': 'scan', 'seed': self._scan_seed, 'devices': len(self.found),
+                        'managed': n_managed, 'links': len(self.found_links),
+                        'sample': self.found_is_sample})
 
     def select_all(self):
         self.tree.selection_set(self.tree.get_children())
@@ -298,6 +333,7 @@ class ScanTab(ttk.Frame):
         if skipped:
             message += ' Not restored (still deleted): ' + ', '.join(d['name'] for d in skipped) + '.'
         self.status.config(text=f'{message} See the Devices page.')
+        self._remember({'kind': 'approval', 'count': n})
         messagebox.showinfo('Approved', message)
         if self.on_approved:
             self.on_approved()

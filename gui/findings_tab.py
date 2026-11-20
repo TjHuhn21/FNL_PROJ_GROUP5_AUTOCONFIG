@@ -94,7 +94,16 @@ class FindingsTab(ttk.Frame):
         self.fix = ttk.Label(self, text='', foreground='#333', justify='left')
         self.fix.pack(anchor='w')
         bar = ttk.Frame(self); bar.pack(fill='x', pady=(theme.PAD, 0))
-        ttk.Button(bar, text='Send to Configure', command=self.send_selected).pack(side='right')
+        self.send_btn = ttk.Button(bar, text='Send to Configure', command=self.send_selected)
+        self.send_btn.pack(side='right')
+        self.read_only = False
+
+    def set_read_only(self, read_only):
+        """Viewers: the stored review can be shown, but a new review (which replaces the
+        stored one) cannot be run and nothing can be sent to Configure."""
+        self.read_only = bool(read_only)
+        for button in (self.run_btn, self.send_btn):
+            button.state(['disabled'] if self.read_only else ['!disabled'])
 
     # ---------------------------------------------------------------- starting work
     def _start(self, text, target, *args):
@@ -107,7 +116,7 @@ class FindingsTab(ttk.Frame):
         self.after(POLL_MS, self.check_queue)
 
     def run(self):
-        if self.busy or not database_ready(self):
+        if self.read_only or self.busy or not database_ready(self):
             return
         self._start('Reading configurations and reviewing...', _review_worker,
                     self.collect, self.store)
@@ -152,7 +161,8 @@ class FindingsTab(ttk.Frame):
                 pass
             return
         self.busy = False
-        self.run_btn.state(['!disabled'])
+        if not self.read_only:
+            self.run_btn.state(['!disabled'])
         self.stored_btn.state(['!disabled'])
         kind = msg[0]
         if kind == 'error':
@@ -205,6 +215,8 @@ class FindingsTab(ttk.Frame):
     def show(self, findings, score, notes=(), source='', saved=None, save_error=None):
         """A review completed just now. saved: store.replace_findings' result, or None
         when it was not stored (sample data, or save_error)."""
+        if saved is not None and getattr(self, 'on_saved', None):
+            self.on_saved()                        # e.g. the Overview's findings counts
         self._fill(findings)
         sample = source.startswith('SAMPLE')
         self.score.config(text=f'Health score: {score} / 100   ({len(self.findings)} findings)'
@@ -269,6 +281,8 @@ class FindingsTab(ttk.Frame):
             self.fix.config(text='Suggested fix:  ' + '  |  '.join(f['commands']))
 
     def send_selected(self):
+        if self.read_only:
+            return
         f = self.selected()
         if not f:
             messagebox.showinfo('Select a finding', 'Click a finding first.')

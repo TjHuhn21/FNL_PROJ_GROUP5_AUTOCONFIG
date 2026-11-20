@@ -1,0 +1,97 @@
+{
+  "_note": "NetCommand Mock Lab. Every login below is FAKE and exists only for this local lab. Never reuse them on real equipment, and never put real credentials here. Device configurations are reset from this file each time the lab starts.",
+
+  "shared_scan_account": {
+    "_note": "Accepted by every mock device, so a NetCommand Scan (one login for all devices) can log in to all three. It is privilege 15 (lands at #), because NetCommand uses the login password as the enable secret. Set to null to require each device's own login.",
+    "username": "labscan",
+    "password": "Lab-scan-pass",
+    "privilege": 15
+  },
+
+  "devices": [
+    {
+      "name": "R1",
+      "type": "router",
+      "host": "127.0.0.11",
+      "port": 22,
+      "username": "labadmin",
+      "password": "Lab-R1-pass",
+      "start_privileged": false,
+      "_privilege_note": "R1 starts in user mode (R1>) so NetCommand's 'enable' step is exercised; the enable secret is the login password, as NetCommand expects.",
+      "failure": "none",
+      "delay_ms": 0,
+      "ports": {"GigabitEthernet": 3},
+      "interfaces": {
+        "GigabitEthernet0/0": {"description": "LAN", "ip": "192.168.10.1", "mask": "255.255.255.0", "shutdown": false, "connected": true},
+        "GigabitEthernet0/1": {"description": "Link to SW1", "ip": "10.0.12.1", "mask": "255.255.255.252", "shutdown": false, "connected": true},
+        "GigabitEthernet0/2": {"shutdown": true}
+      },
+      "static_routes": [["0.0.0.0", "0.0.0.0", "192.168.10.254"]],
+      "dhcp_excluded": [],
+      "dhcp_pools": [],
+      "name_servers": [],
+      "ntp_servers": [],
+      "global_lines": ["service password-encryption", "ip domain-name lab.local", "username labadmin privilege 15 secret 5 $1$mock$hidden"],
+      "line_config": {"con 0": ["logging synchronous"], "vty 0 4": ["login local", "transport input ssh"]},
+      "cdp_neighbors": [
+        {"device": "SW1", "local": "GigabitEthernet0/1", "remote": "GigabitEthernet0/1"}
+      ]
+    },
+    {
+      "name": "SW1",
+      "type": "switch",
+      "host": "127.0.0.12",
+      "port": 22,
+      "username": "labadmin",
+      "password": "Lab-SW1-pass",
+      "start_privileged": true,
+      "failure": "none",
+      "delay_ms": 0,
+      "trunk_encapsulation": "required",
+      "_trunk_note": "required: like a switch that supports ISL and 802.1Q, 'switchport mode trunk' is rejected until 'switchport trunk encapsulation dot1q' is set.",
+      "ports": {"FastEthernet": 24, "GigabitEthernet": 2},
+      "vlans": {"10": "STAFF"},
+      "interfaces": {
+        "FastEthernet0/1": {"mode": "access", "access_vlan": 10, "connected": true},
+        "FastEthernet0/2": {"connected": true},
+        "GigabitEthernet0/1": {"description": "Uplink to R1", "connected": true},
+        "GigabitEthernet0/2": {"description": "Link to SW2", "mode": "trunk", "encapsulation": "dot1q", "connected": true},
+        "Vlan1": {"ip": "127.0.0.12", "mask": "255.0.0.0", "shutdown": false}
+      },
+      "default_gateway": "10.0.12.1",
+      "global_lines": ["service password-encryption", "ip domain-name lab.local", "username labadmin privilege 15 secret 5 $1$mock$hidden"],
+      "line_config": {"con 0": ["logging synchronous"], "vty 0 4": ["login local", "transport input ssh"]},
+      "cdp_neighbors": [
+        {"device": "R1", "local": "GigabitEthernet0/1", "remote": "GigabitEthernet0/1"},
+        {"device": "SW2", "local": "GigabitEthernet0/2", "remote": "GigabitEthernet0/1"}
+      ]
+    },
+    {
+      "name": "SW2",
+      "type": "switch",
+      "host": "127.0.0.13",
+      "port": 22,
+      "username": "labadmin",
+      "password": "Lab-SW2-pass",
+      "start_privileged": true,
+      "failure": "none",
+      "delay_ms": 0,
+      "trunk_encapsulation": "unsupported",
+      "_trunk_note": "unsupported: like an 802.1Q-only switch, 'switchport trunk encapsulation dot1q' is an invalid command here.",
+      "ports": {"FastEthernet": 24, "GigabitEthernet": 2},
+      "vlans": {},
+      "interfaces": {
+        "GigabitEthernet0/1": {"description": "Link to SW1", "mode": "trunk", "connected": true},
+        "FastEthernet0/1": {"connected": true},
+        "Vlan1": {"ip": "127.0.0.13", "mask": "255.0.0.0", "shutdown": false}
+      },
+      "default_gateway": "10.0.12.1",
+      "_findings_note": "SW2 deliberately allows telnet and has password encryption off, so NetCommand's Findings page has something to report.",
+      "global_lines": ["ip domain-name lab.local", "username labadmin privilege 15 password 0 Lab-SW2-pass"],
+      "line_config": {"con 0": [], "vty 0 4": ["login local", "transport input telnet ssh"]},
+      "cdp_neighbors": [
+        {"device": "SW1", "local": "GigabitEthernet0/1", "remote": "GigabitEthernet0/2"}
+      ]
+    }
+  ]
+}

@@ -29,6 +29,13 @@ Target database: names ending in _test are allowed. Any other name needs
 --confirm-database NAME. Stop the backend before `down`: the tables are write-locked
 while they are checked and dropped, so a running backend would wait or fail.
 
+The PRODUCTION database (netcommand_backend) additionally needs, for every command except
+`plan`: BACKEND_ENV=production, --production, --authorize-database NAME and
+--confirm-database NAME; right after connecting, SELECT DATABASE(), @@server_uuid must
+match BACKEND_DB_NAME and BACKEND_DB_SERVER_UUID (a wrong-server safeguard, not proof of
+identity); and `down` (except --dry-run) is refused there: production rollback means
+restoring a verified backup. See backend/database/production.py.
+
 The migration and runtime accounts must be different accounts (refused otherwise).
 
 Exit codes: 0 ok; 1 inconsistent state; 2 refused or failed; 3 status ok but audit_log not
@@ -39,7 +46,7 @@ import argparse
 import getpass
 import sys
 
-from backend.database import audit_triggers
+from backend.database import audit_triggers, production
 from backend.database.errors import MigrationError, RepositoryError
 from backend.database.migrations import (MIGRATIONS, TRACKING_DDL, MigrationRunner,
                                          MySQLSchema, check_database_name, check_definitions)
@@ -72,11 +79,16 @@ def parse_args(argv):
     down.add_argument('--allow-audit-history-loss', action='store_true')
     for cmd in (up, down):
         cmd.add_argument('--dry-run', action='store_true')
-        cmd.add_argument('--confirm-database', metavar='NAME')
     for cmd in (up, down, status, grants, connection, triggers, recommended, purge):
         cmd.add_argument('--authorize-database', metavar='NAME',
                          help='allow a database whose name does not end in _test')
         cmd.add_argument('--allow-main-database', action='store_true')
+        cmd.add_argument('--confirm-database', metavar='NAME',
+                         help='needed to change a database, and for every command on the '
+                              'production database')
+        cmd.add_argument('--production', action='store_true',
+                         help='required (with BACKEND_ENV=production) for the production '
+                              'database, refused for any other')
     return p.parse_args(argv)
 
 
@@ -159,7 +171,14 @@ def main(argv=None, settings=None, schema=None, out=print, password_source=None)
             from backend.settings import load_settings
             settings = load_settings()
         name = settings.database.name if settings.database else ''
+        kind = 'other'
+        if name:                                  # production rules first, then the old ones
+            kind = production.check_target(name, settings.environment,
+                                           production_flag=args.production,
+                                           authorized=args.authorize_database,
+                                           confirmed=args.confirm_database)
         check_database_name(name, args.authorize_database, args.allow_main_database)
+        production.check_rollback(kind, args.command, getattr(args, 'dry_run', False))
         if args.command == 'audit-triggers-sql':
             out(audit_triggers.admin_sql(name))
             return 0
@@ -175,6 +194,8 @@ def main(argv=None, settings=None, schema=None, out=print, password_source=None)
                                  f'(nothing was run).')
         if args.command == 'check-runtime-connection':
             from backend.database.health import check_database
+            if production.check_runtime_identity(settings, kind):
+                out(f'Identity checked: database {name} {production.SAFEGUARD_NOTE}.')
             result = check_database(settings)
             who = f'Runtime account {settings.database.user} on {name}'
             if result.ready:
@@ -186,6 +207,8 @@ def main(argv=None, settings=None, schema=None, out=print, password_source=None)
         if args.command == 'check-runtime-grants':
             if schema is None:
                 schema = open_runtime_schema(settings, password_source)
+            if production.check_schema_identity(schema, settings, kind):
+                out(f'Identity checked: database {name} {production.SAFEGUARD_NOTE}.')
             lines = schema.grants()
             problems, missing = check_runtime_grants(lines, name), missing_runtime_grants(lines, name)
             out(f'Runtime account {settings.database.user} on {name}:')
@@ -202,6 +225,8 @@ def main(argv=None, settings=None, schema=None, out=print, password_source=None)
             return 4 if problems else 5 if missing else 0
         if schema is None:
             schema = open_schema(settings, password_source)
+        if production.check_schema_identity(schema, settings, kind):   # first statement
+            out(f'Identity checked: database {name} {production.SAFEGUARD_NOTE}.')
         runner = MigrationRunner(schema, log=out)
         if args.command == 'status':
             st = runner.status()

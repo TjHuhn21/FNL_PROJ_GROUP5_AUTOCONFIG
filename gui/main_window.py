@@ -35,6 +35,7 @@ from gui.logs_tab import LogsTab
 from gui.overview_page import OverviewPage
 from gui.scan_tab import ScanTab
 from gui.topology_tab import TopologyTab
+from desktop_auth.session import EDIT_DEVICES, MANAGE_ACCOUNTS, RUN_REVIEW
 from store_errors import DatabaseError
 
 # (key, rail label) in rail order. 'dashboard' is the Overview workspace.
@@ -58,16 +59,30 @@ SOURCE_SAMPLE = '●  sample mode · in memory'
 SOURCE_FALLBACK = '●  sample mode · database unavailable at startup'
 
 
-def build_main_window(root, store, demo_store=False, startup_problem=None):
+def build_main_window(root, store, demo_store=False, startup_problem=None, access=None,
+                      account=None):
     """Builds the workbench and every page. Returns refs: one entry per page key,
     plus 'nav', 'command', 'inspector', 'console', 'show_page', 'current_page', and in
     database mode 'db_status' (gui.db_status.DatabaseStatus).
     startup_problem: why the database could not be used at startup, when the app fell
-    back to sample mode (shown, so the fallback is never mistaken for the database)."""
+    back to sample mode (shown, so the fallback is never mistaken for the database).
+    access: desktop_auth.session.Access of the signed-in user (None: everything, as
+    before sign-in existed). Pages and buttons the role may not use are not offered.
+    account: gui.session_watch.SignedInContext (sign-out, and the Accounts page for
+    admins); None in demo mode."""
     theme.apply(root)
     root.grid_columnconfigure(1, weight=1)
     root.grid_rowconfigure(2, weight=1)
     refs, state = {}, {'current': None}
+    refs['access'] = access
+
+    def allowed(key):
+        return access is None or access.can_open(key)
+
+    pages = [(key, label) for key, label in PAGES if allowed(key)]
+    if account is not None and access is not None and access.can(MANAGE_ACCOUNTS):
+        pages.append(('accounts', 'Accounts'))
+    all_pages = PAGES + [p for p in pages if p not in PAGES]
 
     # ---------------------------------------------------------------- header
     header = ctk.CTkFrame(root, fg_color=theme.SURFACE, corner_radius=0, height=48)
@@ -94,6 +109,22 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
         header, text=source_text, font=theme.mono(9),
         text_color=theme.WARNING if demo_store else theme.SUCCESS)
     refs['source_label'].grid(row=0, column=3, padx=14)
+    if access is not None and access.demo:
+        refs['demo_label'] = ctk.CTkLabel(header, text='DEMO MODE · not signed in',
+                                          font=theme.mono(10, 'bold'), text_color=theme.DANGER)
+        refs['demo_label'].grid(row=0, column=4, padx=(0, 14))
+    elif account is not None:
+        who = ctk.CTkFrame(header, fg_color=theme.SURFACE, corner_radius=0)
+        who.grid(row=0, column=4, padx=(0, 10))
+        refs['user_label'] = ctk.CTkLabel(
+            who, text=f'{account.session.email} · {access.title}', font=theme.mono(9),
+            text_color=theme.TEXT_SOFT)
+        refs['user_label'].pack(side='left', padx=(0, 8))
+        refs['sign_out_button'] = ctk.CTkButton(
+            who, text='Sign out', font=theme.mono(9), height=24, width=80, corner_radius=3,
+            fg_color=theme.SURFACE_2, hover_color=theme.BORDER, text_color=theme.TEXT,
+            command=account.on_sign_out)
+        refs['sign_out_button'].pack(side='left')
     ctk.CTkFrame(root, height=1, corner_radius=0, fg_color=theme.BORDER).grid(
         row=1, column=0, columnspan=2, sticky='ew')
 
@@ -156,6 +187,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
         console.show_unavailable()                     # config log and status events
         if 'findings' in refs:                         # kept on screen, marked not refreshed
             refs['findings'].on_db_down(reason)
+        if 'dashboard' in refs:
+            refs['dashboard'].on_db_down(reason)
 
     def on_db_up():
         refs['source_label'].configure(text=SOURCE_CONNECTED, text_color=theme.SUCCESS)
@@ -171,6 +204,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
         update_status()
         console.refresh_current()                      # the stored-data tab shown, if any
         refs['findings'].on_db_up()
+        refs['dashboard'].on_db_up()
 
     if not demo_store:
         refs['db_status'] = DatabaseStatus(root, store, on_down=on_db_down, on_up=on_db_up,
@@ -194,10 +228,15 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
         # Real database mode never falls back to the sample network on the map.
         return services.get_network(store, allow_sample=demo_store)
 
+    def overview_stale():
+        if 'dashboard' in refs:                        # the Overview reloads (now or when shown)
+            refs['dashboard'].mark_stale()
+
     def after_data_change():
         refs['devices'].refresh()
         refs['configure'].refresh_devices()
         update_status()
+        overview_stale()
         if refs['inspector'].device:                   # keep the inspector up to date
             refs['inspector'].show_device(refs['inspector'].device['id'])
 
@@ -215,17 +254,20 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
                                 f"devices: {result['error']}", 'error')
 
     def send_to_configure(commands, device_name):
+        if not allowed('configure'):
+            refuse('configure')
+            return
         refs['configure'].load_commands(commands, device_name)
         show_page('configure')
         console.log('findings', f'Sent {len(commands)} suggested lines for {device_name} to Configure.')
 
     refs['devices'] = DevicesTab(host, store, on_change=after_data_change)
-    refs['configure'] = ConfigureTab(host, store, log=console.log)
+    refs['configure'] = ConfigureTab(host, store, log=console.log, on_change=after_data_change,
+                                     on_applied=overview_stale)
     refs['scan'] = ScanTab(host, store, services.run_discovery,
                            on_approved=after_approval, demo_default=demo_store,
-                           sample_store=demo_store,
-                           find_gateway=lambda: __import__(
-                               'discovery.crawler', fromlist=['x']).default_gateway())
+                           sample_store=demo_store)
+    refs['scan'].on_activity = overview_stale
     def on_map_select(kind, info):
         """A device or link was clicked on the interactive map: show it in the inspector.
         Registered devices are read from the store; anything without a record (sample
@@ -260,8 +302,18 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
                                    layout_scope=layout_scope, log=console.log)
     refs['findings'] = FindingsTab(host, store, lambda: services.collect_review_inputs(store, demo_store),
                                    send_to_configure)
+    refs['findings'].on_saved = overview_stale
     refs['logs'] = LogsTab(host, store)
-    refs['dashboard'] = OverviewPage(host, lambda key: show_page(key))
+    refs['dashboard'] = OverviewPage(
+        host, lambda key: show_page(key), store=store, can_open=allowed,
+        scan_history=lambda: refs['scan'].history,
+        source_note='Sample mode: the data is kept in memory.' if demo_store else '')
+    if access is not None:
+        refs['devices'].set_read_only(not access.can(EDIT_DEVICES))
+        refs['findings'].set_read_only(not access.can(RUN_REVIEW))
+    if any(key == 'accounts' for key, _label in pages):
+        from gui.accounts_page import AccountsPage
+        refs['accounts'] = AccountsPage(host, account)
 
     # ---------------------------------------------------------------- inspector and command strip
     def select_for_configure(name):
@@ -280,6 +332,9 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
         refs['devices'].go_first()
 
     def configure_device(name):
+        if not allowed('configure'):
+            refuse('configure')
+            return
         show_page('configure')
         select_for_configure(name)
 
@@ -295,6 +350,9 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
             console.log('find', f"Selected {d['name']} ({d['ip']}).")
 
     def on_operation(key, device_name):
+        if not allowed(key):
+            refuse(key)
+            return
         show_page(key)
         if key == 'configure' and device_name:
             select_for_configure(device_name)
@@ -381,16 +439,25 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
                'configure': lambda: refs['configure'].refresh_devices(),
                'topology': lambda: refs['topology'].refresh(),
                'findings': lambda: refs['findings'].on_page_shown(),
-               'dashboard': lambda: refs['dashboard'].refresh()}
+               'dashboard': lambda: refs['dashboard'].refresh(),
+               'accounts': lambda: refs['accounts'].refresh()}
+
+    def refuse(key):
+        label = dict(all_pages).get(key, key)
+        console.log('access', f'Your role ({access.title}) cannot use {label}.', 'warn')
 
     def show_page(key):
         """Show one page, hide the others. Opening the page already shown does
-        nothing, exactly like clicking the tab that was already open."""
+        nothing, exactly like clicking the tab that was already open. A page the role
+        may not use is refused (whatever asked for it: rail, command strip, inspector)."""
         if key == state['current']:
             return
+        if not any(key == k for k, _label in pages):
+            refuse(key)
+            return
         remember_console(state['current'])
-        for other, _label in PAGES:
-            if other != key:
+        for other, _label in all_pages:
+            if other != key and other in refs:
                 refs[other].grid_remove()
         refs[key].grid(row=0, column=0, sticky='nsew')
         refs['nav'].set_active(key)
@@ -401,7 +468,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
             on_show[key]()
         update_status()
 
-    refs['nav'] = Rail(root, PAGES, show_page)
+    refs['nav'] = Rail(root, pages, show_page)
+    refs['pages'] = [key for key, _label in pages]
     refs['nav'].grid(row=2, column=0, sticky='ns')
     refs['show_page'] = show_page
     refs['current_page'] = lambda: state['current']
@@ -423,4 +491,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None):
                            'lost on exit.', 'warn')
     else:
         console.log('app', 'Connected to the database.', 'ok')
+    if access is not None and access.demo:
+        console.log('app', 'DEMO MODE: started with --demo, so nobody is signed in.', 'warn')
+    elif account is not None:
+        console.log('app', f'Signed in as {account.session.email} ({access.title}).', 'ok')
     return refs

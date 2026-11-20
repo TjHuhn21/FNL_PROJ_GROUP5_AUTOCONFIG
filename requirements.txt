@@ -1,8 +1,12 @@
-netmiko
-pymysql
-python-dotenv
-cryptography
-networkx
-matplotlib
-pytest>=8,<9    # pytest 9 does not run on this project's Python 3.10.0
+# NetCommand desktop application. Pinned to the versions tested together on Python 3.10.0
+# (Windows). Install with the backend's file too:
+#   .\venv\Scripts\python.exe -m pip install -r requirements.txt -r backend\requirements.txt
+netmiko==4.8.0
+paramiko==4.0.0          # 4.x on purpose: 5.x removed SHA-1 key exchange and ssh-rsa (older Cisco IOS)
+PyMySQL==1.2.4
+python-dotenv==1.2.4     # the same version as backend/requirements.txt
+cryptography==50.0.2
+networkx==3.4.2
+matplotlib==3.10.9
+pytest==8.4.2            # pytest 9 does not run on this project's Python 3.10.0
 customtkinter==5.2.2

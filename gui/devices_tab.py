@@ -24,9 +24,13 @@ class DevicesTab(ttk.Frame):
         entry = ttk.Entry(top, textvariable=self.search, width=30)
         entry.pack(side='left', padx=theme.PAD)
         entry.bind('<KeyRelease>', lambda e: self.go_first())
-        ttk.Button(top, text='Add', command=self.add).pack(side='right')
-        ttk.Button(top, text='Delete', command=self.delete).pack(side='right', padx=4)
-        ttk.Button(top, text='Edit', command=self.edit).pack(side='right')
+        self.read_only = False
+        self.add_btn = ttk.Button(top, text='Add', command=self.add)
+        self.add_btn.pack(side='right')
+        self.delete_btn = ttk.Button(top, text='Delete', command=self.delete)
+        self.delete_btn.pack(side='right', padx=4)
+        self.edit_btn = ttk.Button(top, text='Edit', command=self.edit)
+        self.edit_btn.pack(side='right')
 
         self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS],
                                  show='headings', selectmode='browse')
@@ -105,13 +109,19 @@ class DevicesTab(ttk.Frame):
         return int(sel[0])
 
     # ----- actions -----
+    def set_read_only(self, read_only):
+        """Viewers: devices can be searched and viewed, not added, edited or deleted."""
+        self.read_only = bool(read_only)
+        for button in (self.add_btn, self.edit_btn, self.delete_btn):
+            button.state(['disabled'] if self.read_only else ['!disabled'])
+
     def add(self):
-        if database_ready(self):
+        if not self.read_only and database_ready(self):
             DeviceDialog(self, self.store, None, self._saved)
 
     def edit(self):
         did = self.selected_id()
-        if did is None or not database_ready(self):
+        if self.read_only or did is None or not database_ready(self):
             return
         try:
             d = self.store.get_device(did)
@@ -127,7 +137,7 @@ class DevicesTab(ttk.Frame):
 
     def delete(self):
         did = self.selected_id()
-        if did is None or not database_ready(self):
+        if self.read_only or did is None or not database_ready(self):
             return
         try:
             d = self.store.get_device(did)

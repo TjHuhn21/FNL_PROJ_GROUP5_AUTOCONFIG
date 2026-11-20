@@ -50,7 +50,8 @@ def repo(clock):
 
 
 def admin(repo, email='admin@example.com'):
-    return repo.create_user(email, 'Admin', HASH, role='admin', status='active')
+    return repo.create_user(email, 'Admin', HASH, role='admin', status='active',
+                            email_verified=True)
 
 
 # ================================================================ users (in memory)
@@ -172,8 +173,9 @@ def test_verification_then_approval_is_audited(repo):
 def test_only_another_active_admin_can_approve(repo):
     boss = admin(repo)
     second = admin(repo, 'second@example.com')
-    viewer = repo.create_user('v@example.com', 'V', HASH, status='active')
-    uid = repo.create_user('e@example.com', 'E', HASH, status='pending_approval')
+    viewer = repo.create_user('v@example.com', 'V', HASH, status='active', email_verified=True)
+    uid = repo.create_user('e@example.com', 'E', HASH, status='pending_approval',
+                           email_verified=True)
     with pytest.raises(InvalidValue):
         repo.approve_user(uid, viewer)
     with pytest.raises(InvalidValue):
@@ -263,7 +265,7 @@ def test_simultaneous_consumption_succeeds_once(repo):
 
 # ================================================================ sessions (in memory)
 def active_user(repo, email='n@example.com'):
-    return repo.create_user(email, 'N', HASH, status='active')
+    return repo.create_user(email, 'N', HASH, status='active', email_verified=True)
 
 
 def test_session_lifecycle_and_revocation(repo):
@@ -484,7 +486,7 @@ def admin_answer(active_admins, target):
     def answer(sql):
         if "role = 'admin' AND status = 'active'" in sql:
             return [{'id': i} for i in active_admins]
-        if sql.startswith('SELECT role, status FROM users WHERE id'):
+        if sql.startswith('SELECT role, status'):                  # set_status / set_role
             return target
         return None
     return answer
