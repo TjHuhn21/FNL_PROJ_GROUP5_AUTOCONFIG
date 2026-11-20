@@ -21,7 +21,7 @@ def dev(name, kind='switch', managed=True, status='up', ip=None):
 
 def lab_network(monkeypatch):
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
-    return crawler.discover('admin', 'cisco123', '192.168.1.2')
+    return crawler.discover('admin', 'cisco123', '192.168.1.2', login_neighbours=True)
 
 
 def networks(monkeypatch):

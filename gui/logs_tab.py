@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import ttk
 
 from gui import theme
+from gui.db_status import report_error
+from store_errors import DATABASE_ERRORS
 
 PER_PAGE = 15
 COLUMNS = [('date', 'Date', 150), ('device', 'Device', 110), ('action', 'Action', 200),
@@ -53,10 +55,15 @@ class LogsTab(ttk.Frame):
     def refresh(self):
         text = self.search.get().strip()
         status = '' if self.status.get() == 'all' else self.status.get()
-        total = self.store.count_logs(text, status)
-        pages = max(1, -(-total // PER_PAGE))
-        self.page = min(max(self.page, 1), pages)
-        rows = self.store.get_logs(text, self.page, PER_PAGE, status)
+        try:
+            total = self.store.count_logs(text, status)
+            pages = max(1, -(-total // PER_PAGE))
+            self.page = min(max(self.page, 1), pages)
+            rows = self.store.get_logs(text, self.page, PER_PAGE, status)
+        except DATABASE_ERRORS as err:
+            self.show_unavailable(str(err))
+            report_error(self, err)
+            return
         self.tree.delete(*self.tree.get_children())
         for r in rows:
             when = r['created_at'].strftime('%Y-%m-%d %H:%M:%S')
@@ -68,3 +75,12 @@ class LogsTab(ttk.Frame):
         self.page_label.config(text=f'Page {self.page} of {pages}  ({total} entries)')
         self.prev_btn.state(['!disabled'] if self.page > 1 else ['disabled'])
         self.next_btn.state(['!disabled'] if self.page < pages else ['disabled'])
+
+    def show_unavailable(self, reason=''):
+        """The log could not be read: show no rows at all (never old rows as if current)."""
+        self.tree.delete(*self.tree.get_children())
+        self.empty.config(text='Database unavailable: the log cannot be shown right now. '
+                               'It is refreshed automatically when the connection is back.')
+        self.page_label.config(text='')
+        self.prev_btn.state(['disabled'])
+        self.next_btn.state(['disabled'])

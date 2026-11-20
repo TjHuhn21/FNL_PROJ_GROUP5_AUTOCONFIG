@@ -41,7 +41,8 @@ def page(monkeypatch):
     for name in ('showinfo', 'showerror', 'showwarning'):
         monkeypatch.setattr(messagebox, name, lambda t, m, _n=name, **k: shown.append((_n, t, m)))
     monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: True)
-    monkeypatch.setattr(simpledialog, 'askstring', lambda *a, **k: 'admin')
+    monkeypatch.setattr('gui.components.login_dialog.ask_device_login',
+                        lambda *a, **k: {'username': 'admin', 'password': 'admin', 'save': False})
     from gui.configure_tab import ConfigureTab
     store, summary = Store(), []
     conf = ConfigureTab(root, store, log=lambda *a, **k: summary.append(a))
@@ -102,9 +103,9 @@ def test_previous_output_is_kept_until_clear(page):
     root, conf, store, shown, summary = page
     choose(conf, 'SW1')
     conf.apply_fn = lambda creds, cmds, checks: (True, 'Applied and verified. Backup: b.txt')
-    conf.vid.set('10'); conf.vname.set('STAFF'); conf.add_vlan()
-    conf.make_preview()
-    for _ in range(2):
+    for vid in ('10', '20'):          # a successful Apply clears the applied preview and form,
+        conf.vid.set(vid); conf.vname.set('STAFF'); conf.add_vlan()   # so preview each change
+        conf.make_preview()
         conf.apply()
         assert pump(root, lambda: not conf.busy)
     text = session_text(conf)

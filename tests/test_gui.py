@@ -31,7 +31,8 @@ def app(monkeypatch):
     for name in ('showinfo', 'showerror', 'showwarning'):
         monkeypatch.setattr(messagebox, name, lambda t, m, _n=name, **k: shown.append((_n, t, m)))
     monkeypatch.setattr(messagebox, 'askyesno', lambda *a, **k: True)
-    monkeypatch.setattr(simpledialog, 'askstring', lambda *a, **k: 'admin')
+    monkeypatch.setattr('gui.components.login_dialog.ask_device_login',
+                        lambda *a, **k: {'username': 'admin', 'password': 'admin', 'save': False})
     db_fake.reset()
     from gui.main_window import build_main_window
     refs = build_main_window(root, db_fake, demo_store=True)
@@ -179,6 +180,7 @@ def real_scan(root, scan, monkeypatch):
     from discovery import crawler
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
     scan.demo.set(0); scan.user.set('admin'); scan.pw.set('cisco123'); scan.seed.set('192.168.1.2')
+    scan.login_neighbours.set(1)          # the whole fake lab (the warning is answered 'yes')
     scan.found = []
     scan.on_scan()
     assert pump(root, lambda: scan.found)
@@ -251,3 +253,47 @@ def test_db_refuses_sample_devices_even_if_the_gui_check_is_bypassed(real_app, m
     assert r['shown'][-1][:2] == ('showerror', 'Could not save')
     assert 'Sample (demo) devices' in r['shown'][-1][2]
     assert sent == []                                             # nothing reached the database
+
+
+# ---------------------------------------------------------------- seed-only scanning (Phase 2)
+def _fake_lab_login(monkeypatch, visited):
+    sys.path.insert(0, os.path.dirname(__file__))
+    from fakes import fake_login_factory, lab
+    from discovery import crawler
+    monkeypatch.setattr(crawler, '_login', fake_login_factory(lab(), visited=visited))
+
+
+def test_a_real_scan_without_seed_ip_is_refused(real_app, monkeypatch):
+    root, r = real_app
+    scan, visited = r['scan'], []
+    _fake_lab_login(monkeypatch, visited)
+    scan.demo.set(0); scan.user.set('admin'); scan.pw.set('cisco123'); scan.seed.set('')
+    scan.on_scan()
+    assert r['shown'][-1][:2] == ('showerror', 'Seed IP needed')
+    assert not scan.scanning and visited == []                   # nothing was contacted
+
+
+def test_neighbour_login_is_off_by_default_and_only_the_seed_is_logged_in_to(real_app, monkeypatch):
+    root, r = real_app
+    scan, visited = r['scan'], []
+    assert scan.login_neighbours.get() == 0
+    _fake_lab_login(monkeypatch, visited)
+    scan.demo.set(0); scan.user.set('admin'); scan.pw.set('cisco123'); scan.seed.set('192.168.1.2')
+    scan.found = []
+    scan.on_scan()
+    assert pump(root, lambda: scan.found)
+    assert visited == ['192.168.1.2']
+    assert {d['name']: d['managed'] for d in scan.found} == {
+        'CORE': True, 'SW1': False, 'SW2': False, 'R1': False}
+
+
+def test_neighbour_login_needs_confirmation_and_can_be_cancelled(real_app, monkeypatch):
+    root, r = real_app
+    scan, visited, asked = r['scan'], [], []
+    _fake_lab_login(monkeypatch, visited)
+    monkeypatch.setattr(messagebox, 'askyesno', lambda t, m, **k: asked.append(m) or False)
+    scan.demo.set(0); scan.user.set('admin'); scan.pw.set('cisco123'); scan.seed.set('192.168.1.2')
+    scan.login_neighbours.set(1)
+    scan.on_scan()
+    assert asked and 'EVERY' in asked[0] and 'sent to those devices' in asked[0]
+    assert not scan.scanning and visited == []                   # cancelled: nothing contacted

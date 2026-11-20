@@ -23,7 +23,7 @@ def test_discover_demo_marks_every_device_and_leaves_sample_data_alone():
 
 def test_real_discovery_has_no_marker(monkeypatch):
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
-    devices, _ = crawler.discover('admin', 'cisco123', '192.168.1.2')
+    devices, _ = crawler.discover('admin', 'cisco123', '192.168.1.2', login_neighbours=True)
     assert len(devices) == 5 and all('sample' not in d for d in devices)
 
 
@@ -33,6 +33,7 @@ def no_sql(*a, **k):
 
 def test_db_refuses_a_sample_device_before_any_sql(monkeypatch):
     monkeypatch.setattr(db, '_run', no_sql)
+    monkeypatch.setattr(db, 'get_conn', no_sql)
     for d in crawler.discover_demo()[0]:
         with pytest.raises(ValueError) as err:
             db.upsert_device(d)
@@ -41,15 +42,21 @@ def test_db_refuses_a_sample_device_before_any_sql(monkeypatch):
 
 @pytest.mark.parametrize('marker', [None, False])
 def test_db_real_device_sql_never_mentions_the_marker(monkeypatch, marker):
-    calls = []
-    monkeypatch.setattr(db, '_run', lambda sql, params=(), *a, **k: calls.append((sql, params)) or 7)
+    # upsert_device runs in save_device's transaction (3C-5 follow-up): a stand-in
+    # connection whose read-only checks (deleted IP, taken name) find nothing.
+    from test_device_save import FakeConnection
+    conns = []
+    monkeypatch.setattr(db, 'get_conn', lambda *a, **k: conns.append(FakeConnection()) or conns[-1])
+    monkeypatch.setattr(db, '_run', no_sql)
     d = {'name': 'CORE', 'ip': '192.168.1.2', 'mac': '', 'type': 'switch',
          'managed': True, 'status': 'up'}                 # same name/IP as the sample: allowed
     if marker is not None:
         d['sample'] = marker
     assert db.upsert_device(d) == 7
-    (sql, params), = calls
-    assert 'sample' not in sql.lower()
+    conn, = conns
+    assert conn.commits == 1
+    assert all('sample' not in sql.lower() for sql, _ in conn.committed)
+    (sql, params), = [c for c in conn.committed if c[0].startswith('INSERT')]
     assert params == ('CORE', '192.168.1.2', '', 'switch', 1, 'up')
 
 

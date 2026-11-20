@@ -73,7 +73,10 @@ This is `main.py --demo` (memory store: the production database is never opened)
 with backups written to `mock-lab\backups\` and the topology layout to `mock-lab\state\`.
 
 1. **Scan**: untick the sample option, seed `127.0.0.11`, login `labscan` / `Lab-scan-pass`.
-   R1, SW1, SW2 and both links are found; approve them.
+   By default only R1 is logged in to (SW1 is listed as an unmanaged neighbour). For the
+   whole lab, tick *Also log in to CDP/LLDP neighbours* and confirm (fine here: every lab
+   device is a local simulation sharing this lab account). R1, SW1, SW2 and both links are
+   then found; approve them.
 2. **Configure**: tick SW1 and SW2, add VLAN 30 and ports `Fa0/5-8`, Preview, Apply.
    Both succeed, each with its own backup in `mock-lab\backups\`.
 3. Add a trunk on `Gi0/2` with "encapsulation dot1q" ticked and apply to SW1 + SW2:

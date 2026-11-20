@@ -23,7 +23,7 @@ BUTTON1 = 0x0100              # "left button held" in a Tk event's state
 def register_lab(monkeypatch):
     """The fake lab as registered devices (SW1 down, SW3 unmanaged)."""
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
-    devices, links = crawler.discover('admin', 'cisco123', '192.168.1.2')
+    devices, links = crawler.discover('admin', 'cisco123', '192.168.1.2', login_neighbours=True)
     for d in devices:
         if d['name'] == 'SW1':
             d['status'] = 'down'

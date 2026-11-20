@@ -226,3 +226,55 @@ def check_ip_order(first, last):
     if ipaddress.IPv4Address(first.strip()) > ipaddress.IPv4Address(last.strip()):
         return f'The range is reversed: {first.strip()} comes after {last.strip()}.'
     return None
+
+
+# ---------------------------------------------------------------- MAC addresses
+_MAC = re.compile(r'^([0-9A-Fa-f]{2}([:-])[0-9A-Fa-f]{2}(\2[0-9A-Fa-f]{2}){4}'
+                  r'|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4})$')
+
+
+def check_mac(mac):
+    """A MAC address as devices.mac (VARCHAR(17)) stores it: aa:bb:cc:dd:ee:ff,
+    aa-bb-cc-dd-ee-ff or Cisco's aabb.ccdd.eeff."""
+    if not _MAC.match((mac or '').strip()):
+        return (f'"{(mac or "").strip()}" is not a MAC address (use aa:bb:cc:dd:ee:ff or '
+                f'aabb.ccdd.eeff).')
+    return None
+
+
+# ---------------------------------------------------------------- device logins
+# devices.username is VARCHAR(50).
+LOGIN_USERNAME_MAX = 50
+# devices.password_enc is VARCHAR(255) and holds the Fernet token of the password.
+# A Fernet token is URL-safe base64 of: version (1 byte) + timestamp (8) + IV (16)
+# + AES-CBC ciphertext + HMAC (32). For an n-byte password the ciphertext is
+# 16 * (n // 16 + 1) bytes (PKCS7 padding), so the token is
+#     4 * ceil((57 + 16 * (n // 16 + 1)) / 3) characters.
+# n = 127 -> 4 * ceil(185 / 3) = 248 characters (fits);
+# n = 128 -> 4 * ceil(201 / 3) = 268 characters (does not fit).
+# The real token length is also checked before anything is written (db.save_device).
+LOGIN_PASSWORD_MAX_BYTES = 127
+
+
+def check_login(username, password):
+    """A device login: both parts, or neither. The message never contains the password."""
+    user = (username or '').strip()
+    pw = password or ''
+    if not user and not pw:
+        return None                                    # no login: allowed
+    if bool(user) != bool(pw):
+        return 'Enter both a login username and password, or neither.'
+    if '\n' in user or '\r' in user:
+        return 'The login username must be on one line (no line breaks).'
+    if len(user) > LOGIN_USERNAME_MAX:
+        return (f'The login username must be {LOGIN_USERNAME_MAX} characters or fewer '
+                f'(this one has {len(user)}).')
+    try:
+        size = len(pw.encode('utf-8'))
+    except UnicodeError:
+        return 'The login password contains characters that cannot be stored.'
+    if size > LOGIN_PASSWORD_MAX_BYTES:
+        return (f'The login password is too long to store: at most {LOGIN_PASSWORD_MAX_BYTES} '
+                f'bytes (this one is {size} bytes; letters such as é or ñ take 2 bytes, '
+                f'some symbols 3 or 4).')
+    return None

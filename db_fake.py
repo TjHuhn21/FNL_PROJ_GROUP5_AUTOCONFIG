@@ -1,6 +1,10 @@
 """In-memory store used in SAMPLE MODE (no MySQL). Same function names and
 behaviour as db.py, so the screens work with either. Data is lost on exit."""
+import functools
+import threading
 from datetime import datetime
+
+from store_errors import DeletedDeviceExists, DeviceNotDeleted, DuplicateDeviceName
 
 SORT_KEYS = {
     'name': lambda d: d['name'].lower(),
@@ -21,6 +25,11 @@ def reset():
         _next[k] = 1
 
 
+def ping():
+    """Same as db.ping: the in-memory store is always available."""
+    return True
+
+
 def _live():
     return [d for d in _devices.values() if not d['is_deleted']]
 
@@ -32,12 +41,63 @@ def _public(d):
 
 
 # ---------------------------------------------------------------- devices
+# Every write that can create or change a device name holds this lock from its checks to
+# its last change, so the check and the write are one step (as a transaction in db.py).
+# Re-entrant: save_device calls upsert_device / update_device while holding it.
+_write_lock = threading.RLock()
+
+
+def _atomic(func):
+    @functools.wraps(func)
+    def locked(*args, **kwargs):
+        with _write_lock:
+            return func(*args, **kwargs)
+    return locked
+
+
+def _check_name(name):
+    """Same as db._check_name: validation.check_name, and no spaces around the name."""
+    import validation
+    problem = validation.check_name(name)
+    if not problem and name != name.strip():
+        problem = 'The name cannot start or end with a space.'
+    if problem:
+        raise ValueError(problem)
+
+
+def _name_taken(name, exclude_id=None, exclude_ip=None):
+    """Same as db._name_taken_query: the ACTIVE device (lowest id) that already uses this
+    name, ignoring capital letters, or None. Deleted devices never count."""
+    wanted = name.lower()
+    for d in sorted(_live(), key=lambda x: x['id']):
+        if d['name'].lower() != wanted:
+            continue
+        if exclude_id is not None and d['id'] == exclude_id:
+            continue
+        if exclude_ip is not None and d['ip'] == exclude_ip:
+            continue
+        return {'id': d['id'], 'name': d['name']}
+    return None
+
+
+@_atomic
 def upsert_device(d):
+    """Add a device, or update the ACTIVE device with this IP. An IP that belongs to a
+    soft-deleted device raises DeletedDeviceExists and changes nothing (as db.py):
+    restore_device is the only way to bring a deleted device back.
+    A name another active device uses raises DuplicateDeviceName (as db.py)."""
+    _check_name(d['name'])
+    if get_deleted_device_by_ip(d['ip']):
+        raise DeletedDeviceExists(get_deleted_device_by_ip(d['ip']))
+    taken = _name_taken(d['name'], exclude_ip=d['ip'])
+    if taken:
+        raise DuplicateDeviceName(d['name'], taken)
     for existing in _devices.values():
         if existing['ip'] == d['ip']:
+            if existing['is_deleted']:
+                raise DeletedDeviceExists(get_deleted_device_by_ip(d['ip']))
             existing.update(name=d['name'], type=d.get('type', 'unknown'),
-                            managed=bool(d.get('managed')), status=d.get('status', 'up'),
-                            is_deleted=False)
+                            managed=bool(d.get('managed')), status=d.get('status', 'up'))
             return existing['id']
     did = _next['device']; _next['device'] += 1
     _devices[did] = {'id': did, 'name': d['name'], 'ip': d['ip'], 'mac': d.get('mac', ''),
@@ -47,7 +107,14 @@ def upsert_device(d):
     return did
 
 
+@_atomic
 def update_device(device_id, data):
+    if device_id not in _devices:                  # as db.update_device
+        raise ValueError('This device no longer exists.')
+    _check_name(data['name'])
+    taken = _name_taken(data['name'], exclude_id=device_id)
+    if taken:
+        raise DuplicateDeviceName(data['name'], taken)
     d = _devices[device_id]
     old_name = d['name']
     d.update(name=data['name'], ip=data['ip'], type=data['type'], status=data['status'],
@@ -56,6 +123,118 @@ def update_device(device_id, data):
         for i, (a, pa, b, pb) in enumerate(_links):
             _links[i] = (d['name'] if a == old_name else a, pa,
                          d['name'] if b == old_name else b, pb)
+
+
+@_atomic
+def save_device(device_id, data, username=None, password=None):
+    """Same contract as db.save_device: add (device_id None) or edit a device and optionally
+    its login, all or nothing. The login is checked first (validation.check_login); if any
+    step fails, every change made by this call is undone. The steps are the module's own
+    upsert_device / update_device / save_credentials, so tests that replace one of them
+    still exercise the failure path."""
+    import validation
+    _check_name(data['name'])
+    user = (username or '').strip()
+    if user or password:
+        problem = validation.check_login(user, password)
+        if problem:
+            raise ValueError(problem)
+    deleted = get_deleted_device_by_ip(data['ip'])
+    if deleted and deleted['id'] != device_id:          # never restored silently
+        raise DeletedDeviceExists(deleted)
+    saved = _snapshot()
+    try:
+        if device_id is None:
+            did = upsert_device(data)
+        else:
+            if device_id not in _devices:
+                raise ValueError('This device no longer exists.')
+            update_device(device_id, data)
+            did = device_id
+        if user:
+            save_credentials(did, user, password)
+        return did
+    except BaseException:
+        _restore(saved)                                   # roll back: nothing of this save is kept
+        raise
+
+
+def _snapshot():
+    import copy
+    return copy.deepcopy(_devices), dict(_logins), list(_links), dict(_next)
+
+
+def _restore(saved):
+    _devices.clear(); _devices.update(saved[0])
+    _logins.clear(); _logins.update(saved[1])
+    _links[:] = saved[2]
+    _next.update(saved[3])
+
+
+def get_deleted_device_by_ip(ip):
+    """Same as db.get_deleted_device_by_ip: non-sensitive details of the deleted device
+    that owns this IP, or None."""
+    for d in _devices.values():
+        if d['ip'] == ip and d['is_deleted']:
+            user, pw = _logins.get(d['id'], ('', ''))
+            return {'id': d['id'], 'name': d['name'], 'ip': d['ip'], 'type': d['type'],
+                    'has_login': bool(user and pw)}
+    return None
+
+
+@_atomic
+def restore_device(device_id, data, *, credentials, username=None, password=None):
+    """Same contract as db.restore_device: restore this deleted device by its id, keeping
+    or replacing its login; all or nothing."""
+    import validation
+    if credentials not in ('keep', 'replace'):
+        raise ValueError("Choose 'keep' or 'replace' for the saved login.")
+    _check_name(data['name'])
+    user = (username or '').strip()
+    if credentials == 'replace':
+        if not user or not password:
+            raise ValueError('Enter the new login username and password, or keep the saved '
+                             'login.')
+        problem = validation.check_login(user, password)
+        if problem:
+            raise ValueError(problem)
+    elif user or password:
+        raise ValueError('A new login was entered but "keep the saved login" was chosen.')
+    mac = (data.get('mac') or '').strip()     # empty: keep the stored MAC; never blank it out
+    if mac:
+        problem = validation.check_mac(mac)
+        if problem:
+            raise ValueError(problem + ' Nothing was changed.')
+    d = _devices.get(device_id)
+    if d is None:
+        raise ValueError('This device no longer exists.')
+    if not d['is_deleted']:
+        raise DeviceNotDeleted(f"{d['name']} ({d['ip']}) is not deleted (it may already have "
+                               f"been restored). Nothing was changed.")
+    if data['ip'] != d['ip']:
+        raise ValueError(f"Device {device_id} has IP {d['ip']}, not {data['ip']}. "
+                         f"Nothing was changed.")
+    taken = _name_taken(data['name'], exclude_id=device_id)
+    if taken:                             # it would become a second active device with the name
+        raise DuplicateDeviceName(data['name'], taken)
+    saved = _snapshot()
+    try:
+        old_name = d['name']
+        d.update(name=data['name'], type=data.get('type', 'unknown'),
+                 status=data.get('status', 'up'), managed=bool(data.get('managed')),
+                 is_deleted=False)
+        if mac:
+            d['mac'] = mac
+        if old_name != d['name']:
+            for i, (a, pa, b, pb) in enumerate(_links):
+                _links[i] = (d['name'] if a == old_name else a, pa,
+                             d['name'] if b == old_name else b, pb)
+        if credentials == 'replace':
+            save_credentials(device_id, user, password)
+        return device_id
+    except BaseException:
+        _restore(saved)
+        raise
 
 
 def delete_device(device_id):
@@ -158,23 +337,70 @@ def clear_findings():
     _findings.clear()
 
 
+def _new_finding(device_id, f, when):
+    fid = _next['finding']; _next['finding'] += 1
+    return {'id': fid, 'device_id': device_id, 'rule': f['rule'], 'severity': f['severity'],
+            'message': f['message'], 'commands': list(f['commands']), 'created_at': when}
+
+
+def _finding_row(f):
+    """As db.py's JOIN: the device's CURRENT name (findings are kept by device id)."""
+    d = _devices.get(f['device_id'])
+    return {'id': f['id'], 'device': d['name'] if d else '?', 'rule': f['rule'],
+            'severity': f['severity'], 'message': f['message'],
+            'commands': list(f['commands']), 'created_at': f['created_at']}
+
+
+_SEVERITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
+
+
 def add_finding(f):
     dev = get_device_by_name(f['device'])
     if not dev:
         return None
-    fid = _next['finding']; _next['finding'] += 1
-    _findings.append({'id': fid, 'device': f['device'], 'rule': f['rule'],
-                      'severity': f['severity'], 'message': f['message'],
-                      'commands': list(f['commands']), 'created_at': datetime.now()})
-    return fid
+    row = _new_finding(dev['id'], f, datetime.now())
+    _findings.append(row)
+    return row['id']
+
+
+@_atomic
+def replace_findings(findings):
+    """Same as db.replace_findings: the new snapshot is built first and swapped in at once,
+    so a failure leaves the previous one exactly as it was. An empty list clears it."""
+    names = sorted({f['device'] for f in findings})
+    ids = {}
+    for name in names:
+        dev = get_device_by_name(name)
+        if dev:
+            ids[name] = dev['id']
+    when, saved_next = datetime.now(), _next['finding']
+    try:
+        new = [_new_finding(ids[f['device']], f, when) for f in findings if f['device'] in ids]
+    except BaseException:
+        _next['finding'] = saved_next
+        raise
+    _findings[:] = new
+    return {'saved': len(new), 'skipped': [n for n in names if n not in ids]}
+
+
+def get_findings_snapshot():
+    """Same as db.get_findings_snapshot."""
+    rows = []
+    for f in sorted(_findings, key=lambda f: (_SEVERITY_ORDER[f['severity']], f['id'])):
+        row = _finding_row(f)
+        d = _devices.get(f['device_id'])
+        row['device_deleted'] = bool(d is None or d['is_deleted'])
+        rows.append(row)
+    saved = [r['created_at'] for r in rows]
+    return {'findings': rows, 'saved_at': max(saved) if saved else None}
 
 
 def get_findings(search='', page=1, per_page=15):
     s = search.lower()
-    order = {'high': 0, 'medium': 1, 'low': 2}
-    rows = [f for f in _findings if s in f['device'].lower() or s in f['rule'].lower()
-            or s in f['message'].lower()]
-    rows.sort(key=lambda f: (order[f['severity']], f['id']))
+    rows = [_finding_row(f) for f in _findings]
+    rows = [r for r in rows if s in r['device'].lower() or s in r['rule'].lower()
+            or s in r['message'].lower()]
+    rows.sort(key=lambda r: (_SEVERITY_ORDER[r['severity']], r['id']))
     start = (max(page, 1) - 1) * per_page
     return rows[start:start + per_page]
 
@@ -187,11 +413,26 @@ def add_event(device_id, kind, detail=''):
     return eid
 
 
+PREVIOUS_STATUS = {'up': 'down', 'down': 'up'}      # as db.py
+
+
+@_atomic
+def record_status_change(device_id, old, new, detail=''):
+    """Same as db.record_status_change: status and event together, only if the active
+    device's status is still old. Returns True if saved, False if it changed meanwhile."""
+    d = _devices.get(device_id)
+    if d is None or d['is_deleted'] or d['status'] != old:
+        return False
+    d['status'] = new
+    add_event(device_id, new, detail)
+    return True
+
+
 def get_events(limit=50):
     out = []
     for e in sorted(_events, key=lambda e: e['id'], reverse=True)[:limit]:
         d = _devices.get(e['device_id'])
         out.append({'id': e['id'], 'created_at': e['created_at'],
                     'device': d['name'] if d else '?', 'kind': e['kind'],
-                    'detail': e['detail']})
+                    'previous': PREVIOUS_STATUS.get(e['kind']), 'detail': e['detail']})
     return out

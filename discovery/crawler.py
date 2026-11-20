@@ -1,25 +1,27 @@
-"""Finds the network by crawling outward over SSH.
+"""Finds the network over SSH, starting at the seed device the admin names.
 
-Start at one device (the default gateway, or the IP the admin types). Log in,
-read its CDP (or LLDP) neighbor table, and put every neighbor that has a
-management IP in a queue. Visit them the same way, until the queue is empty.
+Seed-only by default: log in to the seed IP (and nothing else), read its CDP (or LLDP)
+neighbor table, and list every neighbor as an UNMANAGED device, with its link to the
+seed. The login is never sent to the neighbors.
 
-This is a breadth-first search: a queue of devices still to visit, and a SET of
-devices already seen, so a device is never visited twice.
+Only when the admin explicitly asks for it (login_neighbours=True) is every neighbor
+with a management IP also logged in to, with the same login, breadth-first: a queue of
+devices still to visit and a SET of devices already seen, so none is visited twice.
 
-Uses only the login the admin typed, one attempt per device. It never tries
-guessed passwords.
+There is no fallback: if the seed login fails, the scan stops with the reason. Nothing
+else (other hosts from the ARP table, the default gateway) is ever tried. One login
+attempt per device; it never tries guessed passwords.
+
+Every connection uses ssh_options.connect_options(ip) (strict SSH algorithms, old ones
+only for the addresses in NETCOMMAND_LEGACY_SSH_HOSTS).
 """
-import ipaddress
-import os
 import re
-import socket
-import subprocess
-import sys
 
 from netmiko import ConnectHandler
 
 import sample_data
+import ssh_options
+import validation
 
 MAX_DEVICES = 64            # safety limit so a scan can never run away
 LOGIN_TIMEOUTS = {'conn_timeout': 6, 'auth_timeout': 10, 'banner_timeout': 10}
@@ -57,24 +59,66 @@ def guess_type(capabilities):
     return 'unknown'
 
 
-def default_gateway():
-    """The default gateway of this computer, or None when it cannot be found."""
-    try:
-        if os.name == 'nt':
-            out = subprocess.run(['route', 'print', '-4', '0.0.0.0'],
-                                 capture_output=True, text=True, timeout=10).stdout
-            m = re.search(r'0\.0\.0\.0\s+0\.0\.0\.0\s+' + _IP, out)
-        elif sys.platform == 'darwin':
-            out = subprocess.run(['route', '-n', 'get', 'default'],
-                                 capture_output=True, text=True, timeout=10).stdout
-            m = re.search(r'gateway:\s*' + _IP, out)
-        else:
-            out = subprocess.run(['ip', 'route', 'show', 'default'],
-                                 capture_output=True, text=True, timeout=10).stdout
-            m = re.search(r'default via ' + _IP, out)
-        return m.group(1) if m else None
-    except Exception:
-        return None
+# Model and software-image families, as they appear in `show version`, in a CDP
+# "Platform:" line or in an LLDP "System Description". Switch families are checked first:
+# their numbers would otherwise overlap router families (C2960 vs C2900, C3850 vs C3800).
+_SWITCH_FAMILIES = re.compile(
+    r'\bWS-C\d'                                         # WS-C2960-24TT-L, WS-C3560...
+    r'|\bC(?:2918|2940|2948|2950|2955|2960|2970|2975|3550|3560|3650|3750|3850|4500|6500|6800'
+    r'|9200|9300|9400|9500|9600)'                       # C2960 Software, C9300-24T
+    r'|\bC1000-'                                        # Catalyst 1000 (C1000-24T-4G-L)
+    r'|\bCAT[39]K'                                      # CAT9K_IOSXE, CAT3K_CAA
+    r'|\bvios_l2'                                       # GNS3 virtual IOS switch
+    r'|\bIE-?[2-5]\d{3}',                               # Industrial Ethernet switches
+    re.IGNORECASE)
+_ROUTER_FAMILIES = re.compile(
+    r'\b(?:CISCO|C)(?:18|19|28|29|38|39)\d\d(?!\d)'     # ISR G1/G2: C1900, CISCO1941/K9,
+                                                        # CISCO1941W-E/K9, C2911
+    r'|\bISR\s?\d{3,4}'                                 # ISR4331, ISR 4451
+    r'|\bC11\d\d(?!\d)'                                 # ISR 1100 (C1111-8P)
+    r'|\bC8\d\d(?!\d)'                                  # C880, C891F-K9
+    r'|\bC(?:7200|7600)(?!\d)'
+    r'|\bASR\s?\d{3,4}|\bCSR1000V\b|\bISRv\b'
+    r'|\bVIOS-',                                        # GNS3 virtual IOS router image
+    re.IGNORECASE)
+
+
+def platform_type(text):
+    """'switch' or 'router' when the model/image text names a known family, else None."""
+    text = text or ''
+    if _SWITCH_FAMILIES.search(text):
+        return 'switch'
+    if _ROUTER_FAMILIES.search(text):
+        return 'router'
+    return None
+
+
+_REJECTED = ('% Invalid', '% Ambiguous', '% Unknown command', '% Incomplete')
+
+
+def _vlan_table(text):
+    """True when `show vlan brief` printed a real VLAN table (only switches have one)."""
+    text = text or ''
+    return bool(re.search(r'^\s*1\s+default\s+active', text, re.MULTILINE)) or \
+        ('VLAN' in text and 'Name' in text and 'Status' in text and 'Ports' in text)
+
+
+def classify(version_text, vlan_text):
+    """'router', 'switch' or 'unknown' from `show version` and `show vlan brief` output
+    (either may be None when the command failed). In order of reliability:
+      1. the model / software image in show version;
+      2. a real VLAN table -> switch;  show vlan brief rejected by the device -> router
+         (a Cisco switch always has the command; a router does not have a VLAN table);
+      3. otherwise 'unknown' - never a guessed switch."""
+    kind = platform_type(version_text)
+    if kind:
+        return kind
+    if vlan_text is not None:
+        if _vlan_table(vlan_text):
+            return 'switch'
+        if any(r in vlan_text for r in _REJECTED):
+            return 'router'
+    return 'unknown'
 
 
 # ---------------------------------------------------------------- parsing
@@ -97,11 +141,13 @@ def parse_cdp(text):
         ip = (mgmt or any_ip).group(1) if (mgmt or any_ip) else ''
         plat = re.search(r'Platform:\s*([^,\n]+)', block)
         caps = re.search(r'Capabilities:\s*(.+)', block)
+        platform = plat.group(1).strip() if plat else ''
         found.append({'name': short_name(dev.group(1)), 'ip': ip,
                       'local_port': short_port(ports.group(1)),
                       'remote_port': short_port(ports.group(2)),
-                      'platform': plat.group(1).strip() if plat else '',
-                      'type': guess_type(caps.group(1) if caps else '')})
+                      'platform': platform,
+                      # the platform (model) first: routers often also report "Switch"
+                      'type': platform_type(platform) or guess_type(caps.group(1) if caps else '')})
     return found
 
 
@@ -118,7 +164,9 @@ def parse_lldp(text):
             or re.search(r'\bIP:\s*' + _IP, block)
         caps = re.search(r'Enabled Capabilities:\s*(\S+)', block)
         enabled = (caps.group(1) if caps else '').upper().split(',')
-        kind = 'router' if 'R' in enabled else 'switch' if 'B' in enabled else 'unknown'
+        description = re.search(r'System Description:\s*\n?(.+)', block)
+        kind = platform_type(description.group(1) if description else '') or \
+            ('router' if 'R' in enabled else 'switch' if 'B' in enabled else 'unknown')
         found.append({'name': short_name(name.group(1)), 'ip': ip.group(1) if ip else '',
                       'local_port': short_port(local.group(1)),
                       'remote_port': short_port(remote.group(1)),
@@ -129,7 +177,8 @@ def parse_lldp(text):
 # ---------------------------------------------------------------- talking to one device
 def _login(ip, username, password):
     conn = ConnectHandler(device_type='cisco_ios', host=ip, username=username,
-                          password=password, secret=password, **LOGIN_TIMEOUTS)
+                          password=password, secret=password, **LOGIN_TIMEOUTS,
+                          **ssh_options.connect_options(ip))
     if conn.find_prompt().endswith('>'):          # user mode: step up to privileged mode
         try:
             conn.enable()
@@ -138,13 +187,22 @@ def _login(ip, username, password):
     return conn
 
 
-def _read_device(conn):
-    """(hostname, 'switch' or 'router', neighbors) for the device we are logged in to."""
-    name = conn.find_prompt().rstrip('#>').strip()
+def _show(conn, command):
+    """The command's output, or None when it could not be run (never guessed)."""
     try:
-        is_switch = 'Invalid' not in conn.send_command('show vlan brief')
+        return conn.send_command(command)
     except Exception:
-        is_switch = True
+        return None
+
+
+def _read_device(conn):
+    """(hostname, 'switch' / 'router' / 'unknown', neighbors) for the device we are
+    logged in to. The type comes from classify(): show version first."""
+    name = conn.find_prompt().rstrip('#>').strip()
+    version = _show(conn, 'show version')
+    kind = platform_type(version)
+    vlan = None if kind else _show(conn, 'show vlan brief')   # only needed without a model
+    kind = classify(version, vlan)
     neighbors = []
     try:
         neighbors = parse_cdp(conn.send_command('show cdp neighbors detail'))
@@ -155,69 +213,46 @@ def _read_device(conn):
             neighbors = parse_lldp(conn.send_command('show lldp neighbors detail'))
         except Exception:
             pass
-    return name, ('switch' if is_switch else 'router'), neighbors
+    return name, kind, neighbors
 
 
-# ---------------------------------------------------------------- entry point when the gateway has no SSH
-def port_open(ip, port=22, timeout=1.0):
+# ---------------------------------------------------------------- the seed
+def _login_to_seed(username, password, seed_ip, notify):
+    """Log in to the seed device and nothing else. Raises RuntimeError with the reason
+    (from ssh_options.describe_error: never the exception's own text)."""
+    notify(f'Logging in to the starting device {seed_ip}...')
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def arp_candidates():
-    """IPs of other hosts this computer has recently talked to (from its ARP table)."""
-    try:
-        out = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=10).stdout
-    except Exception:
-        return []
-    ips = re.findall(r'\(' + _IP + r'\) at [0-9a-f:]{11,17}', out, re.I)       # Linux, macOS
-    ips += re.findall(r'^\s*' + _IP + r'\s+[0-9a-f-]{17}', out, re.I | re.M)    # Windows
-    keep = []
-    for ip in ips:
-        first = int(ip.split('.')[0])
-        if ip.endswith('.255') or 224 <= first <= 239 or ip in keep:
-            continue
-        keep.append(ip)
-    return keep
-
-
-def _find_entry(username, password, seed_ip, notify):
-    """Log in to the seed. If that fails, try other SSH hosts the laptop already knows.
-    One login attempt per host. Returns (ip, connection)."""
-    first_error = None
-    try:
-        notify(f'Logging in to the starting device {seed_ip}...')
-        return seed_ip, _login(seed_ip, username, password)
+        return _login(seed_ip, username, password)
     except Exception as err:
-        first_error = err
-    tried = {seed_ip}
-    for ip in arp_candidates()[:12]:
-        if ip in tried or not port_open(ip):
-            continue
-        tried.add(ip)
-        notify(f'Trying another device on the local network: {ip}...')
-        try:
-            return ip, _login(ip, username, password)
-        except Exception:
-            continue
-    reason = type(first_error).__name__
-    hint = ('wrong username or password' if 'Authentication' in reason
-            else 'no answer (is the IP right, is SSH on, is it reachable?)')
-    raise RuntimeError(f'Could not log in to the starting device {seed_ip}: {hint}. '
-                       f'Check the login, or type the IP of your core switch as the seed IP.')
+        _, reason = ssh_options.describe_error(err, seed_ip)
+        raise RuntimeError(f'Could not log in to the starting device {seed_ip}: {reason}.') \
+            from None
 
 
-# ---------------------------------------------------------------- the crawl
-def discover(username, password, seed_ip, progress=None, max_devices=MAX_DEVICES):
-    """Crawl from seed_ip. Returns (devices, links) in the shapes the app uses:
+def check_seed(seed_ip):
+    """The seed IP, stripped, or ValueError: a real scan needs an explicit seed IP."""
+    seed = (seed_ip or '').strip()
+    if not seed:
+        raise ValueError('A seed IP is required: type the management IP of the switch or '
+                         'router to log in to.')
+    problem = validation.check_ip(seed)
+    if problem:
+        raise ValueError(f'Seed IP: {problem}')
+    return seed
+
+
+# ---------------------------------------------------------------- the scan
+def discover(username, password, seed_ip, progress=None, max_devices=MAX_DEVICES,
+             login_neighbours=False):
+    """Scan from seed_ip. Returns (devices, links) in the shapes the app uses:
     device = {'name','ip','mac','type','managed','status'}
-    link   = (name_a, port_a, name_b, port_b)"""
+    link   = (name_a, port_a, name_b, port_b)
+    login_neighbours=False (default): only the seed is logged in to; its CDP/LLDP
+    neighbors are listed as unmanaged. True: the neighbors are logged in to as well."""
+    seed_ip = check_seed(seed_ip)
     notify = progress or (lambda message: None)
     managed = {}        # ip -> {'name', 'type'}   devices we logged in to
-    unmanaged = {}      # ip -> {'name', 'type'}   seen in CDP/LLDP but could not log in
+    unmanaged = {}      # ip -> {'name', 'type'}   seen in CDP/LLDP only (or the login failed)
     raw_links = []      # (ip_a, port_a, ip_b, port_b)
     seen, queue = set(), [seed_ip]
     first = True
@@ -227,19 +262,17 @@ def discover(username, password, seed_ip, progress=None, max_devices=MAX_DEVICES
         if ip in seen:
             continue
         seen.add(ip)
-        try:
-            if first:
-                ip, conn = _find_entry(username, password, ip, notify)
-                seen.add(ip)
-                first = False
-            else:
-                notify(f'Logging in to {ip}...')
+        if first:
+            conn = _login_to_seed(username, password, ip, notify)
+            first = False
+        else:
+            notify(f'Logging in to {ip}...')
+            try:
                 conn = _login(ip, username, password)
-        except RuntimeError:
-            raise
-        except Exception:
-            notify(f'{ip}: could not log in, listed as unmanaged')
-            continue
+            except Exception as err:
+                _, reason = ssh_options.describe_error(err, ip)
+                notify(f'{ip}: could not log in ({reason}), listed as unmanaged')
+                continue
         try:
             name, kind, neighbors = _read_device(conn)
         finally:
@@ -257,7 +290,11 @@ def discover(username, password, seed_ip, progress=None, max_devices=MAX_DEVICES
             raw_links.append((ip, n['local_port'], n['ip'], n['remote_port']))
             if n['ip'] not in managed:
                 unmanaged.setdefault(n['ip'], {'name': n['name'], 'type': n['type']})
-            if n['ip'] not in seen:
+            if not login_neighbours:
+                if n['ip'] not in managed:
+                    notify(f"{n['name']} ({n['ip']}): neighbor listed from CDP/LLDP, "
+                           f"not logged in")
+            elif n['ip'] not in seen:
                 queue.append(n['ip'])
     if queue and len(seen) >= max_devices:
         notify(f'Stopped at the safety limit of {max_devices} devices.')

@@ -4,4 +4,5 @@ state/
 backups/
 __pycache__/
 
-lab_config.json
+# lab_config.json IS committed: the mock lab and tests/test_mock_lab.py need it. It holds
+# only loopback addresses (127.0.0.x) and fake logins that work inside this lab only.

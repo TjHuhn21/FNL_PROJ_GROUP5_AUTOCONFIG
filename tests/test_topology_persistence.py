@@ -119,7 +119,7 @@ def dialogs(monkeypatch):
 
 def register_lab(monkeypatch):
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
-    devices, links = crawler.discover('admin', 'cisco123', '192.168.1.2')
+    devices, links = crawler.discover('admin', 'cisco123', '192.168.1.2', login_neighbours=True)
     for d in devices:
         db_fake.upsert_device(d)
     db_fake.save_links(links)

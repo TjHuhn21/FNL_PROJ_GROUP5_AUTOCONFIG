@@ -8,6 +8,8 @@ read here.
 import customtkinter as ctk
 
 from gui import theme
+from gui.db_status import report_error
+from store_errors import DATABASE_ERRORS
 
 
 class Inspector(ctk.CTkFrame):
@@ -51,6 +53,19 @@ class Inspector(ctk.CTkFrame):
                                 'device with the command strip (Ctrl+K).', font=theme.FONT_SMALL, anchor='w', justify='left',
                      wraplength=250, text_color=theme.TEXT_MUTED).grid(
             row=1, column=0, columnspan=2, sticky='ew')
+
+    def show_unavailable(self, device_id=None):
+        """The database cannot be read: show nothing from it (never old details as if
+        current). device_id: the device to show again when the connection is back."""
+        self.device = None
+        self.selection = ('device', device_id) if device_id is not None else None
+        body = self._new_body()
+        ctk.CTkLabel(body, text='Database unavailable', font=theme.FONT_BOLD, anchor='w',
+                     text_color=theme.DANGER).grid(row=0, column=0, columnspan=2, sticky='ew',
+                                                   pady=(6, 2))
+        ctk.CTkLabel(body, text='Device details cannot be shown until the connection is back.',
+                     font=theme.FONT_SMALL, anchor='w', justify='left', wraplength=250,
+                     text_color=theme.TEXT_MUTED).grid(row=1, column=0, columnspan=2, sticky='ew')
 
     # ---------------------------------------------------------------- generic rows
     def _rows(self, body, rows, start):
@@ -136,7 +151,12 @@ class Inspector(ctk.CTkFrame):
         """Show one registered device (read from the store). extra_rows: more
         (label, value, is_mono) facts from the topology, e.g. single point of failure.
         Returns the device, or None if it is gone."""
-        d = self.store.get_device(device_id)
+        try:
+            d = self.store.get_device(device_id)
+        except DATABASE_ERRORS as err:
+            self.show_unavailable(device_id)
+            report_error(self, err)
+            return None
         body = self._new_body()
         self.device = d
         self.selection = ('device', device_id)

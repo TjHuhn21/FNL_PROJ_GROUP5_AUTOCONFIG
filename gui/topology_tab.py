@@ -14,15 +14,37 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from gui import theme
+from gui.db_status import report_error
 from gui.topology_canvas import TopologyCanvas
 from topology.graph import build_graph, draw_map, find_single_points
 from topology.layout_store import LayoutStore
+from store_errors import DATABASE_ERRORS
 
 EMPTY_MESSAGE = ('No registered devices yet.\n'
                  'Run a scan and approve the devices you find to see your network here.')
+UNAVAILABLE_MESSAGE = ('Database unavailable: the map cannot be shown right now.\n'
+                       'It is redrawn when the connection is back.')
 SAMPLE_BANNER = 'SAMPLE DATA: example network, not your registered devices'
 DEFAULT_SIZE = (900, 520)        # used before the page has been laid out
 RESIZE_DELAY_MS = 250
+RENDER_PREFIX = 'netcommand_topology_'   # + a unique part per render (tempfile.mkstemp)
+
+
+def map_error_text(err):
+    """The reason a map failed, never blank: some exceptions have an empty message."""
+    message = str(err).strip()
+    name = type(err).__name__
+    return f'{name}: {message}' if message else f'{name} (no further details were given)'
+
+
+def remove_render_file(path):
+    """Remove one render's own temporary PNG. A file that cannot be removed right now
+    (for example briefly locked by a virus scanner) is left in the temp folder; its name
+    is unique, so it can never be confused with another render's file."""
+    try:
+        os.remove(path)
+    except OSError:                  # already gone, or locked for a moment: nothing to do
+        pass
 
 
 class TopologyTab(ttk.Frame):
@@ -87,7 +109,12 @@ class TopologyTab(ttk.Frame):
 
     # ---------------------------------------------------------------- loading
     def refresh(self):
-        devices, links, source = self.get_data()
+        try:
+            devices, links, source = self.get_data()
+        except DATABASE_ERRORS as err:
+            self.show_unavailable(str(err))
+            report_error(self, err)
+            return
         self._data = (devices, links, source)
         is_sample = source.startswith('SAMPLE')
         self.source.config(text=source, style='Sample.TLabel' if is_sample else 'TLabel')
@@ -105,6 +132,17 @@ class TopologyTab(ttk.Frame):
         points = find_single_points(devices, links)
         self.single.config(text=('Single points of failure: ' + ', '.join(points))
                            if points else '')
+
+    def show_unavailable(self, reason=''):
+        """The devices could not be read: show no map at all (never the old one as if it
+        were current). Saved layouts are not touched."""
+        self._data = ([], [], 'Database unavailable')
+        self.source.config(text='Database unavailable', style='TLabel')
+        self.interactive.load([], [], sample=False, empty_text=UNAVAILABLE_MESSAGE)
+        self._set_state(None)
+        self.img, self.shown_names, self.drawn_size = None, [], None
+        self.label.config(image='', text=UNAVAILABLE_MESSAGE)
+        self.single.config(text='')
 
     # ---------------------------------------------------------------- saved layouts
     def device_key(self, name):
@@ -214,17 +252,26 @@ class TopologyTab(ttk.Frame):
         return (w, h) if w > 200 and h > 150 else DEFAULT_SIZE
 
     def _render(self):
+        """Draw the static map. Each render uses its OWN new temporary PNG (created
+        exclusively by mkstemp), so two renders, in this window or in another NetCommand
+        process, can never overwrite or read each other's file. Tk reads the whole image
+        when PhotoImage is created, so the file is removed right after, also on failure.
+        A failed render keeps the previous map."""
         devices, links, source = self._data
         size = self._area_size()
         dpi = float(self.tk.call('tk', 'scaling')) * 72      # text the same size as the app's
-        path = os.path.join(tempfile.gettempdir(), 'netcommand_topology.png')
+        fd, path = tempfile.mkstemp(prefix=RENDER_PREFIX, suffix='.png')
+        os.close(fd)                                          # draw_map writes it by name
         try:
             draw_map(devices, links, path, size=size, dpi=dpi,
                      banner=SAMPLE_BANNER if source.startswith('SAMPLE') else None)
-            self.img = tk.PhotoImage(file=path)   # keep a reference, or it vanishes
+            img = tk.PhotoImage(file=path)   # read completely now
         except Exception as err:
-            messagebox.showerror('Map failed', str(err))
+            messagebox.showerror('Map failed', map_error_text(err))
             return
+        finally:
+            remove_render_file(path)         # only this render's own file
+        self.img = img                       # keep a reference, or it vanishes
         self.label.config(image=self.img, text='')
         self.drawn_size = size
         self.shown_names = list(build_graph(devices, links).nodes)

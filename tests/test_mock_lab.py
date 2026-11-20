@@ -452,8 +452,23 @@ def test_hostname_change_through_netcommand_is_reported_not_saved(route, tmp_pat
 def test_discovery_finds_the_lab(route):
     from discovery import crawler
     shared = CONFIG['shared_scan_account']
-    devices, links = crawler.discover(shared['username'], shared['password'], '127.0.0.11')
+    devices, links = crawler.discover(shared['username'], shared['password'], '127.0.0.11',
+                                    login_neighbours=True)
     assert {(d['name'], d['ip'], d['type'], d['managed']) for d in devices} == {
         ('R1', '127.0.0.11', 'router', True), ('SW1', '127.0.0.12', 'switch', True),
         ('SW2', '127.0.0.13', 'switch', True)}
     assert set(links) == {('R1', 'Gi0/1', 'SW1', 'Gi0/1'), ('SW1', 'Gi0/2', 'SW2', 'Gi0/1')}
+
+
+def test_default_discovery_logs_in_to_the_seed_only(route, monkeypatch):
+    """Real Netmiko + Paramiko, strict SSH options: R1 is logged in to; its CDP neighbour
+    SW1 is listed but never receives the login."""
+    from discovery import crawler
+    logins = []
+    real = crawler.ConnectHandler
+    monkeypatch.setattr(crawler, 'ConnectHandler', lambda **kw: (logins.append(kw['host']), real(**kw))[1])
+    shared = CONFIG['shared_scan_account']
+    devices, links = crawler.discover(shared['username'], shared['password'], '127.0.0.11')
+    assert logins == ['127.0.0.11']
+    assert {(d['name'], d['managed']) for d in devices} == {('R1', True), ('SW1', False)}
+    assert set(links) == {('R1', 'Gi0/1', 'SW1', 'Gi0/1')}

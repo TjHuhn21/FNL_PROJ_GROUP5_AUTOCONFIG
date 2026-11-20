@@ -1,0 +1,9 @@
+# NetCommand backend (FastAPI): pinned, tested on Python 3.10.0 together with the desktop's
+# requirements.txt (python-dotenv is the same version in both files).
+fastapi==0.162.5
+uvicorn==0.54.0
+httpx==0.28.1
+python-dotenv==1.2.4
+# Authentication Phase 1: Argon2id password hashing (bindings pinned too)
+argon2-cffi==25.1.0
+argon2-cffi-bindings==25.1.0

@@ -16,6 +16,9 @@ Passwords and secrets are never reported: commands and replies are masked
 before they are logged (what is SENT is not changed).
 
 Every failure comes back as (False, 'a clear message'). Nothing crashes the app.
+
+Every connection uses ssh_options.connect_options(host): strict SSH algorithms, with the
+old SHA-1 ones allowed only for the addresses in NETCOMMAND_LEGACY_SSH_HOSTS.
 """
 import os
 import re
@@ -23,6 +26,8 @@ from datetime import datetime
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+import ssh_options
 
 LOGIN_TIMEOUTS = {'conn_timeout': 8, 'auth_timeout': 10, 'banner_timeout': 10}
 BACKUP_DIR = 'backups'
@@ -67,7 +72,8 @@ class _Report:
 def _open(creds):
     conn = ConnectHandler(device_type='cisco_ios', host=creds['host'],
                           username=creds['username'], password=creds['password'],
-                          secret=creds.get('secret') or creds['password'], **LOGIN_TIMEOUTS)
+                          secret=creds.get('secret') or creds['password'], **LOGIN_TIMEOUTS,
+                          **ssh_options.connect_options(creds['host']))
     if conn.find_prompt().endswith('>'):
         try:
             conn.enable()
@@ -131,15 +137,8 @@ def apply_config(creds, commands, checks=(), backup_dir=None, log=None):
     report('info', f'Connecting to {host} through SSH...')
     try:
         conn = _open(creds)
-    except NetmikoTimeoutException:
-        report('error', f'No answer from {host} (wrong IP, device off, or SSH not enabled).')
-        return False, 'No answer (wrong IP, device off, or SSH not enabled).'
-    except NetmikoAuthenticationException:
-        report('error', 'The device refused the login (wrong username or password).')
-        return False, 'Wrong username or password.'
     except Exception as err:
-        report('error', f'Could not connect: {type(err).__name__}: {err}')
-        return False, f'Error: {type(err).__name__}: {err}'
+        return _connect_failed(err, host, report)
     try:
         return _session(conn, host, commands, checks, backup_dir, report)
     except NetmikoTimeoutException:
@@ -149,14 +148,35 @@ def apply_config(creds, commands, checks=(), backup_dir=None, log=None):
         report('error', 'The device refused the login (wrong username or password).')
         return False, 'Wrong username or password.'
     except Exception as err:
-        report('error', f'The session failed: {type(err).__name__}: {err}')
-        return False, f'Error: {type(err).__name__}: {err}'
+        detail = mask(str(err))
+        report('error', f'The session failed: {type(err).__name__}: {detail}')
+        return False, f'Error: {type(err).__name__}: {detail}'
     finally:
         try:
             conn.disconnect()
             report('info', 'SSH session closed.')
         except Exception:
             pass
+
+
+def _connect_failed(err, host, report):
+    """(False, message) for a connection that could not be opened. The message comes
+    from ssh_options.describe_error: fixed text, never the exception's own text."""
+    kind, text = ssh_options.describe_error(err, host)
+    if kind == ssh_options.AUTH:
+        report('error', 'The device refused the login (wrong username or password).')
+        return False, 'Wrong username or password.'
+    if kind == ssh_options.TIMEOUT:
+        report('error', f'No answer from {host}: {text}.')
+        return False, 'No answer (the connection timed out: wrong IP, device off, or not reachable).'
+    if kind == ssh_options.REFUSED:
+        report('error', f'{host}: {text}.')
+        return False, 'Connection refused (SSH is not enabled on the device, or port 22 is blocked).'
+    if kind == ssh_options.ALGORITHMS:
+        report('error', f'Unsupported SSH algorithms: {text}.')
+        return False, f'Unsupported SSH algorithms: {text}.'
+    report('error', f'Could not connect: {text}.')
+    return False, f'Error: {type(err).__name__} (the SSH connection could not be opened).'
 
 
 def _session(conn, host, commands, checks, backup_dir, report):

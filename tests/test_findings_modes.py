@@ -24,7 +24,7 @@ CONFIGS_BY_IP = {'192.168.1.3': sample_data.CONFIGS['SW1'], '192.168.1.4': sampl
 def register_lab(monkeypatch, with_logins=True):
     """The fake lab, discovered and registered as real (non-sample) devices."""
     monkeypatch.setattr(crawler, '_login', fake_login_factory(lab()))
-    devices, links = crawler.discover('admin', 'cisco123', '192.168.1.2')
+    devices, links = crawler.discover('admin', 'cisco123', '192.168.1.2', login_neighbours=True)
     for d in devices:
         did = db_fake.upsert_device(d)
         if with_logins and d['managed']:

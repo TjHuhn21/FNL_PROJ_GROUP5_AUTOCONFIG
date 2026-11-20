@@ -117,9 +117,10 @@ def test_send_to_configure_switches_page_and_is_logged(app):
     assert any(s == 'findings' and 'SW1' in m for _, s, m, _ in r['console'].lines)
 
 
-def test_overview_is_a_labelled_placeholder_that_opens_topology(app):
+def test_overview_shows_stored_data_and_opens_topology(app):
     root, r = app
-    assert 'later step' in r['dashboard'].message.cget('text')
+    assert 'PLACEHOLDER' not in r['dashboard'].message.cget('text')
+    assert r['dashboard'].data is not None                    # loaded from the store
     r['dashboard'].open_topology.invoke()
     assert r['current_page']() == 'topology'
 

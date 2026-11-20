@@ -1,7 +1,8 @@
--- NetCommand database. Open this in MySQL Workbench as root and run it.
--- BEFORE running: change 'choose-a-password' on the CREATE USER line, and use
--- the same password in your .env file (DB_PASSWORD).
--- The app connects as the limited 'netcommand' user (no DROP, no ALTER).
+-- NetCommand database tables (MySQL 8.4). Tables only: run it once on a new database.
+-- Database users and privileges are NOT created here: the database administrator
+-- configures them separately (the app connects as the restricted netcommand_app user
+-- set in .env). Every CREATE statement uses IF NOT EXISTS, so existing tables and
+-- data are left untouched.
 
 CREATE DATABASE IF NOT EXISTS netcommand CHARACTER SET utf8mb4;
 USE netcommand;
@@ -59,8 +60,3 @@ CREATE TABLE IF NOT EXISTS config_logs (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (device_id) REFERENCES devices(id)
 ) ENGINE=InnoDB;
-
--- The limited-privilege user the rubric asks for.
-CREATE USER IF NOT EXISTS 'netcommand'@'localhost' IDENTIFIED BY 'choose-a-password';
-GRANT SELECT, INSERT, UPDATE, DELETE ON netcommand.* TO 'netcommand'@'localhost';
-FLUSH PRIVILEGES;
