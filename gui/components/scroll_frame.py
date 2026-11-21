@@ -3,11 +3,59 @@ content is taller than the space it has (no needless scroll bars).
 
     box = ScrollFrame(parent)
     ttk.Label(box.inner, text='...').pack()      # put widgets in .inner
+
+Two helpers for scrollable widgets (tables, text boxes) that are not inside a ScrollFrame:
+
+    bind_wheel(tree)                 # the mouse wheel scrolls THIS widget only
+    bar = auto_scrollbar(holder, tree)   # a scroll bar shown only when it is needed
 """
 import tkinter as tk
 from tkinter import ttk
 
 from gui import theme
+
+WHEEL_STEP = 120          # one notch of a classic Windows mouse wheel (event.delta)
+
+
+def bind_wheel(widget, lines_per_notch=1):
+    """The mouse wheel scrolls `widget` (anything with yview_scroll) and nothing else.
+
+    Why not the default binding: Tk's own Treeview binding computes -(delta / 120) with
+    integer division, so the small steps many Windows mice and touchpads send (delta 40,
+    for example) scroll down but never up. This handler adds the steps up until a whole
+    notch is reached, scrolls only the widget under the pointer, and returns 'break', so
+    the class binding and any application-wide wheel handler (ScrollFrame) do not also
+    scroll this or another section."""
+    state = {'rest': 0}
+
+    def on_wheel(event):
+        state['rest'] += event.delta
+        notches = int(state['rest'] / WHEEL_STEP)         # toward zero, both directions
+        if notches:
+            state['rest'] -= notches * WHEEL_STEP
+            widget.yview_scroll(-notches * lines_per_notch, 'units')
+        return 'break'
+    widget.bind('<MouseWheel>', on_wheel)
+    # X11 sends buttons 4/5 instead of <MouseWheel> (Linux test machines)
+    widget.bind('<Button-4>', lambda e: (widget.yview_scroll(-lines_per_notch, 'units'), 'break')[1])
+    widget.bind('<Button-5>', lambda e: (widget.yview_scroll(lines_per_notch, 'units'), 'break')[1])
+    return on_wheel
+
+
+def auto_scrollbar(parent, widget, row=0, column=1):
+    """A vertical scroll bar for `widget`, placed with grid at (row, column) of `parent`
+    and shown only while the content does not fit (widget must be gridded in `parent`)."""
+    bar = ttk.Scrollbar(parent, orient='vertical', command=widget.yview)
+
+    def on_scroll(first, last):
+        bar.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            bar.grid_remove()                              # everything is visible
+        elif not bar.winfo_manager():
+            bar.grid(row=row, column=column, sticky='ns')
+    widget.configure(yscrollcommand=on_scroll)
+    bar.on_scroll = on_scroll                              # for tests
+    return bar
 
 
 class ScrollFrame(ttk.Frame):

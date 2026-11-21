@@ -50,10 +50,11 @@ class DevicePicker(ttk.Frame):
         holder.grid_columnconfigure(0, weight=1)
         holder.grid_rowconfigure(0, weight=1)
         self.tree = ttk.Treeview(holder, columns=('check', 'name', 'ip', 'type'),
-                                 show='headings', height=8, selectmode='browse')
-        for key, title, width, stretch in (('check', '', 34, False), ('name', 'Device', 90, True),
-                                           ('ip', 'IP address', 104, True),
-                                           ('type', 'Type', 62, False)):
+                                 show='headings', height=8, selectmode='browse',
+                                 style='Data.Treeview')
+        for key, title, width, stretch in (('check', '', 30, False), ('name', 'Device', 96, True),
+                                           ('ip', 'IP address', 118, True),
+                                           ('type', 'Type', 66, False)):
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, minwidth=width if not stretch else 60,
                              stretch=stretch, anchor='center' if key == 'check' else 'w')

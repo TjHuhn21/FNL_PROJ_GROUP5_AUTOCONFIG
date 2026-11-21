@@ -57,7 +57,7 @@ class SshConsole(tk.Frame):
 
         holder = tk.Frame(self, background=BG)
         holder.pack(fill='both', expand=True)
-        self.text = tk.Text(holder, height=10, wrap='none', font=theme.mono(9),
+        self.text = tk.Text(holder, height=10, wrap='none', font=theme.mono(theme.SESSION_SIZE),
                             background=BG, foreground=COLORS['output'], insertbackground=BG,
                             relief='flat', borderwidth=0, highlightthickness=0, padx=10, pady=8,
                             state='disabled', cursor='arrow')
@@ -70,7 +70,8 @@ class SshConsole(tk.Frame):
         for kind, color in COLORS.items():
             bold = kind in ('command', 'section', 'start', 'device', 'ok', 'error')
             self.text.tag_configure(kind, foreground=color,
-                                    font=theme.mono(9, 'bold') if bold else theme.mono(9))
+                                    font=theme.mono(theme.SESSION_SIZE, 'bold') if bold
+                                    else theme.mono(theme.SESSION_SIZE))
         self._device = None
         self._timer = self.after(DRAIN_MS, self._drain)
         self.bind('<Destroy>', self._stop, add='+')

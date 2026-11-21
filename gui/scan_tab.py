@@ -65,30 +65,39 @@ class ScanTab(ttk.Frame):
         self.demo = tk.IntVar(value=int(demo_default))
         self.save_login = tk.IntVar(value=1)
         self.login_neighbours = tk.IntVar(value=0)       # off: only the seed gets the login
+        # Larger form text (theme.FONT_FORM). Each label sits above its field, so the
+        # wider text still fits on one line next to the inspector (no horizontal overflow).
+        self.entries = {}
         for col, (label, var, show) in enumerate(
                 [('Username', self.user, ''), ('Password', self.pw, '*'),
                  ('Seed IP', self.seed, '')]):
-            ttk.Label(form, text=label).grid(row=0, column=col * 2, sticky='w', padx=(0, 4))
-            ttk.Entry(form, textvariable=var, show=show, width=18).grid(
-                row=0, column=col * 2 + 1, padx=(0, theme.PAD * 2))
-        self.scan_btn = ttk.Button(form, text='Scan', style='Accent.TButton',
+            ttk.Label(form, text=label, style='Form.TLabel').grid(
+                row=0, column=col, sticky='w', padx=(0, theme.PAD * 2), pady=(0, 2))
+            entry = ttk.Entry(form, textvariable=var, show=show, width=17, font=theme.FONT_FORM)
+            entry.grid(row=1, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
+            self.entries[label] = entry
+        self.scan_btn = ttk.Button(form, text='Scan', style='Large.Accent.TButton',
                                    command=self.on_scan)
-        self.scan_btn.grid(row=0, column=6)
+        self.scan_btn.grid(row=1, column=3, sticky='w')
 
+        # One option per line: with the larger text, side by side they could be cut off
         opts = ttk.Frame(self); opts.pack(fill='x', pady=theme.PAD)
-        ttk.Checkbutton(opts, text='Demo mode (use sample data, no network)',
-                        variable=self.demo).pack(side='left')
-        ttk.Checkbutton(opts, text='Save the login (encrypted) with approved devices',
-                        variable=self.save_login).pack(side='left', padx=theme.PAD * 2)
-        ttk.Checkbutton(self, text='Also log in to CDP/LLDP neighbours with this login '
-                        '(sends the login to every neighbour; off = seed device only)',
-                        variable=self.login_neighbours).pack(anchor='w', pady=(0, theme.PAD))
+        self.option_boxes = [
+            ttk.Checkbutton(opts, text='Demo mode (use sample data, no network)',
+                            variable=self.demo, style='Form.TCheckbutton'),
+            ttk.Checkbutton(opts, text='Save the login (encrypted) with approved devices',
+                            variable=self.save_login, style='Form.TCheckbutton'),
+            ttk.Checkbutton(opts, text='Also log in to CDP/LLDP neighbours with this login\n'
+                            '(sends the login to every neighbour; off = seed device only)',
+                            variable=self.login_neighbours, style='Form.TCheckbutton')]
+        for box in self.option_boxes:
+            box.pack(anchor='w', pady=1)
 
         self.status = ttk.Label(self, text='Ready.'); self.status.pack(anchor='w')
-        cols = [('name', 'Name', 150), ('ip', 'IP', 130), ('type', 'Type', 90),
-                ('managed', 'Managed', 80), ('source', 'Source', 150)]
+        cols = [('name', 'Name', 170), ('ip', 'IP', 145), ('type', 'Type', 100),
+                ('managed', 'Managed', 100), ('source', 'Source', 160)]
         self.tree = ttk.Treeview(self, columns=[c[0] for c in cols], show='headings',
-                                 selectmode='extended')
+                                 selectmode='extended', style='Data.Treeview')
         for key, title, width in cols:
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, anchor='w')

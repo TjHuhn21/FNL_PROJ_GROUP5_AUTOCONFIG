@@ -7,8 +7,9 @@ from gui.db_status import database_ready, report_error
 from store_errors import DATABASE_ERRORS, DeletedDeviceExists, DuplicateDeviceName, outcome_text
 
 PER_PAGE = 15
-COLUMNS = [('name', 'Name', 160), ('ip', 'IP', 130), ('type', 'Type', 90),
-           ('status', 'Status', 70), ('managed', 'Managed', 80)]
+# widths for the larger table text (theme.TABLE_SIZE)
+COLUMNS = [('name', 'Name', 180), ('ip', 'IP', 150), ('type', 'Type', 100),
+           ('status', 'Status', 85), ('managed', 'Managed', 100)]
 SORTABLE = {'name', 'ip', 'type', 'status'}
 
 
@@ -33,7 +34,7 @@ class DevicesTab(ttk.Frame):
         self.edit_btn.pack(side='right')
 
         self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS],
-                                 show='headings', selectmode='browse')
+                                 show='headings', selectmode='browse', style='Data.Treeview')
         for key, title, width in COLUMNS:
             cmd = (lambda k=key: self.sort(k)) if key in SORTABLE else ''
             self.tree.heading(key, text=title, command=cmd)

@@ -53,6 +53,20 @@ FONT_BRAND = (FONT_FAMILY, 11, 'bold')
 FONT_RAIL = (FONT_FAMILY, 8)
 FONT_MONO = (MONO_FAMILY, 9)
 FONT_MONO_BOLD = (MONO_FAMILY, 9, 'bold')
+# Forms people type into while working (the Scan login line): one step larger than FONT
+FONT_FORM = (FONT_FAMILY, 11)
+FONT_FORM_BOLD = (FONT_FAMILY, 11, 'bold')
+# Monospace sizes for command text: what Configure will send, and the live SSH session
+CODE_SIZE = 11
+SESSION_SIZE = 10
+# Data tables people read row by row (Devices, Logs, Scan results, Configure's device
+# list): one step larger than FONT, with taller rows and larger headings
+TABLE_SIZE = 11
+TABLE_ROW_HEIGHT = 28
+TABLE_HEADING_SIZE = 10
+# The bottom operations console (Console / Config log / Status events)
+CONSOLE_SIZE = 11
+CONSOLE_TAB_SIZE = 11
 PAD = 8
 RAIL_WIDTH = 64
 INSPECTOR_WIDTH = 300
@@ -116,6 +130,11 @@ def apply(root):
               background=[('disabled', '#9DBFBB'), ('pressed', ACCENT_HOVER),
                           ('active', ACCENT_HOVER)],
               foreground=[('disabled', SURFACE)])
+    # Larger form controls (inherit everything else from TLabel / TCheckbutton /
+    # Accent.TButton, so colors and states stay the same)
+    style.configure('Form.TLabel', font=FONT_FORM)
+    style.configure('Form.TCheckbutton', font=FONT_FORM)
+    style.configure('Large.Accent.TButton', font=FONT_FORM_BOLD, padding=(16, 5))
 
     style.configure('TEntry', fieldbackground=SURFACE, foreground=TEXT, insertcolor=TEXT,
                     bordercolor=BORDER_STRONG, lightcolor=SURFACE, darkcolor=SURFACE)
@@ -139,12 +158,22 @@ def apply(root):
                     foreground=TEXT_SOFT, bordercolor=BORDER, lightcolor=SURFACE_2,
                     darkcolor=SURFACE_2, relief='flat', padding=(6, 4))
     style.map('Treeview.Heading', background=[('active', BORDER)])
+    # Larger tables (inherit the ledger look above; only size and row height change)
+    style.configure('Data.Treeview', font=(FONT_FAMILY, TABLE_SIZE), rowheight=TABLE_ROW_HEIGHT)
+    style.configure('Data.Treeview.Heading', font=(MONO_FAMILY, TABLE_HEADING_SIZE, 'bold'),
+                    padding=(6, 5))
 
     style.configure('TNotebook', background=BG, bordercolor=BORDER, tabmargins=(0, 2, 0, 0))
     style.configure('TNotebook.Tab', background=SURFACE_2, foreground=TEXT_SOFT,
                     bordercolor=BORDER, lightcolor=SURFACE_2, darkcolor=SURFACE_2,
                     padding=(12, 4))
     style.map('TNotebook.Tab', background=[('selected', SURFACE)], foreground=[('selected', TEXT)])
+    # The bottom operations console: slightly larger tab labels and buttons
+    style.configure('Console.TNotebook', background=BG, bordercolor=BORDER,
+                    tabmargins=(0, 2, 0, 0))
+    style.configure('Console.TNotebook.Tab', font=(FONT_FAMILY, CONSOLE_TAB_SIZE),
+                    padding=(14, 5))
+    style.configure('Console.TButton', font=(FONT_FAMILY, CONSOLE_TAB_SIZE), padding=(12, 3))
 
     style.configure('TScrollbar', background=SURFACE_2, troughcolor=SURFACE,
                     bordercolor=SURFACE, arrowcolor=TEXT_MUTED,

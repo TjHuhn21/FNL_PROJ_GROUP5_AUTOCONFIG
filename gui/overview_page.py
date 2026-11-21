@@ -31,13 +31,15 @@ from datetime import date, datetime
 from tkinter import ttk
 
 from gui import theme
+from gui.components.scroll_frame import auto_scrollbar, bind_wheel
 from gui.db_status import report_error
 from store_errors import DATABASE_ERRORS
 
 FRESH_SECONDS = 15
 AUTO_SECONDS = 60
-RECENT = 6
-SESSION_ROWS = 3
+RECENT = 6           # rows each list shows at least (its height); more scroll
+LIST_ROWS = 25       # rows each list loads (scroll with the mouse wheel or its scroll bar)
+SESSION_ROWS = 10    # of those, at most this many are this session's scans and approvals
 QUICK_ACTIONS = [('scan', 'Scan network'), ('devices', 'Devices'), ('topology', 'Open Topology'),
                  ('findings', 'Findings'), ('configure', 'Configure'), ('logs', 'Logs')]
 NONE_YET = {
@@ -73,7 +75,7 @@ def summarize(store, scan_history=()):
     session = sorted(scan_history, key=lambda h: _sortable(h['when']), reverse=True)[:SESSION_ROWS]
     registered = sorted((d for d in devices if d.get('created_at')),
                         key=lambda d: _sortable(d['created_at']),
-                        reverse=True)[:RECENT - len(session)]
+                        reverse=True)[:LIST_ROWS - len(session)]
     activity = [{'when': d['created_at'], 'what': 'Device registered',
                  'detail': f"{d['name']} ({d['ip']}, {d.get('type') or 'unknown'})"}
                 for d in registered]
@@ -103,9 +105,9 @@ def summarize(store, scan_history=()):
         'review_saved_at': snapshot.get('saved_at'),
         'changes': store.count_logs(), 'changes_ok': store.count_logs(status='success'),
         'changes_failed': store.count_logs(status='failed'),
-        'recent_changes': store.get_logs(page=1, per_page=RECENT),
-        'recent_events': store.get_events(limit=RECENT),
-        'recent_activity': activity[:RECENT],
+        'recent_changes': store.get_logs(page=1, per_page=LIST_ROWS),
+        'recent_events': store.get_events(limit=LIST_ROWS),
+        'recent_activity': activity[:LIST_ROWS],
     }
 
 
@@ -249,8 +251,16 @@ class OverviewPage(tk.Frame):
                          highlightbackground=theme.BORDER)
         tk.Label(frame, text=title, font=theme.mono(8, 'bold'), background=theme.SURFACE_2,
                  foreground=theme.TEXT_SOFT, anchor='w', padx=10, pady=5).pack(fill='x')
-        tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show='headings',
+        # the table and its own scroll bar (shown only when the rows do not fit); the
+        # mouse wheel scrolls only the list under the pointer (bind_wheel)
+        holder = tk.Frame(frame, background=theme.SURFACE)
+        holder.grid_columnconfigure(0, weight=1)
+        holder.grid_rowconfigure(0, weight=1)
+        tree = ttk.Treeview(holder, columns=[c[0] for c in columns], show='headings',
                             height=RECENT, selectmode='none')
+        tree.grid(row=0, column=0, sticky='nsew')
+        bar = auto_scrollbar(holder, tree)
+        bind_wheel(tree)
         for key, heading, width in columns:
             tree.heading(key, text=heading)
             tree.column(key, width=width, minwidth=50, anchor='w', stretch=True)
@@ -260,7 +270,7 @@ class OverviewPage(tk.Frame):
         empty = tk.Label(frame, text='', font=theme.FONT, background=theme.SURFACE,
                          foreground=theme.TEXT_MUTED, wraplength=280, justify='left', anchor='nw',
                          padx=10, pady=10)
-        return {'frame': frame, 'tree': tree, 'empty': empty}
+        return {'frame': frame, 'tree': tree, 'empty': empty, 'holder': holder, 'bar': bar}
 
     # ------------------------------------------------------------ loading
     def mark_stale(self):
@@ -393,16 +403,17 @@ class OverviewPage(tk.Frame):
 
     def _fill(self, key, rows, empty_text):
         part = self.lists[key]
-        tree, empty = part['tree'], part['empty']
+        tree, empty, holder = part['tree'], part['empty'], part['holder']
         tree.delete(*tree.get_children())
         for values, tags in rows:
             tree.insert('', 'end', values=values, tags=tags)
+        tree.yview_moveto(0)                       # newest rows first after every reload
         if rows:
             empty.pack_forget()
-            if not tree.winfo_manager():
-                tree.pack(fill='both', expand=True)
+            if not holder.winfo_manager():
+                holder.pack(fill='both', expand=True)
         else:
-            tree.pack_forget()
+            holder.pack_forget()
             empty.config(text=empty_text)
             if not empty.winfo_manager():
                 empty.pack(fill='both', expand=True)

@@ -79,7 +79,7 @@ def test_this_sessions_scans_are_listed_with_the_registrations():
     assert ('Scan (this session)', 'seed 10.0.0.1: 4 devices (1 managed), 3 links') in texts
     assert ('Scan (this session)', 'seed 10.9.9.9: failed (see the Scan page)') in texts
     assert ('Approval (this session)', '1 device saved') in texts
-    assert len(d['recent_activity']) == overview_page.RECENT
+    assert len(d['recent_activity']) == 7       # 3 session entries + 4 registrations (all fit)
 
 
 def test_when_text():
@@ -137,7 +137,7 @@ def test_empty_database_shows_friendly_empty_states(page):
     assert card(p, 'findings')[1] == 'No review saved yet.'
     for key, text in overview_page.NONE_YET.items():
         assert p.lists[key]['empty'].cget('text') == text
-        assert p.lists[key]['empty'].winfo_manager() and not p.lists[key]['tree'].winfo_manager()
+        assert p.lists[key]['empty'].winfo_manager() and not p.lists[key]['holder'].winfo_manager()
 
 
 def test_populated_database_fills_cards_and_lists(page):

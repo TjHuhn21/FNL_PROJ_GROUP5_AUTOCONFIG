@@ -12,6 +12,13 @@ Three tabs:
                  opened, on Refresh, and after the monitor records a change.
 Both stored-data tabs are read on the window's own thread. While the database is
 unavailable they show that instead of their old contents (never old rows as current).
+
+Refresh and Clear act on the tab that is shown:
+  Console        Refresh shows any lines still waiting; Clear empties the console.
+  Config log     Refresh reloads it; Clear only empties the VIEW (a note says so).
+  Status events  Refresh reloads them; Clear only empties the VIEW.
+Clearing never deletes anything from the database: the configuration log and the
+status history stay stored, and Refresh (or opening the tab again) shows them again.
 """
 import queue
 import threading
@@ -28,6 +35,10 @@ EVENT_ROWS = 50
 CONFIG_TAB, EVENTS_TAB = 1, 2
 UNAVAILABLE_TEXT = ('Database unavailable: this cannot be shown right now. It is reloaded '
                     'when the connection is back.\n')
+CLEARED_TEXT = {CONFIG_TAB: 'Configuration log cleared from view (nothing was deleted). '
+                            'Click Refresh to show it again.\n',
+                EVENTS_TAB: 'Status events cleared from view (nothing was deleted). '
+                            'Click Refresh to show them again.\n'}
 
 
 class OperationsConsole(tk.Frame):
@@ -37,7 +48,7 @@ class OperationsConsole(tk.Frame):
         self._queue = queue.Queue()
         self.lines = []                     # (time, source, message, level): handy for tests
 
-        self.tabs = ttk.Notebook(self)
+        self.tabs = ttk.Notebook(self, style='Console.TNotebook')
         self.tabs.pack(fill='both', expand=True)
 
         self.text = self._make_text(self.tabs)
@@ -53,8 +64,12 @@ class OperationsConsole(tk.Frame):
 
         tools = tk.Frame(self, background=theme.SURFACE)
         tools.place(relx=1.0, x=-8, y=2, anchor='ne')          # sits on the tab row, right side
-        ttk.Button(tools, text='Clear', command=self.clear).pack(side='right')
-        ttk.Button(tools, text='Refresh', command=self.refresh_current).pack(side='right', padx=4)
+        self.clear_button = ttk.Button(tools, text='Clear', command=self.clear,
+                                       style='Console.TButton')
+        self.clear_button.pack(side='right')
+        self.refresh_button = ttk.Button(tools, text='Refresh', command=self.refresh_current,
+                                         style='Console.TButton')
+        self.refresh_button.pack(side='right', padx=4)
 
         self._timer = self.after(150, self._drain)
         self.bind('<Destroy>', self._stop, add='+')
@@ -69,7 +84,8 @@ class OperationsConsole(tk.Frame):
 
     def _make_text(self, parent):
         holder = tk.Frame(parent, background=theme.SURFACE)
-        text = tk.Text(holder, height=6, wrap='none', font=theme.mono(9), relief='flat',
+        text = tk.Text(holder, height=6, wrap='none', font=theme.mono(theme.CONSOLE_SIZE),
+                       relief='flat',
                        background='#FAFAF8', foreground=theme.TEXT, padx=10, pady=6,
                        borderwidth=0, highlightthickness=0, state='disabled', cursor='arrow')
         scroll = ttk.Scrollbar(holder, orient='vertical', command=text.yview)
@@ -134,6 +150,16 @@ class OperationsConsole(tk.Frame):
         t.configure(state='disabled')
 
     def clear(self):
+        """The Clear button: empty the tab that is shown. On the stored-data tabs only the
+        view is emptied (nothing is deleted from the database)."""
+        tab = self._current_tab()
+        if tab in (CONFIG_TAB, EVENTS_TAB):
+            t = self.config_text if tab == CONFIG_TAB else self.events_text
+            t.configure(state='normal')
+            t.delete('1.0', 'end')
+            t.insert('end', CLEARED_TEXT[tab], ('time',))
+            t.configure(state='disabled')
+            return
         self.lines.clear()
         self.text.configure(state='normal')
         self.text.delete('1.0', 'end')
@@ -154,12 +180,15 @@ class OperationsConsole(tk.Frame):
             self.refresh_events()
 
     def refresh_current(self):
-        """The Refresh button, and after the database is back: reload the tab shown."""
+        """The Refresh button, and after the database is back: reload the tab shown.
+        On the Console tab: show any lines that are still waiting in the queue."""
         tab = self._current_tab()
         if tab == CONFIG_TAB:
             self.refresh_config_log()
         elif tab == EVENTS_TAB:
             self.refresh_events()
+        else:
+            self.flush()
 
     def show_unavailable(self):
         """The database is unavailable: blank both stored-data tabs (no old rows shown as

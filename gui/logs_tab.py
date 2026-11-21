@@ -6,8 +6,9 @@ from gui.db_status import report_error
 from store_errors import DATABASE_ERRORS
 
 PER_PAGE = 15
-COLUMNS = [('date', 'Date', 150), ('device', 'Device', 110), ('action', 'Action', 200),
-           ('status', 'Status', 80), ('details', 'Details', 420)]
+# widths for the larger table text (theme.TABLE_SIZE)
+COLUMNS = [('date', 'Date', 175), ('device', 'Device', 125), ('action', 'Action', 210),
+           ('status', 'Status', 95), ('details', 'Details', 400)]
 
 
 class LogsTab(ttk.Frame):
@@ -15,20 +16,21 @@ class LogsTab(ttk.Frame):
         super().__init__(parent, padding=theme.PAD)
         self.store, self.page = store, 1
         top = ttk.Frame(self); top.pack(fill='x')
-        ttk.Label(top, text='Search:').pack(side='left')
+        ttk.Label(top, text='Search:', style='Form.TLabel').pack(side='left')
         self.search = tk.StringVar()
-        entry = ttk.Entry(top, textvariable=self.search, width=30)
-        entry.pack(side='left', padx=theme.PAD)
+        entry = ttk.Entry(top, textvariable=self.search, width=28, font=theme.FONT_FORM)
+        entry.pack(side='left', padx=theme.PAD, ipady=2)
         entry.bind('<KeyRelease>', lambda e: self.go_first())
-        ttk.Label(top, text='Status:').pack(side='left', padx=(theme.PAD, 0))
+        ttk.Label(top, text='Status:', style='Form.TLabel').pack(side='left', padx=(theme.PAD, 0))
         self.status = tk.StringVar(value='all')
         box = ttk.Combobox(top, textvariable=self.status, width=10, state='readonly',
-                           values=['all', 'success', 'failed'])
+                           values=['all', 'success', 'failed'], font=theme.FONT_FORM)
         box.pack(side='left', padx=theme.PAD)
         box.bind('<<ComboboxSelected>>', lambda e: self.go_first())
         ttk.Button(top, text='Refresh', command=self.refresh).pack(side='right')
 
-        self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS], show='headings')
+        self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS], show='headings',
+                                 style='Data.Treeview')
         for key, title, width in COLUMNS:
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, anchor='w')

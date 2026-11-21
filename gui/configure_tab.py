@@ -207,8 +207,11 @@ class ConfigureTab(ttk.Frame):
         if width < 500 or height < 200:
             return
         self._placed = True
-        self.columns.sashpos(0, int(width * 0.22))
-        self.columns.sashpos(1, int(width * 0.56))
+        # Room for the larger device-list text: on narrow windows the device list gets a
+        # bigger share, so device names and IP addresses are not cut off.
+        first, second = (0.25, 0.56) if width >= 1100 else (0.30, 0.61)
+        self.columns.sashpos(0, int(width * first))
+        self.columns.sashpos(1, int(width * second))
         self.right.sashpos(0, int(height * 0.5))
 
     # ------------------------------------------------------------ switch forms
@@ -381,7 +384,8 @@ class ConfigureTab(ttk.Frame):
         holder.pack(fill='both', expand=True)
         holder.grid_columnconfigure(0, weight=1)
         holder.grid_rowconfigure(0, weight=1)
-        self.preview = tk.Text(holder, height=8, font=theme.mono(10), wrap='none', undo=True,
+        self.preview = tk.Text(holder, height=8, font=theme.mono(theme.CODE_SIZE), wrap='none',
+                               undo=True,
                                relief='solid', borderwidth=1, padx=8, pady=6)
         ys = ttk.Scrollbar(holder, orient='vertical', command=self.preview.yview)
         xs = ttk.Scrollbar(holder, orient='horizontal', command=self.preview.xview)
@@ -390,7 +394,8 @@ class ConfigureTab(ttk.Frame):
         ys.grid(row=0, column=1, sticky='ns')
         xs.grid(row=1, column=0, sticky='ew')
         self.preview.tag_configure('comment', foreground=theme.TEXT_MUTED)
-        self.preview.tag_configure('header', foreground=theme.ACCENT, font=theme.mono(10, 'bold'))
+        self.preview.tag_configure('header', foreground=theme.ACCENT,
+                                   font=theme.mono(theme.CODE_SIZE, 'bold'))
         self.preview.tag_configure('skipped', foreground=theme.WARNING)
 
         foot = ttk.Frame(parent); foot.pack(fill='x', pady=(6, 0))
