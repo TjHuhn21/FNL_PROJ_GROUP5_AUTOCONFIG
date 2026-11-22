@@ -27,21 +27,23 @@ matplotlib.use('Agg')  # draw to a file, not to a window
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Rectangle
 
-# ---------------------------------------------------------------- look (matches the workbench)
-BG = '#F8F9F7'
+# ---------------------------------------------------------------- look (matches the workbench:
+# the dark green and beige theme of gui/theme.py; this module does not import the GUI)
+BG = '#FBF9F4'              # theme.CANVAS_BG
 NODE_FILL = '#FFFFFF'
-NODE_FILL_MUTED = '#F1F2EF'
-EDGE = '#6F7A82'
-TEXT = '#1F2428'
-TEXT_SOFT = '#3D454C'
-TEXT_MUTED = '#59626B'
-BORDER = '#8A949C'
-UP = '#1B7A3A'
-DOWN = '#B42318'
-MUTED = '#8A949C'
-AMBER = '#7A4600'
-AMBER_SOFT = '#F6E9D2'
-AMBER_EDGE = '#C98A2E'
+NODE_FILL_MUTED = '#F1ECE0'
+EDGE = '#6E7A70'
+TEXT = '#26352E'            # theme.TEXT
+TEXT_SOFT = '#45534A'       # theme.TEXT_SOFT
+TEXT_MUTED = '#5E6B62'      # theme.TEXT_MUTED
+BORDER = '#8C9A8F'
+LABEL_BORDER = '#D8CFB9'    # theme.BORDER
+UP = '#2F6B3F'              # theme.SUCCESS
+DOWN = '#A33A2C'            # theme.DANGER
+MUTED = '#8C9A8F'
+AMBER = '#7A5A14'           # theme.WARNING
+AMBER_SOFT = '#F3E6C4'      # theme.WARNING_SOFT
+AMBER_EDGE = '#B8893A'
 SANS = ['Segoe UI', 'DejaVu Sans']
 MONO = ['Consolas', 'DejaVu Sans Mono']
 TYPE_TAG = {'router': 'RTR', 'switch': 'SW'}            # anything else: 'DEV'
@@ -379,7 +381,7 @@ def draw_map(devices, links, path='topology.png', size=(800, 600), dpi=100, bann
     for lab in plan['labels']:
         ax.text(lab['x'], lab['y'], lab['text'], fontsize=lab['size'], family=MONO,
                 color=TEXT_SOFT, ha='center', va='center', zorder=5,
-                bbox=dict(boxstyle='square,pad=0.15', facecolor='white', edgecolor='#CDD2D6',
+                bbox=dict(boxstyle='square,pad=0.15', facecolor='white', edgecolor=LABEL_BORDER,
                           linewidth=0.5))
 
     legend, size = legend_text(LEGEND_PARTS, width - 2 * MARGIN * px, px)

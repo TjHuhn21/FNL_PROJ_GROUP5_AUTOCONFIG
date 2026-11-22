@@ -11,9 +11,18 @@ Failure modes (per device, from lab_config.json, the command line, or
                (drop_after, default 1): that command IS applied, nothing more
     slow       every reply waits delay_ms (default 2000)
 
+Restore simulation (restore_sim.py), decided by the device rather than a mode:
+    a command can cut the connection (Reply.drop); a device that is reloading,
+    or whose management_ip no longer exists, refuses connections and cuts the
+    sessions it has; reconnect_refused refuses logins; and when the device
+    configuration contains `ip scp server enable` an SCP sink ("scp -t") writes
+    files to the simulated flash. The lab only accepts connections: it never
+    connects anywhere.
+
 Passwords are never logged.
 """
 import logging
+import re
 import socket
 import sys
 import threading
@@ -21,6 +30,7 @@ import time
 
 import paramiko
 
+from . import restore_sim
 from .cli import Session
 
 FAILURES = ('none', 'auth_fail', 'offline', 'hang', 'drop', 'slow')
@@ -61,6 +71,8 @@ class _Auth(paramiko.ServerInterface):
     def __init__(self, endpoint):
         self.ep = endpoint
         self.shell = threading.Event()
+        self.ready = threading.Event()          # a shell or an SCP exec was requested
+        self.exec_command = None
         self.user = None
 
     def get_allowed_auths(self, username):
@@ -69,6 +81,9 @@ class _Auth(paramiko.ServerInterface):
     def check_auth_password(self, username, password):
         if self.ep.failure == 'auth_fail':
             log.info('[%s] login refused for %r (auth_fail mode)', self.ep.name, username)
+            return paramiko.AUTH_FAILED
+        if getattr(self.ep.device, 'logins_refused', False):
+            log.info('[%s] login refused for %r (reconnect_refused)', self.ep.name, username)
             return paramiko.AUTH_FAILED
         if username in self.ep.accounts and self.ep.accounts[username][0] == password:
             self.user = username
@@ -90,10 +105,26 @@ class _Auth(paramiko.ServerInterface):
 
     def check_channel_shell_request(self, channel):
         self.shell.set()
+        self.ready.set()
         return True
 
     def check_channel_exec_request(self, channel, command):
-        return False                       # Netmiko uses an interactive shell
+        """Only "scp -t <path>", and only when the device configuration already has
+        `ip scp server enable` (nothing ever turns it on). Netmiko uses a shell."""
+        text = command.decode('utf-8', 'replace') if isinstance(command, bytes) else command
+        if text.startswith('scp ') and self.ep.device.scp_enabled():
+            if self.ready.is_set():
+                # a later channel of a connection that is already served (the scp package
+                # opens one next to the shell): serve it on its own thread
+                threading.Thread(target=self.ep._scp_channel,
+                                 args=(channel, text, self.ep.accounts[self.user][1]),
+                                 daemon=True).start()
+                return True
+            self.exec_command = text
+            self.ready.set()
+            return True
+        log.info('[%s] exec request refused: %s', self.ep.name, text.split()[:1])
+        return False
 
 
 class Endpoint:
@@ -199,13 +230,26 @@ class Endpoint:
             self.stopping.wait(120)
             conn.close()
             return
+        if not self.device.reachable():               # reloading, or its address is gone
+            log.info('[%s] unreachable (simulated): connection closed at once', self.name)
+            conn.close()
+            return
         transport = paramiko.Transport(conn)
+        if 'legacy_ssh_only' in getattr(self.device, 'quirks', ()):
+            # like an older IOS image: only SHA-1 key exchange, ssh-rsa host key, hmac-sha1
+            options = transport.get_security_options()
+            options.kex = ('diffie-hellman-group14-sha1',)
+            options.key_types = ('ssh-rsa',)
+            options.digests = ('hmac-sha1',)
         transport.add_server_key(self.host_key)
         auth = _Auth(self)
         try:
             transport.start_server(server=auth)
             chan = transport.accept(20)
-            if chan is None or not auth.shell.wait(10):
+            if chan is None or not auth.ready.wait(10):
+                return
+            if auth.exec_command is not None:
+                self._scp(chan, transport, auth.exec_command, self.accounts[auth.user][1])
                 return
             self._shell(chan, transport, failure, self.accounts[auth.user][1])
         except Exception as err:                      # a client that went away
@@ -218,10 +262,16 @@ class Endpoint:
 
     def _shell(self, chan, transport, failure, privilege=None):
         session = Session(self.device, privilege)
+        boot = self.device.boot_count
         chan.settimeout(0.3)
         chan.sendall(f'\r\n{session.prompt()}'.encode())
         buf, echo, last_cr, config_lines = '', True, False, 0
         while not self.stopping.is_set() and not chan.closed:
+            if self._cut_off(boot):
+                log.info('[%s] session cut (simulated reload or management address gone)',
+                         self.name)
+                transport.close()
+                return
             try:
                 data = chan.recv(4096)
             except socket.timeout:
@@ -239,6 +289,12 @@ class Endpoint:
                     reply = session.handle(buf)
                     log.info('[%s] %s', self.name, _loggable(buf, echo))
                     buf = ''
+                    if reply.drop or self._cut_off(boot):
+                        log.info('[%s] connection cut by the device (simulated)', self.name)
+                        if out:                            # what was echoed, not the reply
+                            chan.sendall(''.join(out).encode())
+                        transport.close()
+                        return
                     if failure == 'drop' and in_config:
                         config_lines += 1
                         if config_lines >= self.drop_after:
@@ -280,6 +336,103 @@ class Endpoint:
                 if failure == 'slow' and any('\r\n' in o for o in out):
                     time.sleep((self.delay_ms or 2000) / 1000)
                 chan.sendall(''.join(out).encode())
+
+    def _cut_off(self, boot):
+        return self.device.boot_count != boot or not self.device.reachable()
+
+    # ---------------------------------------------------------------- SCP sink (simulated)
+    def _scp_channel(self, chan, command, privilege):
+        try:
+            self._scp(chan, chan.get_transport(), command, privilege)
+        except Exception as err:                      # a client that went away
+            log.debug('[%s] scp ended: %s', self.name, err)
+
+    def _scp(self, chan, transport, command, privilege):
+        """The receiving side of "scp -t <path>": files go to the simulated flash through
+        restore_sim.store_transfer. Only for a privilege-15 login, as IOS requires.
+        transfer_fails cuts the whole connection half way through."""
+        dev = self.device
+        chan.settimeout(10)
+        try:
+            m = re.match(r'scp\s+(?:-[a-zA-Z]+\s+)*-t\s+(?:-[a-zA-Z]+\s+)*(\S+)\s*$', command)
+            privileged = (privilege or 0) >= 15 or (privilege is None and dev.start_privileged)
+            if not m or '-r' in command.split() or '-f' in command.split():
+                return self._scp_error(chan, 'only "scp -t <file>" is simulated')
+            if not privileged:
+                return self._scp_error(chan, 'Privilege denied (SIMULATED: SCP needs a privilege '
+                                             '15 login)')
+            try:
+                target = restore_sim.flash_path(m.group(1).strip('\'"'))
+            except restore_sim.FlashError as err:
+                return self._scp_error(chan, err.message)
+            chan.sendall(b'\0')
+            while True:
+                line = _read_line(chan)
+                if not line:
+                    break
+                if line[:1] in (b'T', b'E'):
+                    chan.sendall(b'\0')
+                    continue
+                if line[:1] != b'C':
+                    return self._scp_error(chan, 'only single files are simulated')
+                parts = line[1:].decode('utf-8', 'replace').rstrip('\n').split(' ', 2)
+                if len(parts) != 3 or not parts[1].isdigit():
+                    return self._scp_error(chan, 'bad SCP header')
+                size, name = int(parts[1]), target or parts[2]
+                chan.sendall(b'\0')
+                if 'transfer_fails' in dev.quirks:          # cut half way: a partial file
+                    data = _read_exact(chan, size // 2)
+                    with dev.lock:
+                        try:
+                            dev.flash.write(name, data, overwrite='flash_overwrites' in dev.quirks)
+                        except restore_sim.FlashError:
+                            pass
+                        dev.event('transfer_failed', f'{name}: connection lost (transfer_fails)')
+                    transport.close()                       # the whole connection drops
+                    return
+                data = _read_exact(chan, size)
+                _read_exact(chan, 1)
+                with dev.lock:
+                    error = restore_sim.store_transfer(dev, name, data)
+                if error:
+                    return self._scp_error(chan, error)
+                log.info('[%s] scp: %s (%d bytes)', self.name, name, size)
+                chan.sendall(b'\0')
+            chan.send_exit_status(0)
+        finally:
+            chan.close()
+
+    @staticmethod
+    def _scp_error(chan, message):
+        chan.sendall(b'\x01' + message.encode('utf-8', 'replace') + b'\n')
+        chan.send_exit_status(1)
+        # let the client read the refusal before the channel closes (closing at once can
+        # overtake the reply to its exec request, and it would only see "Channel closed")
+        chan.settimeout(2)
+        try:
+            chan.recv(1)
+        except Exception:
+            pass
+
+
+def _read_line(chan):
+    out = b''
+    while not out.endswith(b'\n'):
+        piece = chan.recv(1)
+        if not piece:
+            break
+        out += piece
+    return out
+
+
+def _read_exact(chan, size):
+    out = b''
+    while len(out) < size:
+        piece = chan.recv(min(65536, size - len(out)))
+        if not piece:
+            raise EOFError('the SCP client went away')
+        out += piece
+    return out
 
 
 def _loggable(line, echo):

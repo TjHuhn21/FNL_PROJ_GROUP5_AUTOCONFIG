@@ -15,7 +15,7 @@ from gui_helpers import new_root
 
 EXPECTED = [('dashboard', 'Overview'), ('scan', 'Scan'), ('devices', 'Devices'),
             ('topology', 'Topology'), ('findings', 'Findings'), ('configure', 'Configure'),
-            ('logs', 'Logs')]
+            ('setup', 'Setup'), ('logs', 'Logs')]
 
 
 def make_app(monkeypatch, demo_store):
@@ -66,7 +66,7 @@ def add(name, ip, managed=True, status='up', kind='switch'):
 
 
 # ---------------------------------------------------------------- rail navigation
-def test_opens_on_overview_with_seven_rail_items_in_order(app):
+def test_opens_on_overview_with_eight_rail_items_in_order(app):
     root, r = app
     nav = r['nav']
     assert [(k, item.label_text) for k, item in nav.items.items()] == EXPECTED
@@ -139,7 +139,11 @@ def test_without_an_icon_font_the_rail_shows_text_only(monkeypatch):
 
 
 def test_every_page_has_an_icon():
-    assert set(icons.GLYPHS) == {k for k, _ in EXPECTED}
+    # The eight pages everyone sees, plus Accounts (shown to admins only).
+    assert set(icons.GLYPHS) == {k for k, _ in EXPECTED} | {'accounts'}
+    assert all(len(g) == 1 for g in icons.GLYPHS.values())
+    assert len(set(icons.GLYPHS.values())) == len(icons.GLYPHS)      # no icon used twice
+    assert icons.glyph('accounts') == ''                        # People
 
 
 # ---------------------------------------------------------------- resizable panels

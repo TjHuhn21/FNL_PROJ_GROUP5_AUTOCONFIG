@@ -10,7 +10,7 @@
 
   "devices": [
     {
-      "name": "R1",
+      "name": "MOCK-R1",
       "type": "router",
       "host": "127.0.0.11",
       "port": 22,
@@ -54,7 +54,7 @@
       "interfaces": {
         "FastEthernet0/1": {"mode": "access", "access_vlan": 10, "connected": true},
         "FastEthernet0/2": {"connected": true},
-        "GigabitEthernet0/1": {"description": "Uplink to R1", "connected": true},
+        "GigabitEthernet0/1": {"description": "Uplink to MOCK-R1", "connected": true},
         "GigabitEthernet0/2": {"description": "Link to SW2", "mode": "trunk", "encapsulation": "dot1q", "connected": true},
         "Vlan1": {"ip": "127.0.0.12", "mask": "255.0.0.0", "shutdown": false}
       },
@@ -62,7 +62,7 @@
       "global_lines": ["service password-encryption", "ip domain-name lab.local", "username labadmin privilege 15 secret 5 $1$mock$hidden"],
       "line_config": {"con 0": ["logging synchronous"], "vty 0 4": ["login local", "transport input ssh"]},
       "cdp_neighbors": [
-        {"device": "R1", "local": "GigabitEthernet0/1", "remote": "GigabitEthernet0/1"},
+        {"device": "MOCK-R1", "local": "GigabitEthernet0/1", "remote": "GigabitEthernet0/1"},
         {"device": "SW2", "local": "GigabitEthernet0/2", "remote": "GigabitEthernet0/1"}
       ]
     },

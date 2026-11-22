@@ -17,6 +17,7 @@ when explicitly enabled; the health endpoint needs none of them.
 """
 import base64
 import binascii
+import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
@@ -151,10 +152,24 @@ class Settings:
     # Email delivery (BACKEND_MAIL_BACKEND, BACKEND_MAIL_OUTBOX_DIR).
     mail_backend: str = 'none'
     mail_outbox_dir: str = ''
+    # HTTPS (BACKEND_TLS_CERT_FILE / BACKEND_TLS_KEY_FILE: both or neither). The key file's
+    # path is kept out of repr() so it never ends up in a log line by accident.
+    tls_cert_file: str = ''
+    tls_key_file: str = field(default='', repr=False)
+    # BACKEND_LAN_MODE=true: listening on a non-loopback address is allowed (HTTPS only).
+    lan_mode: bool = False
 
     @property
     def docs_enabled(self):
         return self.environment != 'production'
+
+    @property
+    def tls_enabled(self):
+        return bool(self.tls_cert_file and self.tls_key_file)
+
+    @property
+    def scheme(self):
+        return 'https' if self.tls_enabled else 'http'
 
     def secret_values(self):
         """Every secret value that is set (for the logging redaction filter)."""
@@ -318,6 +333,24 @@ def parse_settings(raw):
         problems.append(f'{PREFIX}MAIL_BACKEND=outbox is for development only and is refused '
                         f'when {PREFIX}ENV=production.')
 
+    # ---- HTTPS and LAN mode. Messages name the settings, never the file paths.
+    tls_cert_file, tls_key_file = text('TLS_CERT_FILE'), text('TLS_KEY_FILE')
+    if bool(tls_cert_file) != bool(tls_key_file):
+        problems.append(f'{PREFIX}TLS_CERT_FILE and {PREFIX}TLS_KEY_FILE must be set together '
+                        f'(HTTPS needs both the certificate and its private key).')
+    else:
+        for name, path in (('TLS_CERT_FILE', tls_cert_file), ('TLS_KEY_FILE', tls_key_file)):
+            if path and not Path(path).is_file():
+                problems.append(f'{PREFIX}{name} does not name an existing file.')
+    tls = bool(tls_cert_file and tls_key_file)
+    lan_mode = flag('LAN_MODE')
+    if lan_mode and not tls:
+        problems.append(f'{PREFIX}LAN_MODE=true requires HTTPS: set {PREFIX}TLS_CERT_FILE and '
+                        f'{PREFIX}TLS_KEY_FILE (plain HTTP is never offered to other computers).')
+    if bind_host and not is_loopback_host(bind_host) and not lan_mode:
+        problems.append(f'{PREFIX}HOST is not a loopback address; listening for other computers '
+                        f'must be turned on explicitly with {PREFIX}LAN_MODE=true (and HTTPS).')
+
     if problems:
         raise SettingsError(problems)
     return Settings(environment=environment, host=bind_host, port=bind_port,
@@ -325,7 +358,20 @@ def parse_settings(raw):
                     fernet_key=fernet_key, otp_pepper=otp_pepper,
                     migrate_user=migrate_user, migrate_password=migrate_password,
                     auth_policy=auth_policy, mail_backend=mail_backend,
-                    mail_outbox_dir=mail_outbox_dir)
+                    mail_outbox_dir=mail_outbox_dir, tls_cert_file=tls_cert_file,
+                    tls_key_file=tls_key_file, lan_mode=lan_mode)
+
+
+def is_loopback_host(host):
+    """127.0.0.0/8, ::1 or localhost. Anything else (0.0.0.0, a LAN address, a name) is
+    reachable from other computers and needs LAN mode."""
+    value = (host or '').strip().strip('[]').lower()
+    if value == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 
 def _valid_fernet_key(value):
@@ -338,6 +384,7 @@ def _valid_fernet_key(value):
 def describe(settings):
     """A safe one-line summary for startup logs: no secret values, only whether set."""
     parts = [f'environment={settings.environment}', f'bind={settings.host}:{settings.port}',
+             f'scheme={settings.scheme}', f"lan_mode={'on' if settings.lan_mode else 'off'}",
              f'log_level={settings.log_level}',
              f"database={'enabled' if settings.database else 'disabled'}",
              f"smtp={'enabled' if settings.smtp else 'disabled'}",

@@ -36,7 +36,7 @@ class LogsTab(ttk.Frame):
             self.tree.column(key, width=width, anchor='w')
         self.tree.tag_configure('failed', background=theme.SEVERITY_COLORS['high'])
         self.tree.pack(fill='both', expand=True, pady=theme.PAD)
-        self.empty = ttk.Label(self, text='', foreground='#666'); self.empty.pack()
+        self.empty = ttk.Label(self, text='', foreground=theme.TEXT_MUTED); self.empty.pack()
 
         nav = ttk.Frame(self); nav.pack(fill='x', pady=(theme.PAD, 0))
         self.prev_btn = ttk.Button(nav, text='Previous', command=lambda: self.turn(-1))

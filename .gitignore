@@ -4,6 +4,12 @@
 .env.*
 !.env.example
 
+# HTTPS certificate and PRIVATE KEY for LAN mode (python -m backend.tls_cert). The key
+# must never leave the server laptop; certificates are copied to clients by hand.
+backend/tls/
+*.key
+*.pem
+
 # Python virtual environments
 venv/
 .venv/
@@ -49,3 +55,9 @@ GROUP-5-PROPOSAL (2).docx
 # Operating system files
 .DS_Store
 Thumbs.db
+
+# Backup encryption recovery files (backup_keys.py): keep them OFFLINE, never in Git
+*.ncrecovery
+
+# Local project review documents
+/document review/

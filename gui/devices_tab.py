@@ -32,6 +32,12 @@ class DevicesTab(ttk.Frame):
         self.delete_btn.pack(side='right', padx=4)
         self.edit_btn = ttk.Button(top, text='Edit', command=self.edit)
         self.edit_btn.pack(side='right')
+        # Backup & Restore catalogue (Phase 4B). Only for roles with the Configure
+        # permission (set_backups_allowed); disabled until the main window allows it.
+        self.backups_allowed, self.on_backup_selected = False, None
+        self.backups_btn = ttk.Button(top, text='Backups...', command=self.open_backups)
+        self.backups_btn.pack(side='right', padx=(0, 12))
+        self.backups_btn.state(['disabled'])
 
         self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS],
                                  show='headings', selectmode='browse', style='Data.Treeview')
@@ -44,7 +50,7 @@ class DevicesTab(ttk.Frame):
         self.tree.pack(fill='both', expand=True, pady=theme.PAD)
         self.tree.bind('<Double-1>', lambda e: self.edit())
 
-        self.empty = ttk.Label(self, text='', foreground='#666')
+        self.empty = ttk.Label(self, text='', foreground=theme.TEXT_MUTED)
         self.empty.pack()
 
         nav = ttk.Frame(self); nav.pack(fill='x', pady=(theme.PAD, 0))
@@ -115,6 +121,34 @@ class DevicesTab(ttk.Frame):
         self.read_only = bool(read_only)
         for button in (self.add_btn, self.edit_btn, self.delete_btn):
             button.state(['disabled'] if self.read_only else ['!disabled'])
+
+    def set_backups_allowed(self, allowed):
+        """Roles with the Configure permission may open the backup catalogue and select a
+        backup for a future restore; others (viewers) may not."""
+        self.backups_allowed = bool(allowed)
+        self.backups_btn.state(['!disabled'] if self.backups_allowed else ['disabled'])
+
+    def open_backups(self):
+        """The Backup & Restore catalogue for the selected device (read-only: it never
+        connects to the device)."""
+        if not self.backups_allowed:
+            return
+        device_id = self.selected_id()
+        if device_id is None:
+            return
+        try:
+            d = self.store.get_device(device_id)
+        except Exception as err:
+            report_error(self, err)
+            return
+        if not d:
+            return
+        import backup_catalogue
+        from gui.backup_catalogue_window import BackupCatalogueWindow
+        device = backup_catalogue.Device(ip=d['ip'], hostname=d.get('name'),
+                                         device_id=d.get('id'))
+        self.backups_window = BackupCatalogueWindow(self, device, self.backups_allowed,
+                                                    on_select=self.on_backup_selected)
 
     def add(self):
         if not self.read_only and database_ready(self):
@@ -198,7 +232,7 @@ class DeviceDialog(tk.Toplevel):
             widget.grid(row=r, column=1, pady=3, padx=theme.PAD)
         hint = 'Optional. Saved encrypted. Leave both blank to keep the current login.' \
             if device else 'Optional. Saved encrypted, used by Configure and Review.'
-        ttk.Label(self, text=hint, foreground='#666').grid(row=len(rows), column=0,
+        ttk.Label(self, text=hint, foreground=theme.TEXT_MUTED).grid(row=len(rows), column=0,
                                                            columnspan=2, sticky='w')
         btns = ttk.Frame(self); btns.grid(row=len(rows) + 1, column=0, columnspan=2,
                                           sticky='e', pady=(theme.PAD, 0))

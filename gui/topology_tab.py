@@ -89,9 +89,9 @@ class TopologyTab(ttk.Frame):
         self._set_state(None)
         self.interactive.on_change = lambda: self._set_state('unsaved')
         self.interactive.on_reset_request = self.reset_layout
-        self.area = tk.Frame(self.holder, background='#F8F9F7', highlightthickness=1,
+        self.area = tk.Frame(self.holder, background=theme.CANVAS_BG, highlightthickness=1,
                              highlightbackground=theme.BORDER)
-        self.label = tk.Label(self.area, background='#F8F9F7', foreground=theme.TEXT_SOFT,
+        self.label = tk.Label(self.area, background=theme.CANVAS_BG, foreground=theme.TEXT_SOFT,
                               font=theme.FONT, justify='center')
         self.label.place(relx=0.5, rely=0.5, anchor='center')
         self.area.bind('<Configure>', self._on_resize)

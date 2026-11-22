@@ -39,7 +39,19 @@ def test_runtime_grants_are_exactly_the_required_least_privilege_set():
         'email_challenges': ('SELECT', 'INSERT', 'UPDATE'),
         'sessions': ('SELECT', 'INSERT', 'UPDATE'),
         'audit_log': ('SELECT', 'INSERT'),
-        'schema_migrations': ('SELECT',)}
+        'schema_migrations': ('SELECT',),
+        # Phase C shared application tables: still no DELETE; append-only where marked.
+        'app_devices': ('SELECT', 'INSERT', 'UPDATE'),
+        'app_device_credentials': ('SELECT', 'INSERT', 'UPDATE'),
+        'app_links': ('SELECT', 'INSERT', 'UPDATE'),
+        'app_findings': ('SELECT', 'INSERT', 'UPDATE'),
+        'app_status_events': ('SELECT', 'INSERT'),
+        'app_config_logs': ('SELECT', 'INSERT'),
+        'app_jobs': ('SELECT', 'INSERT', 'UPDATE'),
+        'app_job_devices': ('SELECT', 'INSERT', 'UPDATE'),
+        'app_job_events': ('SELECT', 'INSERT'),
+        'app_device_locks': ('SELECT', 'INSERT', 'UPDATE'),
+        'app_device_backups': ('SELECT', 'INSERT')}
     granted = {p for _, privs in RUNTIME_GRANTS for p in privs}
     assert granted == {'SELECT', 'INSERT', 'UPDATE'}             # no DELETE / DDL at all
     assert check_runtime_grants(RUNTIME_LINES, DB) == []

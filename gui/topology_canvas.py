@@ -436,7 +436,7 @@ class TopologyCanvas(tk.Frame):
                                       fill=graph.TEXT_SOFT, tags=('label', f'label-{i}'))
                     x0, y0, x1, y1 = c.bbox(t)
                     r = c.create_rectangle(x0 - 2, y0 - 1, x1 + 2, y1 + 1, fill='white',
-                                           outline='#CDD2D6', tags=('label-bg',))
+                                           outline=theme.BORDER, tags=('label-bg',))
                     c.tag_lower(r, t)
 
         if self.sample:

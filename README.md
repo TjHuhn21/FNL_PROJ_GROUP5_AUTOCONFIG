@@ -64,7 +64,12 @@ Scan -> review found devices -> Approve -> Devices (database)
 ```
 python main.py            # sign in, then uses MySQL; if it is not reachable, starts in SAMPLE mode
 python main.py --demo     # DEMO MODE: sample data, no sign-in (no database, no lab)
+python main.py --demo --mock-console   # Initial Setup page with SIMULATED console ports
 ```
+
+The **Initial Setup** page (rail item *Setup*, operators and admins) connects to a device's
+console cable and reads what it is and whether it can use SSH. It only reads; see
+`docs/INITIAL_SETUP.md`.
 
 **Signing in.** Without `--demo`, NetCommand first opens a sign-in window that talks to the
 NetCommand backend (`python -m backend`, see `backend/README.md`) at `NETCOMMAND_API_URL`
@@ -167,6 +172,7 @@ only the login the admin types and never tries guessed passwords.
 | SSH engine (`config/connect.py`, `ssh_options.py`), Configure | Built: preview, backup, one command at a time, checks, `write mem` only when the checks pass; strict SSH algorithms with per-device legacy SHA-1 support; SSH login dialog with optional encrypted saving; hostname changes rename the device record; applied form sections are cleared |
 | Database (`schema.sql`, `db.py`), sample store (`db_fake.py`), `security.py`, `validation.py`, monitor | Built; `db.py` also tested against a real MySQL server |
 | Review rules, Findings, Topology, Devices, Logs, Overview dashboard | Built |
+| Console access and Initial Setup (`console/`, `gui/setup_tab.py`) | Built, read-only: COM port list, console connection, device and SSH capability detection. SSH configuration **preview** (`console/plan.py`, never executed; see `docs/SSH_CONFIGURATION_PREVIEW.md`). Tested offline only (fake serial ports, mock lab); not yet used on real hardware. Sending the SSH setup to a device is not built |
 | Sign-in and accounts (`backend/`, `desktop_auth/`) | Built: FastAPI backend, registration with email verification, administrator approval, two-step sign-in with emailed codes, roles (viewer / operator / admin), *Accounts* page |
 | Automated tests | About 1,670 offline tests (no MySQL, network or devices needed), including a simulated Cisco mock lab (`mock-lab/`) |
 

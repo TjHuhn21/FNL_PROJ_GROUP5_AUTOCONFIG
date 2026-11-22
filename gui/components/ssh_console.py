@@ -23,19 +23,8 @@ from tkinter import ttk
 
 from gui import theme
 
-BG = '#1B2024'                  # terminal background
-COLORS = {                      # all at least 4.5:1 against BG
-    'command': '#FFFFFF',
-    'output': '#B9C2C9',
-    'info': '#98A3AC',
-    'section': '#4FD1C5',
-    'ok': '#62D394',
-    'warn': '#F2B84B',
-    'error': '#FF8A7F',
-    'start': '#7FB3FF',
-    'device': '#7FB3FF',        # one device of a multi-device run starts
-    'summary': '#E6EAED',
-}
+BG = theme.TERMINAL_BG          # dark green-black terminal background
+COLORS = dict(theme.TERMINAL_COLORS)   # all at least 7:1 against BG (see gui/theme.py)
 DRAIN_MS = 60
 
 

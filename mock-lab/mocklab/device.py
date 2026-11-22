@@ -5,9 +5,12 @@ parsers and checks; they are not copied from Cisco software.
 One Device is shared by every SSH session to it (guarded by a lock); it is
 built fresh from lab_config.json each time the lab starts.
 """
+import copy
 import ipaddress
 import re
 import threading
+
+from . import restore_sim
 
 INTERFACE_TYPES = ['FastEthernet', 'GigabitEthernet', 'TenGigabitEthernet', 'Vlan', 'Loopback',
                    'Port-channel']
@@ -15,6 +18,92 @@ SHORT = {'FastEthernet': 'Fa', 'GigabitEthernet': 'Gi', 'TenGigabitEthernet': 'T
          'Vlan': 'Vl', 'Loopback': 'Lo', 'Port-channel': 'Po'}
 RESERVED_VLANS = {1002: 'fddi-default', 1003: 'token-ring-default', 1004: 'fddinet-default',
                   1005: 'trnet-default'}
+
+# Simulated SSH conditions (lab_config.json "ssh_condition"; for console detection tests).
+# They only change what the show commands REPORT. The lab's own SSH server still accepts
+# connections whatever the condition.
+#   enabled      SSH on, RSA keys present (the default)
+#   disabled     crypto image, but no RSA keys yet: "SSH Disabled"
+#   unsupported  classic IOS image without crypto (no K9): the ssh/crypto commands do not exist
+#   unknown      unrecognised software, and the ssh/crypto commands are blocked by authorization
+SSH_CONDITIONS = ('enabled', 'disabled', 'unsupported', 'unknown')
+# Edge-case behaviours a device can be given ("quirks" in lab_config / scenario specs).
+# All are SIMULATIONS of situations NetCommand must handle safely; the wording of the
+# simulated messages marked (SIMULATED) is not copied from real Cisco output, and none of
+# them proves how real hardware behaves.
+QUIRKS = {
+    'rsa_slow': 'key generation reports a long simulated delay (Reply.delay_s, no real sleep)',
+    'rsa_fails': 'key generation prints a failure and creates no key',
+    'rsa_ask_modulus': '"crypto key generate rsa" without a size asks "How many bits in the '
+                       'modulus [512]:"',
+    'rsa_partial': 'key generation output stops before "[OK]"; the key list is unreadable '
+                   'afterwards',
+    'prompt_lag': 'after "hostname X" the next prompt still shows the old name once',
+    'prompt_garbled': 'after "hostname X" the next prompt is cut off (no # or >) once',
+    'domain_rejected': '"ip domain-name" is rejected',
+    'ssh_v2_ignored': '"ip ssh version 2" is accepted, but show ip ssh keeps reporting 1.99',
+    'ssh_v2_rejected': '"ip ssh version 2" is rejected',
+    'syslog': 'system log lines are interleaved into command output',
+    'legacy_ssh_only': 'the SSH server offers only SHA-1 key exchange / ssh-rsa / hmac-sha1',
+    # restore simulation (restore_sim.py)
+    'replace_unsupported': '"configure replace", "configure confirm" and "configure revert" '
+                           'do not exist',
+    'no_tcl': '"tclsh" does not exist',
+    'no_scp': 'the SCP server refuses transfers even with "ip scp server enable"',
+    'flash_overwrites': 'a transfer to an existing file name overwrites it silently (as IOS '
+                        'does); by default the mock refuses',
+    'transfer_fails': 'the connection is cut half way through a file transfer; a partial '
+                      'file is left on flash',
+    'transfer_corrupt': 'a transferred file is stored with one byte changed (MD5 mismatch)',
+    'replace_partial': 'configure replace rejects the last command of the file and reports '
+                       '"Rollback aborted"; the rest is applied',
+    'revert_fails': 'the rollback (configure revert, or the timer) fails and leaves the '
+                    'running configuration as it is',
+    'drop_during_replace': 'configure replace is applied, then the connection is cut before '
+                           'its output arrives',
+    'reconnect_refused': 'after configure replace every new login is refused until a rollback',
+    'verify_mismatch': 'after configure replace the device adds a line, so the running '
+                       'configuration no longer matches the file',
+    'delete_fails': '"delete" of a flash file fails (cleanup failure)',
+    'reboot_during_restore': 'the device reloads during configure replace: running = startup, '
+                             'the pending rollback is lost, sessions are cut',
+}
+# Device attributes that make up the running configuration (configure replace, rollback
+# and reload swap these; ports, cables, keys, quirks and flash are physical and stay).
+CONFIG_ATTRS = ('hostname', 'enable_secret', 'vlans', 'interfaces', 'routes', 'default_gateway',
+                'dhcp_excluded', 'pools', 'name_servers', 'ntp_servers', 'global_lines', 'lines',
+                'archive')
+SYSLOG_LINES = ('*Nov 21 10:15:42.123: %LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed '
+                'state to up',
+                '*Nov 21 10:15:43.456: %LINEPROTO-5-UPDOWN: Line protocol on Interface '
+                'GigabitEthernet0/1, changed state to up')
+AUTHORIZATION_FAILED = '% Command authorization failed.'
+# show version lines per (type, condition), used only when "ssh_condition" is set in the
+# spec. Every output still starts with the "NetCommand Mock Lab - simulated" line.
+_PROFILES = {
+    'router': {
+        'crypto': ('Simulated IOS Software, C1900 Software (C1900-UNIVERSALK9-M), '
+                   'Version 15.4(3)M2, RELEASE SOFTWARE (fc2)',
+                   'flash0:c1900-universalk9-mz.SPA.154-3.M2.bin',
+                   'Simulated CISCO1941/K9 (revision 1.0) with 491520K/32768K bytes of memory.'),
+        'plain': ('Simulated IOS Software, C1900 Software (C1900-IPBASE-M), Version 15.1(4)M4, '
+                  'RELEASE SOFTWARE (fc1)',
+                  'flash0:c1900-ipbase-mz.SPA.151-4.M4.bin',
+                  'Simulated CISCO1941/K9 (revision 1.0) with 491520K/32768K bytes of memory.'),
+    },
+    'switch': {
+        'crypto': ('Simulated IOS Software, C2960 Software (C2960-LANBASEK9-M), '
+                   'Version 15.0(2)SE11, RELEASE SOFTWARE (fc3)',
+                   'flash:c2960-lanbasek9-mz.150-2.SE11.bin',
+                   'Simulated WS-C2960-24TT-L (PowerPC405) processor (revision B0) with '
+                   '65536K bytes of memory.\nModel number                    : WS-C2960-24TT-L'),
+        'plain': ('Simulated IOS Software, C2960 Software (C2960-LANBASE-M), '
+                  'Version 12.2(55)SE12, RELEASE SOFTWARE (fc2)',
+                  'flash:c2960-lanbase-mz.122-55.SE12.bin',
+                  'Simulated WS-C2960-24TT-L (PowerPC405) processor (revision B0) with '
+                  '65536K bytes of memory.\nModel number                    : WS-C2960-24TT-L'),
+    },
+}
 
 
 def short_name(name):
@@ -67,8 +156,9 @@ class Interface:
 class Device:
     """spec: one entry of lab_config.json's "devices" (already checked by lab.py)."""
 
-    def __init__(self, spec, lab_hosts=None):
+    def __init__(self, spec, lab_hosts=None, clock=None):
         self.lock = threading.RLock()
+        self.clock = clock or restore_sim.SimClock()     # simulated time (never real sleeps)
         self.spec = spec
         self.name = spec['name']
         self.kind = spec['type']                         # 'router' or 'switch'
@@ -119,9 +209,79 @@ class Device:
                                               {'con 0': [], 'vty 0 4': ['login local',
                                                                         'transport input ssh']}).items()}
         self.cdp = [dict(n) for n in spec.get('cdp_neighbors') or []]
+        # simulated SSH condition: None keeps the original show version text
+        self.ssh_profile = spec.get('ssh_condition')
+        self.ssh_condition = self.ssh_profile or 'enabled'
+        self.rsa_keys = self.ssh_condition == 'enabled'      # the key SSH uses (hostname.domain)
+        # other key pairs that exist besides SSH's, e.g. "TP-self-signed-1234" (HTTPS)
+        self.extra_rsa_keys = list(spec.get('extra_rsa_keys') or [])
+        # VTY lines the device has (show line), when more than the configured ranges
+        self.vty_count = spec.get('vty_count')
+        self.quirks = set(spec.get('quirks') or [])
+        unknown = self.quirks - set(QUIRKS)
+        if unknown:
+            raise ValueError(f'unknown quirk(s): {", ".join(sorted(unknown))}')
+        # the label of SSH's key: fixed when the key is made (a later rename keeps it)
+        self.rsa_label = f'{self.hostname}.{self.domain_name() or "lab.local"}'
+        self.rsa_bits = 2048
+        self.rsa_listing_broken = False      # rsa_partial: the key list cannot be read
         self.lab_hosts = lab_hosts or {}                 # neighbour name -> (host, type)
+        # restore simulation (restore_sim.py). None of it is in the default lab config, so
+        # the default devices' running configurations are unchanged.
+        archive = spec.get('archive')
+        self.archive = None if archive is None else {
+            'path': archive.get('path'), 'maximum': archive.get('maximum'),
+            'write_memory': bool(archive.get('write_memory')),
+            'time_period': archive.get('time_period')}
+        self.management_ip = spec.get('management_ip')  # SIMULATED address NetCommand uses
+        self.flash = restore_sim.Flash.for_device(self, spec)
+        self.archive_copies = []                         # flash names, oldest first
+        self.archive_next = 1
+        self.rollback = None                             # a pending restore_sim.Rollback
+        self.logins_refused = False                      # reconnect_refused
+        self.boot_count = 0
+        self.booting_until = None
+        self.events = []                                 # (simulated time, kind, detail)
         self.startup = self.running_config()             # as if saved before the lab started
         self.saves = 0
+
+    # ---------------------------------------------------------------- restore simulation
+    def config_state(self):
+        return copy.deepcopy({attr: getattr(self, attr) for attr in CONFIG_ATTRS})
+
+    def set_config_state(self, state):
+        for attr in CONFIG_ATTRS:
+            setattr(self, attr, copy.deepcopy(state[attr]))
+
+    def event(self, kind, detail=''):
+        self.events.append((self.clock.now(), kind, detail))
+
+    def tick(self):
+        with self.lock:
+            restore_sim.tick(self)
+
+    def booting(self):
+        return self.booting_until is not None and self.clock.now() < self.booting_until
+
+    def reachable(self):
+        """Can NetCommand reach the device? Not while it reloads, and (when management_ip
+        is set) not once no up interface has that address any more."""
+        with self.lock:
+            restore_sim.tick(self)
+            if self.booting():
+                return False
+            if self.management_ip is None:
+                return True
+            return any(i.ip == self.management_ip and i.is_up()
+                       for i in self.interfaces.values())
+
+    def scp_enabled(self):
+        return (self.ssh_commands_exist() and 'no_scp' not in self.quirks
+                and 'ip scp server enable' in self.global_lines)
+
+    def reload(self, reason='reload'):
+        with self.lock:
+            restore_sim.reload(self, reason)
 
     # ---------------------------------------------------------------- interfaces
     def _create(self, name):
@@ -146,6 +306,17 @@ class Device:
         L += ['!', f'hostname {self.hostname}', '!', 'boot-start-marker', 'boot-end-marker', '!']
         L += [g for g in self.global_lines if not g.endswith('service password-encryption')]
         if self.global_lines:
+            L.append('!')
+        if self.archive is not None:
+            L.append('archive')
+            if self.archive.get('path'):
+                L.append(f" path {self.archive['path']}")
+            if self.archive.get('maximum'):
+                L.append(f" maximum {self.archive['maximum']}")
+            if self.archive.get('write_memory'):
+                L.append(' write-memory')
+            if self.archive.get('time_period'):
+                L.append(f" time-period {self.archive['time_period']}")
             L.append('!')
         if self.kind == 'router':
             for start, end in self.dhcp_excluded:
@@ -240,12 +411,100 @@ class Device:
 
     # ---------------------------------------------------------------- show commands
     def show_version(self):
+        if self.ssh_profile in ('enabled', 'disabled', 'unsupported'):
+            software, image, hardware = _PROFILES[self.kind][
+                'plain' if self.ssh_profile == 'unsupported' else 'crypto']
+            return (f'NetCommand Mock Lab - simulated {self.kind} (not Cisco software)\n'
+                    f'{software}\n\n'
+                    f'{self.hostname} uptime is 1 hour, 2 minutes\n'
+                    f'System image file is "{image}"\n\n'
+                    f'{hardware}\n'
+                    f'Configuration register is 0x2102')
         return (f'NetCommand Mock Lab - simulated {self.kind} (not Cisco software)\n'
                 f'Mock software, Version 15.2(mock), RELEASE SOFTWARE\n\n'
                 f'{self.hostname} uptime is 1 hour, 2 minutes\n'
                 f'System image file is "mock:netcommand-lab.bin"\n\n'
                 f'{self.model} with 262144K bytes of memory.\n'
                 f'Configuration register is 0x2102')
+
+    # ---------------------------------------------------------------- SSH-related shows
+    def domain_name(self):
+        for line in self.global_lines:
+            m = re.match(r'ip domain[ -]name (\S+)$', line)
+            if m:
+                return m.group(1)
+        return None
+
+    def ssh_commands_exist(self):
+        """False on the simulated image without crypto: the commands are not in its CLI."""
+        return self.ssh_condition != 'unsupported'
+
+    def show_ip_ssh(self):
+        if self.ssh_condition == 'unknown':
+            return AUTHORIZATION_FAILED
+        version = '2.0' if ('ip ssh version 2' in self.global_lines
+                            and 'ssh_v2_ignored' not in self.quirks) else '1.99'
+        timeout, retries = 120, 3
+        for line in self.global_lines:
+            m = re.fullmatch(r'ip ssh time-out (\d+)', line)
+            timeout = int(m.group(1)) if m else timeout
+            m = re.fullmatch(r'ip ssh authentication-retries (\d+)', line)
+            retries = int(m.group(1)) if m else retries
+        if self.rsa_keys:
+            return (f'SSH Enabled - version {version}\n'
+                    'Authentication methods:publickey,keyboard-interactive,password\n'
+                    f'Authentication timeout: {timeout} secs; Authentication retries: {retries}\n'
+                    'Minimum expected Diffie Hellman key size : 2048 bits\n'
+                    'IOS Keys in SECSH format(ssh-rsa, base64 encoded): '
+                    f'{self.rsa_label}\n'
+                    'AAAAB3NzaC1yc2EAAAADAQABAAABAQ-SIMULATED-KEY')
+        return ('SSH Disabled - version 1.99\n'
+                '%Please create RSA keys to enable SSH (and of atleast 768 bits for SSH v2).\n'
+                'Authentication methods:publickey,keyboard-interactive,password\n'
+                'Authentication timeout: 120 secs; Authentication retries: 3\n'
+                'Minimum expected Diffie Hellman key size : 1024 bits\n'
+                'IOS Keys in SECSH format(ssh-rsa, base64 encoded): NONE')
+
+    def show_crypto_key(self):
+        if self.ssh_condition == 'unknown':
+            return AUTHORIZATION_FAILED
+        names = ([self.rsa_label] if self.rsa_keys else []) + self.extra_rsa_keys
+        if self.rsa_listing_broken:               # rsa_partial: generation never finished
+            return ('% Key pair was generated at: 10:15:00 UTC Nov 18 2026\n'
+                    ' Key Data:\n  30820122 300D0609 (SIMULATED: listing incomplete)')
+        return '\n'.join(
+            f'% Key pair was generated at: 10:15:00 UTC Nov 18 2026\n'
+            f'Key name: {name}\n'
+            f'Key type: RSA KEYS\n'
+            f' Storage Device: not specified\n'
+            f' Usage: General Purpose Key\n'
+            f' Key is not exportable.\n'
+            f' Key Data:\n'
+            f'  30820122 300D0609 2A864886 F70D0101 01050003 82010F00 3082010A 02820101\n'
+            f'  00SIMULA TEDKEY00 00000000 00000000 00000000 00000000 00000000 00000000'
+            for name in names)
+
+    def vty_numbers(self):
+        numbers = set(range(max(5, int(self.vty_count or 0))))
+        for name in self.lines:
+            m = re.fullmatch(r'vty (\d+)(?: (\d+))?', name)
+            if m:
+                numbers.update(range(int(m.group(1)), int(m.group(2) or m.group(1)) + 1))
+        return sorted(numbers)
+
+    def show_line(self):
+        out = ['   Tty Line Typ     Tx/Rx    A Modem  Roty AccO AccI  Uses  Noise Overruns  Int',
+               '*     0    0 CTY              -    -      -    -    -     0      0    0/0      -']
+        first = 1
+        if self.kind == 'router':
+            out.append('      1    1 AUX   9600/9600  -    -      -    -    -     0      0    0/0'
+                       '      -')
+            first = 2
+        for n, _ in enumerate(self.vty_numbers()):
+            tty = first + n
+            out.append(f'{tty:>7}{tty:>5} VTY              -    -      -    -    -     0      0'
+                       f'    0/0      -')
+        return '\n'.join(out)
 
     def show_ip_interface_brief(self):
         out = [f"{'Interface':<23}{'IP-Address':<16}OK? Method {'Status':<22}Protocol"]

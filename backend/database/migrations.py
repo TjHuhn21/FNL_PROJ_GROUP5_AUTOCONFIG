@@ -9,8 +9,11 @@ Rules enforced here (each refusal raises MigrationError before anything is chang
     an applied migration must have the expected columns;
   * a migration's tables must not exist before it runs unless it is recorded as applied
     (an unrecorded table is a partial or foreign state: refused, never recreated);
-  * no migration may name one of the five application tables, nor create triggers,
-    routines or events (those need administrator privilege: see audit_triggers.py);
+  * no migration may name one of the five DESKTOP application tables (devices, links,
+    findings, status_events, config_logs: the desktop database's own tables), nor create
+    triggers, routines or events (those need administrator privilege: see
+    audit_triggers.py). The shared application data of Phase C uses NEW tables with the
+    app_ prefix (app_devices, ...), so this guard is unchanged;
   * MySQL commits every CREATE/DROP immediately, so a migration is NOT one transaction.
     A failed statement is reported with what is known about it: if the connection was
     lost, MySQL may or may not have completed it (`status` shows the real state);
@@ -31,12 +34,17 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from backend.database import audit_triggers, m0001_auth_tables
+from backend.database import (audit_triggers, m0001_auth_tables, m0002_app_tables,
+                              m0003_jobs_locks, m0004_device_backups)
 from backend.database.connection import is_connection_lost, is_driver_error, translate
 from backend.database.errors import MigrationError
 from backend.database.privileges import can_see_triggers
 
+# The desktop database's own tables (schema.sql). Never named by any migration.
 APP_TABLES = ('devices', 'links', 'findings', 'status_events', 'config_logs')
+DESKTOP_TABLES = APP_TABLES
+# Every shared application table created by the backend starts with this prefix.
+SHARED_PREFIX = 'app_'
 MAIN_DATABASE = 'netcommand'
 TEST_SUFFIX = '_test'
 TRACKING_TABLE = 'schema_migrations'
@@ -95,7 +103,8 @@ def _from_module(module):
                      tuple(module.TABLES))
 
 
-MIGRATIONS = (_from_module(m0001_auth_tables),)
+MIGRATIONS = tuple(_from_module(m) for m in (m0001_auth_tables, m0002_app_tables,
+                                             m0003_jobs_locks, m0004_device_backups))
 ALL_TABLES = frozenset(t for m in MIGRATIONS for t in m.tables)
 
 

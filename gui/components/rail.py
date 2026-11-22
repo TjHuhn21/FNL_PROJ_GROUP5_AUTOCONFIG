@@ -58,7 +58,7 @@ class RailItem(ctk.CTkFrame):
 
     def _paint(self):
         bg = theme.RAIL_ACTIVE if self._active else theme.RAIL_HOVER if self._hover else theme.RAIL_BG
-        fg = '#FFFFFF' if (self._active or self._hover) else theme.RAIL_TEXT
+        fg = theme.WHITE if (self._active or self._hover) else theme.RAIL_TEXT
         self.configure(fg_color=bg)
         self.marker.configure(fg_color=theme.RAIL_ACCENT if self._active else bg)
         self.text.configure(text_color=fg, fg_color=bg)

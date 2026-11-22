@@ -57,7 +57,7 @@ class ScanTab(ttk.Frame):
         ttk.Label(self, text='Type the device login and its management IP (Seed IP), then '
                   'scan. Only that device is logged in to; its neighbours are listed from '
                   'CDP/LLDP. The login is used for this scan only unless you tick the box below.',
-                  foreground='#555', wraplength=760, justify='left').pack(
+                  foreground=theme.TEXT_SOFT, wraplength=760, justify='left').pack(
                       anchor='w', pady=(0, theme.PAD))
 
         form = ttk.Frame(self); form.pack(fill='x')

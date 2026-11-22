@@ -13,17 +13,23 @@ Modes and prompts (as on Cisco IOS):
 Commands are matched by unique prefix (sh run, conf t, int range...). Anything
 not simulated is answered like IOS answers an unknown command, so it can never
 be mistaken for success.
+
+The restore simulation (dir, delete, verify /md5, tclsh, archive, configure
+replace|confirm|revert, show archive) lives in restore_sim.py.
 """
 import ipaddress
 import re
 
+from . import restore_sim
 from .device import compress, default_vlan_name
 
 INVALID = "% Invalid input detected at '^' marker."
 INCOMPLETE = '% Incomplete command.'
 SUFFIX = {'user': '>', 'exec': '#', 'config': '(config)#', 'config-if': '(config-if)#',
           'config-if-range': '(config-if-range)#', 'config-vlan': '(config-vlan)#',
-          'dhcp-config': '(dhcp-config)#', 'config-line': '(config-line)#'}
+          'dhcp-config': '(dhcp-config)#', 'config-line': '(config-line)#',
+          'config-archive': '(config-archive)#', 'tcl': '(tcl)#'}
+TCL_CONTINUE = '+>'
 _HOSTNAME = re.compile(r'^[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$')
 
 
@@ -35,11 +41,14 @@ class CLIError(Exception):
 
 
 class Reply:
-    def __init__(self, output='', close=False, echo_next=True, raw=False):
+    def __init__(self, output='', close=False, echo_next=True, raw=False, delay_s=0.0,
+                 drop=False):
         self.output = output            # text after the command (no prompt)
         self.close = close              # end the session
+        self.drop = drop                # cut the connection now; the output never arrives
         self.echo_next = echo_next      # False while a password is being typed
         self.raw = raw                  # True: no newline / prompt after the output
+        self.delay_s = delay_s          # SIMULATED seconds the device would take (never slept)
 
 
 class Words:
@@ -126,26 +135,54 @@ class Session:
         self.pool = None                # dhcp-config
         self.line_name = None           # config-line
         self.pending = None             # a question waiting for an answer (enable password...)
+        self._next_prompt = None        # prompt_lag / prompt_garbled: shown once instead
+        self.simulated_seconds = 0.0    # total SIMULATED device time (rsa_slow), never slept
+        self._syslog_count = 0
+        self.tcl_block = None           # tclsh: a `puts [open ...] {` block being typed
+
+    def _prompt_text(self):
+        return self.dev.hostname + SUFFIX[self.mode]
 
     def prompt(self):
-        return self.dev.hostname + SUFFIX[self.mode]
+        if self.tcl_block is not None:               # inside an open { ... } in tclsh
+            return TCL_CONTINUE
+        if self._next_prompt is not None:            # a one-time stale or cut-off prompt
+            shown, self._next_prompt = self._next_prompt, None
+            return shown
+        return self._prompt_text()
 
     # ---------------------------------------------------------------- entry point
     def handle(self, line):
         """One line typed by the user (without the newline)."""
         with self.dev.lock:
-            if self.pending:
-                handler, self.pending = self.pending, None
-                return handler(line)
-            if not line.strip():
-                return Reply()
-            prompt_len = len(self.prompt())
-            try:
-                return self._dispatch(line)
-            except CLIError as err:
-                if err.pos is None:
-                    return Reply(err.message)
-                return Reply(' ' * (prompt_len + err.pos) + '^\n' + err.message)
+            restore_sim.tick(self.dev)              # an expired rollback timer fires first
+            return self._with_syslog(self._handle(line))
+
+    def _handle(self, line):
+        if self.pending:
+            handler, self.pending = self.pending, None
+            return handler(line)
+        if not line.strip():
+            return Reply()
+        prompt_len = len(self._prompt_text())
+        try:
+            return self._dispatch(line)
+        except CLIError as err:
+            if err.pos is None:
+                return Reply(err.message)
+            return Reply(' ' * (prompt_len + err.pos) + '^\n' + err.message)
+
+    def _with_syslog(self, reply):
+        """syslog quirk: a system log line appears inside the output (after its first
+        line), as asynchronous console messages do. Deterministic: the lines alternate."""
+        if 'syslog' not in self.dev.quirks or not reply.output or reply.raw:
+            return reply
+        from .device import SYSLOG_LINES
+        lines = reply.output.split('\n')
+        lines.insert(min(1, len(lines)), SYSLOG_LINES[self._syslog_count % len(SYSLOG_LINES)])
+        self._syslog_count += 1
+        reply.output = '\n'.join(lines)
+        return reply
 
     def control_z(self):
         if self.mode not in ('user', 'exec'):
@@ -153,6 +190,8 @@ class Session:
         return Reply()
 
     def _dispatch(self, line):
+        if self.mode == 'tcl':
+            return restore_sim.tcl_line(self, line)
         w = Words(line)
         if self.mode in ('user', 'exec'):
             return self.exec_command(w)
@@ -163,7 +202,8 @@ class Session:
             return self.global_command(w)
         sub = {'config-if': self.interface_command, 'config-if-range': self.interface_command,
                'config-vlan': self.vlan_command, 'dhcp-config': self.dhcp_command,
-               'config-line': self.line_command}[self.mode]
+               'config-line': self.line_command,
+               'config-archive': self.archive_command}[self.mode]
         try:
             return sub(w)
         except CLIError as sub_err:
@@ -187,7 +227,9 @@ class Session:
         privileged = self.mode != 'user'
         words = ['enable', 'disable', 'exit', 'logout', 'quit', 'show', 'terminal']
         if privileged:
-            words += ['configure', 'write', 'copy']
+            words += ['configure', 'write', 'copy', 'dir', 'delete', 'verify', 'archive']
+            if 'no_tcl' not in self.dev.quirks:
+                words.append('tclsh')
         try:
             cmd = w.kw(0, words)
         except CLIError as err:
@@ -218,9 +260,23 @@ class Session:
             if sub in ('length', 'width'):
                 w.number(2, 0, 512)
             return Reply()
+        handlers = {'dir': restore_sim.dir_command, 'delete': restore_sim.delete_command,
+                    'verify': restore_sim.verify_command, 'tclsh': restore_sim.tclsh_command,
+                    'archive': restore_sim.archive_exec}
+        if cmd in handlers:
+            return handlers[cmd](self, w)
         if cmd == 'configure':
             if w.has(1):
-                w.kw(1, ['terminal'])
+                options = ['terminal']
+                if 'replace_unsupported' not in self.dev.quirks:
+                    options += ['replace', 'confirm', 'revert']
+                sub = w.kw(1, options)
+                if sub == 'replace':
+                    return restore_sim.configure_replace(self, w)
+                if sub == 'confirm':
+                    return restore_sim.configure_confirm(self, w)
+                if sub == 'revert':
+                    return restore_sim.configure_revert(self, w)
                 w.end(2)
             self.mode = 'config'
             return Reply('Enter configuration commands, one per line.  End with CNTL/Z.')
@@ -260,7 +316,9 @@ class Session:
         options = ['version', 'privilege', 'clock']
         if privileged:
             options += ['running-config', 'startup-config', 'ip', 'interfaces', 'cdp', 'lldp',
-                        'history']
+                        'history', 'line', 'archive']
+            if self.dev.ssh_commands_exist():
+                options += ['crypto']
             if self.dev.kind == 'switch':
                 options += ['vlan']
         what = w.kw(1, options)
@@ -273,6 +331,17 @@ class Session:
             out = '*10:15:00.000 UTC Wed Nov 18 2026'
         elif what == 'history':
             out = ''
+        elif what == 'archive':
+            out = restore_sim.show_archive(self, w)
+        elif what == 'line':
+            w.end(2)
+            out = d.show_line()
+        elif what == 'crypto':
+            w.kw(2, ['key'])
+            w.kw(3, ['mypubkey'])
+            w.kw(4, ['rsa'])
+            w.end(5)
+            out = d.show_crypto_key()
         elif what == 'running-config':
             if w.has(2):
                 w.kw(2, ['interface'])
@@ -289,8 +358,12 @@ class Session:
                 w.kw(2, ['brief'])
             out = d.show_vlan_brief()
         elif what == 'ip':
-            sub = w.kw(2, ['interface', 'route', 'dhcp'])
-            if sub == 'interface':
+            subs = ['interface', 'route', 'dhcp'] + (['ssh'] if d.ssh_commands_exist() else [])
+            sub = w.kw(2, subs)
+            if sub == 'ssh':
+                w.end(3)
+                out = d.show_ip_ssh()
+            elif sub == 'interface':
                 w.kw(3, ['brief'])
                 out = d.show_ip_interface_brief()
             elif sub == 'route':
@@ -353,7 +426,9 @@ class Session:
     def global_command(self, w):
         d = self.dev
         words = ['hostname', 'interface', 'ip', 'no', 'ntp', 'service', 'enable', 'username',
-                 'line', 'end', 'exit', 'cdp', 'crypto', 'spanning-tree', 'default']
+                 'line', 'end', 'exit', 'cdp', 'spanning-tree', 'default', 'archive']
+        if d.ssh_commands_exist():
+            words.append('crypto')
         if d.kind == 'switch':
             words += ['vlan', 'vtp']
         cmd = w.kw(0, words)
@@ -365,12 +440,23 @@ class Session:
             return Reply()
         if cmd == 'no':
             return self.no_global(w)
+        if cmd == 'archive':
+            w.end(1)
+            if d.archive is None:
+                d.archive = {'path': None, 'maximum': None, 'write_memory': False,
+                             'time_period': None}
+            self.mode = 'config-archive'
+            return Reply()
         if cmd == 'hostname':
             name = w.word(1)
             w.end(2)
             if not _HOSTNAME.match(name):
                 return Reply('% Hostname contains one or more illegal characters.')
-            d.hostname = name
+            old, d.hostname = d.hostname, name
+            if 'prompt_lag' in d.quirks:                 # the old name is shown once more
+                self._next_prompt = old + SUFFIX[self.mode]
+            elif 'prompt_garbled' in d.quirks:           # a cut-off prompt, once
+                self._next_prompt = name[:3]
             return Reply()
         if cmd == 'vlan':
             ids = vlan_numbers(w.word(1), w.pos(1))
@@ -416,10 +502,14 @@ class Session:
             w.kw(1, ['key'])
             w.kw(2, ['generate'])
             w.kw(3, ['rsa'])
-            return Reply(f'The name for the keys will be: {d.hostname}.lab.local\n'
-                         f'% The key modulus size is 2048 bits\n'
-                         f'% Generating 2048 bit RSA keys, keys will be non-exportable...\n'
-                         f'[OK] (elapsed time was 1 seconds)')
+            words = [x.lower() for x, _ in w.items[4:]]
+            bits = None
+            if 'modulus' in words:
+                i = words.index('modulus')
+                if i + 1 >= len(words) or not words[i + 1].isdigit():
+                    raise CLIError(INCOMPLETE)
+                bits = int(words[i + 1])
+            return self._keygen(bits)
         if cmd in ('cdp', 'spanning-tree', 'vtp', 'default'):
             return Reply()                                # accepted, not modelled
         # service / enable / username: stored as configuration lines
@@ -432,6 +522,11 @@ class Session:
             secret = w.rest(2)
             if not secret:
                 raise CLIError(INCOMPLETE)
+            hashed = _prehashed(secret.split())
+            if hashed:                                    # 'enable secret 5 <hash>' (a replay)
+                d.enable_secret = _secret_for_hash(d, hashed[1])
+                self._set_global(f'enable {kind} {hashed[0]} {hashed[1]}', f'enable {kind}')
+                return Reply()
             secret = secret.split()[-1]
             d.enable_secret = secret
             self._set_global(f'enable {kind} 5 $1$mock${_scramble(secret)}', f'enable {kind}')
@@ -442,10 +537,72 @@ class Session:
             kind = 'secret' if 'secret' in line.split() else 'password'
             secret = line.split()[-1]
             prefix = line.split(kind)[0].strip()
+            hashed = _prehashed(line.split(kind, 1)[1].split())
+            if hashed:                                    # already a hash: kept as it is
+                self._set_global(f'{prefix} {kind} {hashed[0]} {hashed[1]}', f'username {name}')
+                return Reply()
             self._set_global(f'{prefix} {kind} {5 if kind == "secret" else 0} '
                              f'{"$1$mock$" + _scramble(secret) if kind == "secret" else secret}',
                              f'username {name}')
         return Reply()
+
+    # ---------------------------------------------------------------- RSA key generation
+    def _keygen(self, bits):
+        """crypto key generate rsa [modulus N]. Prerequisite errors as IOS prints them; a
+        question when SSH's key already exists (and, with rsa_ask_modulus, when no size is
+        given). Questions are only answered by whoever types the next line: the mock never
+        answers them itself."""
+        d = self.dev
+        if d.hostname in ('Router', 'Switch'):
+            return Reply(f'% Please define a hostname other than {d.hostname}.')
+        domain = d.domain_name()
+        if not domain:
+            return Reply('% Please define a domain-name first.')
+        label = f'{d.hostname}.{domain}'
+        if d.rsa_keys:
+            self.pending = lambda answer: self._replace_answer(answer, label, bits)
+            return Reply(f'% You already have RSA keys defined named {d.rsa_label}.\n'
+                         f'% Do you really want to replace them? [yes/no]: ', raw=True)
+        return self._ask_or_generate(label, bits)
+
+    def _replace_answer(self, answer, label, bits):
+        if answer.strip().lower() not in ('yes', 'y'):
+            return Reply()                                 # the existing key is kept
+        return self._ask_or_generate(label, bits)
+
+    def _ask_or_generate(self, label, bits):
+        if bits is None and 'rsa_ask_modulus' in self.dev.quirks:
+            self.pending = lambda answer: self._modulus_answer(answer, label)
+            return Reply(f'The name for the keys will be: {label}\n'
+                         'Choose the size of the key modulus in the range of 360 to 4096 for '
+                         'your\n  General Purpose Keys. Choosing a key modulus greater than 512 '
+                         'may take\n  a few minutes.\n\nHow many bits in the modulus [512]: ',
+                         raw=True)
+        return self._generate(label, bits or 2048)
+
+    def _modulus_answer(self, answer, label):
+        text = answer.strip() or '512'
+        if not text.isdigit() or not 360 <= int(text) <= 4096:
+            return Reply('% Invalid modulus size (SIMULATED)')
+        return self._generate(label, int(text))
+
+    def _generate(self, label, bits):
+        d = self.dev
+        head = (f'The name for the keys will be: {label}\n'
+                f'% The key modulus size is {bits} bits\n'
+                f'% Generating {bits} bit RSA keys, keys will be non-exportable...')
+        delay = 45.0 if 'rsa_slow' in d.quirks else 1.0
+        self.simulated_seconds += delay
+        if 'rsa_fails' in d.quirks:
+            return Reply(head + '\n%Error: RSA key generation failed (SIMULATED)', delay_s=delay)
+        d.rsa_keys, d.rsa_label, d.rsa_bits = True, label, bits   # SSH turns on with keys
+        if 'rsa_partial' in d.quirks:                  # the output stops before [OK]
+            d.rsa_listing_broken = True
+            return Reply(head, delay_s=delay)
+        out = head + f'\n[OK] (elapsed time was {int(delay)} seconds)'
+        if 'syslog' in d.quirks:
+            out += '\n*Nov 21 10:16:01.000: %SSH-5-ENABLED: SSH 1.99 has been enabled'
+        return Reply(out, delay_s=delay)
 
     def _set_global(self, line, key):
         lines = self.dev.global_lines
@@ -458,10 +615,18 @@ class Session:
 
     def global_ip(self, w):
         d = self.dev
-        options = ['domain-name', 'name-server', 'http', 'ssh', 'dhcp', 'default-gateway']
+        options = ['domain-name', 'name-server', 'http', 'dhcp', 'default-gateway']
+        if d.ssh_commands_exist():
+            options += ['ssh', 'scp']
         if d.kind == 'router':
             options += ['route', 'routing']
         sub = w.kw(1, options)
+        if sub == 'scp':                                  # ip scp server enable
+            w.kw(2, ['server'])
+            w.kw(3, ['enable'])
+            w.end(4)
+            self._set_global('ip scp server enable', 'ip scp')
+            return Reply()
         if sub == 'route':
             net, mask, nh = w.ip(2), w.mask(3), w.ip(4)
             w.end(5)
@@ -500,15 +665,25 @@ class Session:
             return Reply()
         if sub == 'routing':
             return Reply()
+        if sub == 'domain-name' and 'domain_rejected' in d.quirks:
+            raise CLIError(INVALID, w.pos(2))
+        if sub == 'ssh' and [x.lower() for x, _ in w.items[2:4]] == ['version', '2']:
+            if 'ssh_v2_rejected' in d.quirks:
+                return Reply('% Please create RSA keys to enable SSH (and of atleast 768 bits '
+                             'for SSH v2). (SIMULATED rejection)')
         self._set_global(' '.join(x for x, _ in w.items), ' '.join(x for x, _ in w.items[:2]))
         return Reply()
 
     def no_global(self, w):
         d = self.dev
-        options = ['ip', 'ntp', 'service', 'username', 'cdp', 'hostname', 'interface']
+        options = ['ip', 'ntp', 'service', 'username', 'cdp', 'hostname', 'interface', 'archive']
         if d.kind == 'switch':
             options.append('vlan')
         cmd = w.kw(1, options)
+        if cmd == 'archive':
+            w.end(2)
+            d.archive = None
+            return Reply()
         if cmd == 'vlan':
             for vid in vlan_numbers(w.word(2), w.pos(2)):
                 if vid == 1 or vid in (1002, 1003, 1004, 1005):
@@ -532,7 +707,7 @@ class Session:
             return Reply()
         if cmd == 'ip':
             sub = w.kw(2, ['route', 'name-server', 'dhcp', 'domain-name', 'http', 'ssh',
-                           'default-gateway'])
+                           'default-gateway', 'scp'])
             if sub == 'route':
                 net, mask, nh = w.ip(3), w.mask(4), w.ip(5)
                 if (net, mask, nh) in d.routes:
@@ -794,6 +969,44 @@ class Session:
         return Reply()
 
     # ---------------------------------------------------------------- other sub-modes
+    def archive_command(self, w):
+        a = self.dev.archive
+        cmd = w.kw(0, ['path', 'maximum', 'write-memory', 'time-period', 'exit', 'end', 'no'])
+        if cmd == 'exit':
+            self.mode = 'config'
+            return Reply()
+        if cmd == 'end':
+            self.mode = 'exec'
+            return Reply()
+        if cmd == 'no':
+            what = w.kw(1, ['path', 'maximum', 'write-memory', 'time-period'])
+            a[{'write-memory': 'write_memory', 'time-period': 'time_period'}.get(what, what)] = \
+                False if what == 'write-memory' else None
+            return Reply()
+        if cmd == 'path':
+            url = w.word(1)
+            w.end(2)
+            try:
+                name = restore_sim.flash_path(url)
+            except restore_sim.FlashError:
+                name = ''
+            if not name or not re.fullmatch(r'[A-Za-z0-9$][A-Za-z0-9$._-]*', name):
+                return Reply(f'%Error: {url} is not a usable archive path (SIMULATED: the mock '
+                             f'supports flash:<name> only)')
+            a['path'] = url
+            return Reply()
+        if cmd == 'maximum':
+            a['maximum'] = w.number(1, 1, 14)
+            w.end(2)
+            return Reply()
+        if cmd == 'time-period':
+            a['time_period'] = w.number(1, 1, 525600)
+            w.end(2)
+            return Reply()
+        w.end(1)
+        a['write_memory'] = True
+        return Reply()
+
     def vlan_command(self, w):
         cmd = w.kw(0, ['name', 'exit', 'end', 'no', 'state'])
         if cmd == 'exit':
@@ -903,3 +1116,19 @@ def _scramble(secret):
     """A fake hash: never the real text, never a real IOS hash."""
     import hashlib
     return hashlib.sha256(secret.encode()).hexdigest()[:22]
+
+
+def _prehashed(words):
+    """['5', '$1$mock$...'] -> ('5', '$1$mock$...'): a secret given as a hash, as a
+    replayed configuration file contains it. None for a plain secret."""
+    if len(words) == 2 and words[0] in ('5', '8', '9') and words[1].startswith('$'):
+        return words[0], words[1]
+    return None
+
+
+def _secret_for_hash(dev, hashed):
+    """The enable secret a replayed hash stands for: the current one when the hash is
+    its own, otherwise unknown (None: `enable` is refused, as with a lost secret)."""
+    if dev.enable_secret and hashed == f'$1$mock${_scramble(dev.enable_secret)}':
+        return dev.enable_secret
+    return None

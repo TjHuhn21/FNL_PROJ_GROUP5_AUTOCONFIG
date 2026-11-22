@@ -50,7 +50,7 @@ TITLES = {
     'register_resend': ('Verify an account', 'Created an account earlier? Get a new '
                                              'verification code for it.'),
 }
-BANNER = {'error': (theme.DANGER_SOFT, theme.DANGER), 'success': ('#E3F1E6', theme.SUCCESS),
+BANNER = {'error': (theme.DANGER_SOFT, theme.DANGER), 'success': (theme.SUCCESS_SOFT, theme.SUCCESS),
           'info': (theme.ACCENT_SOFT, theme.TEXT)}
 
 
@@ -74,25 +74,25 @@ class SignInWindow(ttk.Frame):
         for name in ('code', 'reg_code'):
             self.vars[name].trace_add('write', lambda *a, n=name: self._digits_only(n))
 
-        card = tk.Frame(self, background=theme.SURFACE, highlightthickness=1,
+        card = tk.Frame(self, background=theme.CARD, highlightthickness=1,
                         highlightbackground=theme.BORDER, padx=32, pady=26)
         card.pack(expand=True)
         self.card = card
-        brand = tk.Frame(card, background=theme.SURFACE)
+        brand = tk.Frame(card, background=theme.CARD)
         brand.pack(fill='x', pady=(0, 18))
         tk.Label(brand, text='NC', font=theme.mono(11, 'bold'), background=theme.RAIL_BG,
-                 foreground='#FFFFFF', width=4, pady=6).pack(side='left')
-        names = tk.Frame(brand, background=theme.SURFACE)
+                 foreground=theme.WHITE, width=4, pady=6).pack(side='left')
+        names = tk.Frame(brand, background=theme.CARD)
         names.pack(side='left', padx=(10, 0))
-        tk.Label(names, text='NetCommand', font=theme.FONT_BRAND, background=theme.SURFACE,
+        tk.Label(names, text='NetCommand', font=theme.FONT_BRAND, background=theme.CARD,
                  foreground=theme.TEXT).pack(anchor='w')
         tk.Label(names, text='network administration workbench', font=theme.mono(8),
-                 background=theme.SURFACE, foreground=theme.TEXT_MUTED).pack(anchor='w')
+                 background=theme.CARD, foreground=theme.TEXT_MUTED).pack(anchor='w')
 
-        self.heading = tk.Label(card, text='', font=theme.FONT_TITLE, background=theme.SURFACE,
+        self.heading = tk.Label(card, text='', font=theme.FONT_TITLE, background=theme.CARD,
                                 foreground=theme.TEXT, anchor='w')
         self.heading.pack(fill='x')
-        self.subtitle = tk.Label(card, text='', font=theme.FONT, background=theme.SURFACE,
+        self.subtitle = tk.Label(card, text='', font=theme.FONT, background=theme.CARD,
                                  foreground=theme.TEXT_SOFT, anchor='w', justify='left',
                                  wraplength=360)
         self.subtitle.pack(fill='x', pady=(2, 14))
@@ -103,19 +103,19 @@ class SignInWindow(ttk.Frame):
                                 foreground=theme.TEXT, padx=10, pady=7)
         self.message.pack(fill='x')
 
-        self.body = tk.Frame(card, background=theme.SURFACE)
+        self.body = tk.Frame(card, background=theme.CARD)
         self.body.pack(fill='both', expand=True)
 
-        self.progress_row = tk.Frame(card, background=theme.SURFACE)
+        self.progress_row = tk.Frame(card, background=theme.CARD)
         self.progress = ttk.Progressbar(self.progress_row, mode='indeterminate', length=360)
         self.progress.pack(fill='x')
         self.busy_label = tk.Label(self.progress_row, text='', font=theme.FONT_SMALL,
-                                   background=theme.SURFACE, foreground=theme.TEXT_MUTED,
+                                   background=theme.CARD, foreground=theme.TEXT_MUTED,
                                    anchor='w')
         self.busy_label.pack(fill='x', pady=(2, 0))
 
         footer = server_text or ''
-        tk.Label(card, text=footer, font=theme.mono(8), background=theme.SURFACE,
+        tk.Label(card, text=footer, font=theme.mono(8), background=theme.CARD,
                  foreground=theme.TEXT_MUTED, anchor='w').pack(fill='x', side='bottom',
                                                                pady=(16, 0))
         self.buttons = []
@@ -130,17 +130,17 @@ class SignInWindow(ttk.Frame):
     def _styles(widget):
         style = ttk.Style(widget)
         style.configure('Auth.TFrame', background=theme.APP_BG)
-        style.configure('Card.TCheckbutton', background=theme.SURFACE, foreground=theme.TEXT_SOFT)
-        style.map('Card.TCheckbutton', background=[('active', theme.SURFACE)])
-        style.configure('Link.TButton', background=theme.SURFACE, foreground=theme.ACCENT,
-                        bordercolor=theme.SURFACE, lightcolor=theme.SURFACE,
-                        darkcolor=theme.SURFACE, relief='flat', padding=(2, 2))
+        style.configure('Card.TCheckbutton', background=theme.CARD, foreground=theme.TEXT_SOFT)
+        style.map('Card.TCheckbutton', background=[('active', theme.CARD)])
+        style.configure('Link.TButton', background=theme.CARD, foreground=theme.ACCENT,
+                        bordercolor=theme.CARD, lightcolor=theme.CARD,
+                        darkcolor=theme.CARD, relief='flat', padding=(2, 2))
         style.map('Link.TButton', background=[('active', theme.ACCENT_SOFT)],
                   foreground=[('disabled', theme.TEXT_MUTED)])
         style.configure('Primary.TButton', padding=(10, 7))
 
     def _label(self, frame, text):
-        tk.Label(frame, text=text, font=theme.FONT_BOLD, background=theme.SURFACE,
+        tk.Label(frame, text=text, font=theme.FONT_BOLD, background=theme.CARD,
                  foreground=theme.TEXT, anchor='w').pack(fill='x', pady=(0, 3))
 
     def _field(self, frame, label, var, secret=False):
@@ -156,7 +156,7 @@ class SignInWindow(ttk.Frame):
                           font=theme.mono(18, 'bold'))
         entry.pack(anchor='w', pady=(0, 4), ipady=4)
         tk.Label(frame, text=f'{CODE_LENGTH} digits, from the email.', font=theme.FONT_SMALL,
-                 background=theme.SURFACE, foreground=theme.TEXT_MUTED,
+                 background=theme.CARD, foreground=theme.TEXT_MUTED,
                  anchor='w').pack(fill='x')
         return entry
 
@@ -184,14 +184,14 @@ class SignInWindow(ttk.Frame):
 
     # ------------------------------------------------------------ screens
     def _build_login(self):
-        f = tk.Frame(self.body, background=theme.SURFACE)
+        f = tk.Frame(self.body, background=theme.CARD)
         self.login_entry = self._field(f, 'Email address', self.vars['email'])
         pw = self._field(f, 'Password', self.vars['password'], secret=True)
         self._show_toggle(f, [pw])
         self.login_entry.bind('<Return>', lambda e: pw.focus_set())
         pw.bind('<Return>', lambda e: self.submit_login())
         self._primary(f, 'Sign in', self.submit_login)
-        row = tk.Frame(f, background=theme.SURFACE)
+        row = tk.Frame(f, background=theme.CARD)
         row.pack(fill='x')
         self._link(row, 'Create account', lambda: self.show('register', ''))
         self._link(row, 'Verify a new account', lambda: self.show('register_resend', ''),
@@ -200,15 +200,15 @@ class SignInWindow(ttk.Frame):
         return f
 
     def _code_screen(self, name, var, submit):
-        f = tk.Frame(self.body, background=theme.SURFACE)
+        f = tk.Frame(self.body, background=theme.CARD)
         e = self._code_field(f, var, 'Sign-in code' if name == 'login_code' else 'Verification code')
         e.bind('<Return>', lambda ev: submit())
         self.expiry_labels[name] = tk.Label(f, text='', font=theme.FONT_SMALL,
-                                            background=theme.SURFACE, foreground=theme.TEXT_SOFT,
+                                            background=theme.CARD, foreground=theme.TEXT_SOFT,
                                             anchor='w')
         self.expiry_labels[name].pack(fill='x', pady=(2, 10))
         self._primary(f, 'Verify', submit)
-        row = tk.Frame(f, background=theme.SURFACE)
+        row = tk.Frame(f, background=theme.CARD)
         row.pack(fill='x')
         self.resend_buttons[name] = self._link(row, 'Send a new code', self.resend_code)
         self._link(row, 'Back to sign in', self.back_to_login, side='right')
@@ -222,13 +222,13 @@ class SignInWindow(ttk.Frame):
         return self._code_screen('register_code', self.vars['reg_code'], self.submit_register_code)
 
     def _build_register(self):
-        f = tk.Frame(self.body, background=theme.SURFACE)
+        f = tk.Frame(self.body, background=theme.CARD)
         self.first_field['register'] = self._field(f, 'Email address', self.vars['reg_email'])
         self._field(f, 'Full name', self.vars['reg_name'])
         pw = self._field(f, 'Password', self.vars['reg_password'], True)
         confirm = self._field(f, 'Confirm password', self.vars['reg_confirm'], True)
         confirm.bind('<Return>', lambda e: self.submit_register())
-        self.password_hint = tk.Label(f, text='', font=theme.FONT_SMALL, background=theme.SURFACE,
+        self.password_hint = tk.Label(f, text='', font=theme.FONT_SMALL, background=theme.CARD,
                                       foreground=theme.TEXT_MUTED, anchor='w', justify='left')
         self.password_hint.pack(fill='x', pady=(0, 6))
         for name in ('reg_password', 'reg_confirm'):
@@ -236,17 +236,17 @@ class SignInWindow(ttk.Frame):
         self._update_password_hint()
         self._show_toggle(f, [pw, confirm])
         self._primary(f, 'Create account', self.submit_register)
-        row = tk.Frame(f, background=theme.SURFACE)
+        row = tk.Frame(f, background=theme.CARD)
         row.pack(fill='x')
         self._link(row, 'Back to sign in', self.back_to_login)
         return f
 
     def _build_register_resend(self):
-        f = tk.Frame(self.body, background=theme.SURFACE)
+        f = tk.Frame(self.body, background=theme.CARD)
         e = self._field(f, 'Email address', self.vars['resend_email'])
         e.bind('<Return>', lambda ev: self.submit_register_resend())
         self._primary(f, 'Send code', self.submit_register_resend)
-        row = tk.Frame(f, background=theme.SURFACE)
+        row = tk.Frame(f, background=theme.CARD)
         row.pack(fill='x')
         self._link(row, 'Back to sign in', self.back_to_login)
         self.first_field['register_resend'] = e

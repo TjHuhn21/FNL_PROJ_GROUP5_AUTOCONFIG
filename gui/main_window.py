@@ -34,15 +34,28 @@ from gui.findings_tab import FindingsTab
 from gui.logs_tab import LogsTab
 from gui.overview_page import OverviewPage
 from gui.scan_tab import ScanTab
+from gui.setup_tab import SetupTab
 from gui.topology_tab import TopologyTab
-from desktop_auth.session import EDIT_DEVICES, MANAGE_ACCOUNTS, RUN_REVIEW
+from desktop_auth.session import CONFIGURE, EDIT_DEVICES, MANAGE_ACCOUNTS, RUN_REVIEW
 from store_errors import DatabaseError
 
 # (key, rail label) in rail order. 'dashboard' is the Overview workspace.
+# 'setup' is the Initial Setup page (console connection); "Setup" fits the narrow rail.
 PAGES = [('dashboard', 'Overview'), ('scan', 'Scan'), ('devices', 'Devices'),
          ('topology', 'Topology'), ('findings', 'Findings'), ('configure', 'Configure'),
-         ('logs', 'Logs')]
+         ('setup', 'Setup'), ('logs', 'Logs')]
 FIRST_PAGE = 'dashboard'
+
+# Set to 1 only by the mock lab launcher (mock-lab/run_netcommand.py). DISPLAY ONLY: it adds
+# this label to the title and the status bar and changes nothing else.
+MOCK_LAB_VARIABLE = 'NETCOMMAND_MOCK_LAB'
+MOCK_LAB_TEXT = 'MOCK LAB — simulated devices'
+
+
+def mock_lab_label(environ=None):
+    """MOCK_LAB_TEXT when the mock lab launcher started this window, else ''."""
+    return MOCK_LAB_TEXT if (os.environ if environ is None else environ).get(
+        MOCK_LAB_VARIABLE) == '1' else ''
 
 
 def _scaling(widget):
@@ -60,7 +73,7 @@ SOURCE_FALLBACK = '●  sample mode · database unavailable at startup'
 
 
 def build_main_window(root, store, demo_store=False, startup_problem=None, access=None,
-                      account=None):
+                      account=None, console_backend=None):
     """Builds the workbench and every page. Returns refs: one entry per page key,
     plus 'nav', 'command', 'inspector', 'console', 'show_page', 'current_page', and in
     database mode 'db_status' (gui.db_status.DatabaseStatus).
@@ -69,7 +82,9 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     access: desktop_auth.session.Access of the signed-in user (None: everything, as
     before sign-in existed). Pages and buttons the role may not use are not offered.
     account: gui.session_watch.SignedInContext (sign-out, and the Accounts page for
-    admins); None in demo mode."""
+    admins); None in demo mode.
+    console_backend: where the Initial Setup page gets serial ports and console sessions;
+    None = the computer's real COM ports (the simulated one only with --mock-console)."""
     theme.apply(root)
     root.grid_columnconfigure(1, weight=1)
     root.grid_rowconfigure(2, weight=1)
@@ -94,7 +109,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     brand.grid_propagate(False)
     brand.grid_columnconfigure(0, weight=1)
     brand.grid_rowconfigure(0, weight=1)
-    ctk.CTkLabel(brand, text='NC', font=theme.mono(12, 'bold'), text_color='#FFFFFF').grid(
+    ctk.CTkLabel(brand, text='NC', font=theme.mono(12, 'bold'), text_color=theme.WHITE).grid(
         row=0, column=0)
     names = ctk.CTkFrame(header, fg_color=theme.SURFACE, corner_radius=0)
     names.grid(row=0, column=1, padx=(12, 20), sticky='w')
@@ -304,6 +319,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
                                    send_to_configure)
     refs['findings'].on_saved = overview_stale
     refs['logs'] = LogsTab(host, store)
+    if allowed('setup'):                    # not even built for roles that may not use it
+        refs['setup'] = SetupTab(host, log=console.log, backend=console_backend)
     refs['dashboard'] = OverviewPage(
         host, lambda key: show_page(key), store=store, can_open=allowed,
         scan_history=lambda: refs['scan'].history,
@@ -311,6 +328,17 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     if access is not None:
         refs['devices'].set_read_only(not access.can(EDIT_DEVICES))
         refs['findings'].set_read_only(not access.can(RUN_REVIEW))
+    # Backup catalogue (Phase 4B): the same permission as Configure. A selection is only
+    # remembered for a future restore workflow; nothing is sent to any device.
+    refs['devices'].set_backups_allowed(access is None or access.can(CONFIGURE))
+    refs['backup_selection'] = None
+
+    def backup_selected(selection):
+        refs['backup_selection'] = selection
+        console.log('backups', f'Selected backup {os.path.basename(selection.path)} for a '
+                               f'future restore of {selection.device_name or selection.device_ip}'
+                               f' (nothing was sent to the device).')
+    refs['devices'].on_backup_selected = backup_selected
     if any(key == 'accounts' for key, _label in pages):
         from gui.accounts_page import AccountsPage
         refs['accounts'] = AccountsPage(host, account)
@@ -373,6 +401,11 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     refs['status_devices'] = ctk.CTkLabel(status, text='', font=theme.mono(8), height=20,
                                           text_color=theme.TEXT_SOFT)
     refs['status_devices'].pack(side='left', padx=(12, 0))
+    if mock_lab_label():                   # display only: the mock lab launcher's label
+        refs['status_mock_lab'] = ctk.CTkLabel(status, text=mock_lab_label(),
+                                               font=theme.mono(8, 'bold'), height=20,
+                                               text_color=theme.WARNING)
+        refs['status_mock_lab'].pack(side='left', padx=(16, 0))
     ctk.CTkLabel(status, text='Ctrl+K  command strip', font=theme.mono(8), height=20,
                  text_color=theme.TEXT_SOFT).pack(side='right', padx=12)
     refs['inspector_toggle'] = ctk.CTkButton(
@@ -385,7 +418,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     # ---------------------------------------------------------------- collapsible inspector
     # Each page remembers whether it shows the inspector; Configure starts without it
     # (it needs the width). Selecting something to inspect always brings it back.
-    inspector_pref = {'configure': False}
+    inspector_pref = {'configure': False, 'setup': False}
     console_size = {}                          # page -> console height (pixels) chosen there
 
     def inspector_shown():
@@ -440,7 +473,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
                'topology': lambda: refs['topology'].refresh(),
                'findings': lambda: refs['findings'].on_page_shown(),
                'dashboard': lambda: refs['dashboard'].refresh(),
-               'accounts': lambda: refs['accounts'].refresh()}
+               'accounts': lambda: refs['accounts'].refresh(),
+               'setup': lambda: refs['setup'].on_page_shown()}
 
     def refuse(key):
         label = dict(all_pages).get(key, key)

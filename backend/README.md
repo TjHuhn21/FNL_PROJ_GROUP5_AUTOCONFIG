@@ -16,8 +16,10 @@ What it does today:
   operator, never on start-up), audit-log protection and least-privilege accounts.
 * A command to create the **first administrator** (`python -m backend.auth.bootstrap_admin`).
 
-Not yet: **HTTPS** (the backend listens on `127.0.0.1` only, so each team member runs their
-own backend), and device operations behind the backend (the desktop still talks to its own
+* **HTTPS for the local network (LAN mode)**, off by default: a self-signed certificate on
+  port 8443, pinned by the desktop clients. See **[../docs/LAN_DEPLOYMENT.md](../docs/LAN_DEPLOYMENT.md)**.
+
+Not yet: device operations behind the backend (the desktop still talks to its own
 `netcommand` database and to the devices directly).
 
 Installing everything from scratch, step by step: **[../docs/TEAM_INSTALLATION_GUIDE.md](../docs/TEAM_INSTALLATION_GUIDE.md)**.
@@ -52,8 +54,8 @@ From the project folder:
 .\venv\Scripts\python.exe -m backend
 ```
 
-It listens on `http://127.0.0.1:8000` (plain HTTP, this computer only, until the HTTPS
-phase). Check it:
+It listens on `http://127.0.0.1:8000` (plain HTTP, this computer only) unless LAN mode is
+turned on (HTTPS on port 8443, `docs/LAN_DEPLOYMENT.md`). Check it:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/health      # -> status: ok
@@ -459,15 +461,22 @@ Two separate accounts with separate jobs (`migrate` refuses to use the same one 
 
 * **Migration account** (`BACKEND_MIGRATE_USER`, used only by `python -m
   backend.database.migrate`): creates and drops the backend tables and keeps
-  `schema_migrations`. Table-level grants only, so it cannot touch the application tables.
+  `schema_migrations`. Table-level grants only, so it cannot touch the desktop database's
+  application tables (`devices`, `links`, ...); it can create and drop only the backend's
+  own tables, including the shared `app_*` tables of Phase C.
   It deliberately has no `DROP` on `audit_log` (removing audit history is an administrator
   step, see *Rolling back*).
 * **Runtime account** (`BACKEND_DB_USER`, used by the running backend) needs only:
   * `SELECT`, `INSERT`, `UPDATE` on `users`, `email_challenges`, `sessions`;
   * `SELECT`, `INSERT` on `audit_log` (append-only);
-  * `SELECT` on `schema_migrations`.
+  * `SELECT` on `schema_migrations`;
+  * Phase C shared data (see [docs/PHASE_C_SHARED_DATABASE.md](../docs/PHASE_C_SHARED_DATABASE.md)):
+    `SELECT`, `INSERT`, `UPDATE` on `app_devices`, `app_device_credentials`, `app_links`,
+    `app_findings`, `app_jobs`, `app_job_devices`, `app_device_locks`; `SELECT`, `INSERT`
+    only (append-only) on `app_status_events`, `app_config_logs`, `app_job_events`,
+    `app_device_backups`.
 
-  It must not have: `DELETE` on any table; `UPDATE` on `audit_log`; `DROP`, `ALTER` or
+  It must not have: `DELETE` on any table; `UPDATE` on the append-only `app_*` tables; `UPDATE` on `audit_log`; `DROP`, `ALTER` or
   `TRIGGER` on `audit_log`; database-wide `CREATE`, `DROP`, `ALTER` or `TRIGGER`; or roles
   whose privileges are not reviewed. `check-runtime-grants` reports any such grant
   (exit code 4) and any missing required grant (exit code 5).
@@ -486,19 +495,42 @@ GRANT SELECT, CREATE, DROP, REFERENCES ON `netcommand_test`.`users` TO 'netcomma
 GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`email_challenges` TO 'netcommand_migrator'@'127.0.0.1';
 GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`sessions` TO 'netcommand_migrator'@'127.0.0.1';
 GRANT SELECT, CREATE                   ON `netcommand_test`.`audit_log` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP, REFERENCES ON `netcommand_test`.`app_devices` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_device_credentials` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_links` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_findings` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_status_events` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_config_logs` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP, REFERENCES ON `netcommand_test`.`app_jobs` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_job_devices` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_job_events` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_device_locks` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_device_backups` TO 'netcommand_migrator'@'127.0.0.1';
 GRANT LOCK TABLES ON `netcommand\_test`.* TO 'netcommand_migrator'@'127.0.0.1';  -- only works on tables it can SELECT
 -- Optional: lets `migrate status` VERIFY the audit triggers. It also lets this
 -- account drop them; leave it out to verify as an administrator instead.
 -- GRANT TRIGGER ON `netcommand_test`.`audit_log` TO 'netcommand_migrator'@'127.0.0.1';
 
 -- 2) RUNTIME account: what the backend uses. Run AFTER `migrate up` (table
---    grants need the tables). No DELETE anywhere; audit_log is append-only.
+--    grants need the tables). No DELETE anywhere; audit_log and the app_ event,
+--    log and backup tables are append-only.
 CREATE USER 'netcommand_api'@'127.0.0.1' IDENTIFIED BY '<chosen by the DBA>';
 GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`users` TO 'netcommand_api'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`email_challenges` TO 'netcommand_api'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`sessions` TO 'netcommand_api'@'127.0.0.1';
 GRANT SELECT, INSERT         ON `netcommand_test`.`audit_log` TO 'netcommand_api'@'127.0.0.1';
 GRANT SELECT                 ON `netcommand_test`.`schema_migrations` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_devices` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_device_credentials` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_links` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_findings` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT         ON `netcommand_test`.`app_status_events` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT         ON `netcommand_test`.`app_config_logs` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_jobs` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_job_devices` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT         ON `netcommand_test`.`app_job_events` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_device_locks` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT         ON `netcommand_test`.`app_device_backups` TO 'netcommand_api'@'127.0.0.1';
 ```
 
 Grant the runtime account its table privileges after `migrate up` (MySQL needs the tables

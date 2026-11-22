@@ -2,6 +2,8 @@
                                                      sample mode if the database is down)
                            python main.py --demo   (DEMO MODE: sample data, no sign-in)
                            python main.py --no-monitor  (do not ping devices in the background)
+                           python main.py --mock-console  (Initial Setup page uses SIMULATED
+                                                          console ports from the mock lab)
 
 Signing in uses the NetCommand backend API (NETCOMMAND_API_URL; default
 http://127.0.0.1:8000, see desktop_auth/api_client.py). Without --demo there is no way
@@ -14,6 +16,19 @@ from tkinter import messagebox
 
 SIGNED_OUT, CLOSED = 'signed_out', 'closed'
 LOGOUT_WAIT = 3              # seconds to wait for the server to end the session on exit
+
+
+def console_backend(argv=None):
+    """The Initial Setup page's ports and sessions. None (the computer's real COM ports)
+    unless --mock-console asks for the mock lab's SIMULATED console ports."""
+    if '--mock-console' not in (sys.argv if argv is None else argv):
+        return None
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(here, 'mock-lab'))
+    from mocklab.console import MockConsoleBackend
+    print('MOCK CONSOLE MODE: the Initial Setup page shows simulated ports only.')
+    return MockConsoleBackend()
 
 
 def choose_store(force_demo=False):
@@ -90,16 +105,22 @@ def end_server_session(client, session):
     worker.join(LOGOUT_WAIT)
 
 
+def window_title(demo, startup_problem, access, mock_lab=''):
+    """The workbench title. mock_lab: the mock lab launcher's label (display only)."""
+    return ('NetCommand' + ('  [sample mode: database unavailable at startup]'
+                            if startup_problem else '  [sample mode]' if demo else '')
+            + ('  [DEMO MODE]' if access is not None and access.demo else '')
+            + (f'  [{mock_lab}]' if mock_lab else ''))
+
+
 def run_workbench(store, demo, startup_problem, access=None, client=None, session=None,
                   make_root=None):
     """Open the workbench. Returns SIGNED_OUT (show the sign-in window again) or CLOSED.
     make_root: the window factory (tests only; default customtkinter.CTk)."""
-    from gui.main_window import build_main_window
+    from gui.main_window import build_main_window, mock_lab_label
     import customtkinter as ctk
     root = (make_root or ctk.CTk)()          # a Tk window with the dark title bar and scaling support
-    root.title('NetCommand' + ('  [sample mode: database unavailable at startup]'
-                               if startup_problem else '  [sample mode]' if demo else '')
-               + ('  [DEMO MODE]' if access is not None and access.demo else ''))
+    root.title(window_title(demo, startup_problem, access, mock_lab_label()))
     fit_to_screen(root)
     outcome = {'value': CLOSED, 'done': False}
     account = None
@@ -128,7 +149,7 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
 
         account = SignedInContext(client, session, sign_out, session_ended)
     refs = build_main_window(root, store, demo, startup_problem=startup_problem,
-                             access=access, account=account)
+                             access=access, account=account, console_backend=console_backend())
     if session is not None:
         refs['session_watcher'] = SessionWatcher(root, client, session, session_ended)
         root.protocol('WM_DELETE_WINDOW', close_window)
@@ -158,13 +179,15 @@ def main():
         store, demo, startup_problem = choose_store(True)
         run_workbench(store, demo, startup_problem, access=Access(None, demo=True))
         return
-    from desktop_auth.api_client import ApiConfigError, AuthApiClient, api_url_from_environment
+    from desktop_auth.api_client import ApiConfigError, client_from_environment
     try:
-        client = AuthApiClient(api_url_from_environment())
+        client = client_from_environment()   # http:// (this computer) or pinned https://
     except ApiConfigError as err:            # the message names the setting, nothing secret
         print(f'NetCommand not started: {err}')
-        messagebox.showerror('NetCommand', f'{err}\n\nFix NETCOMMAND_API_URL, or start with '
-                                           f'--demo to use sample data without signing in.')
+        messagebox.showerror('NetCommand', f'{err}\n\nFix the server settings in .env '
+                                           f'(NETCOMMAND_API_URL, NETCOMMAND_API_CA_FILE, '
+                                           f'NETCOMMAND_API_ADDRESS), or start with --demo to '
+                                           f'use sample data without signing in.')
         return
     store = None
     while True:

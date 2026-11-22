@@ -14,6 +14,7 @@ import db_fake
 from discovery import crawler
 from fakes import fake_login_factory, lab
 from gui_helpers import new_root, pump
+from gui import theme
 from topology import graph
 
 BUTTON1 = 0x0100              # "left button held" in a Tk event's state
@@ -152,7 +153,7 @@ def test_clicking_a_device_shows_its_database_record(lab_app):
     assert insp.selection == ('device', db_fake.get_device_by_name('SW1')['id'])
     assert insp.fields['IP address'].cget('text') == '192.168.1.3'
     assert 'down' in insp.status_label.cget('text')
-    assert c_outline(tc, 'SW1') == '#0E6F67'                                 # highlighted
+    assert c_outline(tc, 'SW1') == theme.ACCENT                                 # highlighted
     click(root, tc, *tc.screen_center('CORE'))
     assert insp.fields['Topology'].cget('text') == 'single point of failure'
 
@@ -214,7 +215,7 @@ def test_clicking_a_link_shows_both_devices_and_interfaces(lab_app):
     assert insp.selection[0] == 'link' and set(insp.selection[1]) == {'CORE', 'SW2'}
     assert insp.fields['CORE port'].cget('text') == 'Gi0/2'
     assert insp.fields['SW2 port'].cget('text') == 'Gi0/1'
-    assert tc.canvas.itemcget(items(tc, f'edge-{i}')[0], 'fill') == '#0E6F67'
+    assert tc.canvas.itemcget(items(tc, f'edge-{i}')[0], 'fill') == theme.ACCENT
     insp.link_buttons['SW2'].invoke()                    # "Inspect SW2" selects it on the map
     root.update()
     assert tc.selected == ('node', 'SW2') and insp.selection[0] == 'device'

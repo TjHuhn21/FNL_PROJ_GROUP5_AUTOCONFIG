@@ -3,7 +3,7 @@ netmiko.ConnectHandler(device_type='cisco_ios'). NetCommand is not involved.
 
     python netmiko_workflow.py               the lab must be running (python -m mocklab start)
     python netmiko_workflow.py --own-lab     start the lab inside this script, then stop it
-    python netmiko_workflow.py --device SW1  another device (default R1)
+    python netmiko_workflow.py --device SW1  another device (default MOCK-R1)
 
 Steps: connect -> initial prompt -> enable (if needed) -> show running-config ->
 configure terminal -> hostname -> end -> verification -> write mem -> disconnect.
@@ -119,7 +119,7 @@ def run(device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--device', default='R1')
+    p.add_argument('--device', default='MOCK-R1')
     p.add_argument('--own-lab', action='store_true')
     args = p.parse_args()
     with open(os.path.join(HERE, 'lab_config.json'), encoding='utf-8') as f:

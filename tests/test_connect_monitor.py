@@ -8,6 +8,8 @@ from config import connect
 from monitor import monitor
 
 CREDS = {'host': '192.168.1.3', 'username': 'admin', 'password': 'cisco123'}
+# What a Cisco switch returns for show running-config (it always ends with "end").
+RUNNING = 'Building configuration...\n\nCurrent configuration : 30 bytes\n!\nhostname SW1\n!\nend\n'
 
 
 class Switch:
@@ -18,7 +20,9 @@ class Switch:
     def find_prompt(self): return 'SW1#'
     def enable(self): pass
     def send_command(self, cmd, **kw):
-        return 'hostname SW1\n' if cmd == 'show running-config' else self.show_output
+        if cmd == 'show privilege':
+            return 'Current privilege level is 15'           # as a privileged IOS session
+        return RUNNING if cmd == 'show running-config' else self.show_output
     def send_config_set(self, cmds, **kw):
         self.sent = list(cmds)
         return '% Invalid input detected at "^" marker.' if self.reject else ''
@@ -33,14 +37,15 @@ def patch_open(monkeypatch, sw=None, error=None):
     monkeypatch.setattr(connect, '_open', fake_open)
 
 
-def test_apply_backs_up_sends_checks_and_saves(monkeypatch, tmp_path):
+def test_apply_backs_up_sends_checks_and_saves(monkeypatch, tmp_path, synthetic_backup_key):
     sw = Switch(); patch_open(monkeypatch, sw)
     ok, msg = connect.apply_config(CREDS, ['vlan 10', 'name SALES'], [('show vlan brief', 'SALES')],
                                    backup_dir=str(tmp_path))
     assert ok and 'Applied and verified' in msg
     assert sw.sent == ['vlan 10', 'name SALES'] and sw.saved and sw.closed
     files = list(tmp_path.iterdir())
-    assert len(files) == 1 and files[0].read_text() == 'hostname SW1\n'      # the OLD config was saved
+    assert len(files) == 1 and files[0].suffix == '.ncbak'           # encrypted
+    assert synthetic_backup_key.decrypt(files[0])[0] == RUNNING.encode()   # the OLD config
 
 
 def test_comments_and_blank_lines_are_never_sent(monkeypatch, tmp_path):
@@ -75,7 +80,7 @@ def test_every_failure_is_a_clear_message_not_a_crash(monkeypatch, tmp_path, err
 
 def test_get_config(monkeypatch):
     sw = Switch(); patch_open(monkeypatch, sw)
-    assert connect.get_config(CREDS) == 'hostname SW1\n' and sw.closed
+    assert connect.get_config(CREDS) == RUNNING and sw.closed
 
 
 # ---------------------------------------------------------------- monitor

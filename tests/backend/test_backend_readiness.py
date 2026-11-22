@@ -21,6 +21,8 @@ from backend.settings import parse_settings
 ROOT = Path(__file__).resolve().parents[2]
 SECRET = 'Runtime-Db-Secret-5531'
 M1 = MIGRATIONS[0]
+ALL_APPLIED = [{'version': m.version, 'name': m.name, 'checksum': m.checksum}
+               for m in MIGRATIONS]
 
 
 def settings(enabled=True, name='netcommand_test'):
@@ -69,11 +71,11 @@ class Cursor:
 
 
 class Conn:
-    """A healthy database by default: migration 1 applied, all tables present."""
+    """A healthy database by default: every migration applied, all tables present."""
 
     def __init__(self, **kw):
         self.tables = set(ALL_TABLES) | {TRACKING_TABLE, 'devices', 'links'}
-        self.applied = [{'version': 1, 'name': M1.name, 'checksum': M1.checksum}]
+        self.applied = [dict(row) for row in ALL_APPLIED]
         self.select_one = [{'ok': 1}]
         self.fail_on, self.error = None, None
         self.sent, self.rollbacks, self.commits, self.closed = [], 0, 0, False
@@ -112,8 +114,11 @@ def test_ready_when_connected_and_schema_matches():
     {'applied': []},                                                   # migration 1 missing
     {'applied': [{'version': 1, 'name': M1.name, 'checksum': '0' * 64}]},   # wrong checksum
     {'applied': [{'version': 1, 'name': 'renamed', 'checksum': M1.checksum}]},
-    {'applied': [{'version': 1, 'name': M1.name, 'checksum': M1.checksum},
-                 {'version': 2, 'name': 'future', 'checksum': 'f' * 64}]},   # unknown version
+    {'applied': ALL_APPLIED + [{'version': len(MIGRATIONS) + 1, 'name': 'future',
+                                'checksum': 'f' * 64}]},                     # unknown version
+    # Only the authentication migration applied (a database migrated before Phase C):
+    # not ready until migrations 2-4 are applied too.
+    {'applied': [{'version': 1, 'name': M1.name, 'checksum': M1.checksum}]},
 ])
 def test_schema_problems_are_not_ready(change):
     conn = Conn(**change)

@@ -66,18 +66,18 @@ def run(session, *lines):
 
 # ---------------------------------------------------------------- the simulated CLI (no SSH)
 def test_prompts_and_modes():
-    dev, s = cli('R1')
-    assert s.prompt() == 'R1>'
+    dev, s = cli('MOCK-R1')
+    assert s.prompt() == 'MOCK-R1>'
     assert s.handle('enable').output == 'Password: '
-    assert s.handle('wrong').output == '% Access denied' and s.prompt() == 'R1>'
-    s.handle('en'); s.handle(SPEC['R1']['password'])
-    assert s.prompt() == 'R1#'
+    assert s.handle('wrong').output == '% Access denied' and s.prompt() == 'MOCK-R1>'
+    s.handle('en'); s.handle(SPEC['MOCK-R1']['password'])
+    assert s.prompt() == 'MOCK-R1#'
     assert 'Enter configuration commands' in s.handle('conf t').output
-    assert s.prompt() == 'R1(config)#'
-    s.handle('int gi0/2'); assert s.prompt() == 'R1(config-if)#'
-    s.handle('ip dhcp pool LAN'); assert s.prompt() == 'R1(dhcp-config)#'     # global from a sub-mode
-    s.handle('exit'); assert s.prompt() == 'R1(config)#'
-    s.handle('end'); assert s.prompt() == 'R1#'
+    assert s.prompt() == 'MOCK-R1(config)#'
+    s.handle('int gi0/2'); assert s.prompt() == 'MOCK-R1(config-if)#'
+    s.handle('ip dhcp pool LAN'); assert s.prompt() == 'MOCK-R1(dhcp-config)#'     # global from a sub-mode
+    s.handle('exit'); assert s.prompt() == 'MOCK-R1(config)#'
+    s.handle('end'); assert s.prompt() == 'MOCK-R1#'
     sw, t = cli('SW1')
     assert t.prompt() == 'SW1#'                                   # starts privileged
     t.handle('configure terminal'); t.handle('interface range fa0/1 - 3')
@@ -95,8 +95,8 @@ def test_error_messages_look_like_ios():
     s.handle('conf t')
     assert '% Invalid input' in s.handle('ip route 10.0.0.0 255.0.0.0 1.1.1.1').output   # L2 switch
     assert '% Invalid input' in s.handle('interface FastEthernet0/99').output
-    _, r = cli('R1')
-    r.handle('enable'); r.handle(SPEC['R1']['password'])
+    _, r = cli('MOCK-R1')
+    r.handle('enable'); r.handle(SPEC['MOCK-R1']['password'])
     assert '% Invalid input' in r.handle('show vlan brief').output        # routers have no VLANs
 
 
@@ -139,9 +139,9 @@ def test_trunks_differ_per_switch_model():
 
 
 def test_router_interfaces_routes_dhcp_dns_ntp():
-    dev, s = cli('R1')
+    dev, s = cli('MOCK-R1')
     dev.interfaces['GigabitEthernet0/2'].connected = True        # plug a cable into Gi0/2
-    run(s, 'enable', SPEC['R1']['password'], 'conf t', 'interface Gi0/2',
+    run(s, 'enable', SPEC['MOCK-R1']['password'], 'conf t', 'interface Gi0/2',
         'ip address 172.16.5.1 255.255.255.0', 'description Branch', 'no shutdown', 'exit',
         'ip route 10.10.0.0 255.255.0.0 172.16.5.254', 'ip route 10.20.0.0 255.255.0.0 9.9.9.9',
         'ip dhcp excluded-address 172.16.5.1 172.16.5.20', 'ip dhcp pool BRANCH',
@@ -165,8 +165,8 @@ def test_router_interfaces_routes_dhcp_dns_ntp():
 
 
 def test_an_interface_without_a_cable_stays_down():
-    dev, s = cli('R1')                                            # Gi0/2 has no simulated cable
-    run(s, 'enable', SPEC['R1']['password'], 'conf t', 'interface Gi0/2',
+    dev, s = cli('MOCK-R1')                                            # Gi0/2 has no simulated cable
+    run(s, 'enable', SPEC['MOCK-R1']['password'], 'conf t', 'interface Gi0/2',
         'ip address 172.16.5.1 255.255.255.0', 'no shutdown', 'exit',
         'ip route 10.10.0.0 255.255.0.0 172.16.5.254', 'end')
     assert 'GigabitEthernet0/2     172.16.5.1      YES manual down                  down' in \
@@ -195,10 +195,10 @@ def test_passwords_are_never_logged():
 
 
 def test_config_file_checks():
-    bad = {'devices': [dict(SPEC['R1'], host='192.168.1.1')]}
+    bad = {'devices': [dict(SPEC['MOCK-R1'], host='192.168.1.1')]}
     with pytest.raises(LabError, match='not a loopback'):
         check_config(bad)
-    dup = {'devices': [SPEC['R1'], dict(SPEC['SW1'], host=SPEC['R1']['host'])]}
+    dup = {'devices': [SPEC['MOCK-R1'], dict(SPEC['SW1'], host=SPEC['MOCK-R1']['host'])]}
     with pytest.raises(LabError, match='used twice'):
         check_config(dup)
     for d in CONFIG['devices']:                                   # the shipped file is sane
@@ -207,12 +207,12 @@ def test_config_file_checks():
 
 # ---------------------------------------------------------------- SSH with the real Netmiko
 def test_real_netmiko_workflow(lab):
-    conn = connect_to(lab, 'R1')
-    assert conn.find_prompt() == 'R1>' and conn.base_prompt == 'R1'
+    conn = connect_to(lab, 'MOCK-R1')
+    assert conn.find_prompt() == 'MOCK-R1>' and conn.base_prompt == 'MOCK-R1'
     conn.enable()
-    assert conn.find_prompt() == 'R1#'
+    assert conn.find_prompt() == 'MOCK-R1#'
     running = conn.send_command('show running-config')
-    assert 'hostname R1' in running and running.rstrip().endswith('end')
+    assert 'hostname MOCK-R1' in running and running.rstrip().endswith('end')
     assert '[OK]' not in running
     conn.config_mode()
     assert conn.check_config_mode()
@@ -225,7 +225,7 @@ def test_real_netmiko_workflow(lab):
         conn.send_command('show running-config | include ip route')
     assert '[OK]' in conn.save_config()
     conn.disconnect()
-    assert lab.devices['R1'].saves == 1 and 'ntp server 192.168.10.5' in lab.devices['R1'].startup
+    assert lab.devices['MOCK-R1'].saves == 1 and 'ntp server 192.168.10.5' in lab.devices['MOCK-R1'].startup
 
 
 def test_invalid_command_comes_back_through_netmiko(lab):
@@ -258,8 +258,8 @@ def test_hostname_change_then_save_reproduces_the_stale_prompt_issue(lab):
 
 def test_privilege_15_scan_account_lands_in_enable_mode(lab):
     shared = CONFIG['shared_scan_account']
-    conn = connect_to(lab, 'R1', user=shared['username'], password=shared['password'])
-    assert conn.find_prompt() == 'R1#'
+    conn = connect_to(lab, 'MOCK-R1', user=shared['username'], password=shared['password'])
+    assert conn.find_prompt() == 'MOCK-R1#'
     conn.disconnect()
 
 
@@ -281,7 +281,7 @@ def test_start_refuses_an_address_that_is_taken(key_path):
     port = other.getsockname()[1]
     try:
         lab = Lab(CONFIG, key_path=key_path,
-                  overrides={'R1': ('127.0.0.1', 0), 'SW1': ('127.0.0.1', port),
+                  overrides={'MOCK-R1': ('127.0.0.1', 0), 'SW1': ('127.0.0.1', port),
                              'SW2': ('127.0.0.1', 0)})
         with pytest.raises(LabError, match='already in use'):
             lab.start()
@@ -345,6 +345,23 @@ def creds(name, password=None):
             'password': password or SPEC[name]['password']}
 
 
+def test_apply_refused_below_privilege_15_over_real_ssh(route, tmp_path):
+    """MOCK-R1 starts in user mode; with a wrong (synthetic) enable secret the session stays
+    at privilege 1. NetCommand must stop before reading a backup or sending anything."""
+    from config import connect
+    lab = route
+    before = lab.devices['MOCK-R1'].running_config()
+    login = dict(creds('MOCK-R1'), secret='Synthetic-wrong-enable')
+    ok, msg = connect.apply_config(login, ['hostname SHOULD-NOT-APPLY'], [],
+                                   backup_dir=str(tmp_path))
+    assert ok is False
+    assert 'privilege level 1' in msg and 'Privilege level 15 is required' in msg
+    assert 'No configuration command was sent' in msg
+    assert list(tmp_path.iterdir()) == []                       # no backup file
+    assert lab.devices['MOCK-R1'].running_config() == before    # device unchanged
+    assert lab.devices['MOCK-R1'].saves == 0
+
+
 def test_apply_config_backup_verify_save(route, tmp_path):
     from config import commands_switch, connect
     lab = route
@@ -357,8 +374,11 @@ def test_apply_config_backup_verify_save(route, tmp_path):
                                    log=lambda k, t: log.append((k, t)))
     assert ok, msg
     (backup,) = tmp_path.iterdir()
-    assert backup.name.startswith('127.0.0.12_')
-    assert backup.read_text(encoding='utf-8').strip() == before.strip()        # the OLD config
+    assert backup.name.startswith('127.0.0.12_') and backup.suffix == '.ncbak'
+    from config.connect import KEY_SOURCE                       # the tests' synthetic key
+    plaintext, header = KEY_SOURCE.decrypt(backup)
+    assert plaintext.decode('utf-8').strip() == before.strip()                # the OLD config
+    assert header['host'] == '127.0.0.12' and header['privilege'] == 15
     dev = lab.devices['SW1']
     assert dev.saves == 1 and dev.vlans[30] == 'GUEST'
     assert all(dev.interfaces[f'FastEthernet0/{n}'].access_vlan == 30 for n in range(5, 9))
@@ -393,10 +413,10 @@ def test_router_settings_through_netcommand(route, tmp_path):
             'dns_servers': ['8.8.8.8'], 'ntp_server': '192.168.10.5'}
     cmds, checks = commands_router.build_commands(
         plan, ['Interfaces', 'Static routes', 'DHCP', 'DNS servers', 'NTP'])
-    lab.devices['R1'].interfaces['GigabitEthernet0/2'].connected = True     # cable plugged in
-    ok, msg = connect.apply_config(creds('R1'), cmds, checks, backup_dir=str(tmp_path))
+    lab.devices['MOCK-R1'].interfaces['GigabitEthernet0/2'].connected = True     # cable plugged in
+    ok, msg = connect.apply_config(creds('MOCK-R1'), cmds, checks, backup_dir=str(tmp_path))
     assert ok, msg
-    dev = lab.devices['R1']
+    dev = lab.devices['MOCK-R1']
     assert dev.saves == 1 and 'BRANCH' in dev.pools and dev.interfaces['GigabitEthernet0/2'].is_up()
     assert ('10.50.0.0', '255.255.0.0', '172.16.9.254') in dev.routes
 
@@ -442,11 +462,11 @@ def test_hostname_change_through_netcommand_is_reported_not_saved(route, tmp_pat
     lab = route
     cmds, checks = commands_router.build_commands({'hostname': 'BRANCH-RTR'}, ['Hostname'])
     log = []
-    ok, msg = connect.apply_config(creds('R1'), cmds, checks, backup_dir=str(tmp_path),
+    ok, msg = connect.apply_config(creds('MOCK-R1'), cmds, checks, backup_dir=str(tmp_path),
                                    log=lambda k, t: log.append((k, t)))
     assert not ok and 'ReadTimeout' in msg
     assert any(k == 'ok' and 'hostname BRANCH-RTR' in t for k, t in log)   # the check passed
-    assert lab.devices['R1'].hostname == 'BRANCH-RTR' and lab.devices['R1'].saves == 0
+    assert lab.devices['MOCK-R1'].hostname == 'BRANCH-RTR' and lab.devices['MOCK-R1'].saves == 0
 
 
 def test_discovery_finds_the_lab(route):
@@ -455,13 +475,13 @@ def test_discovery_finds_the_lab(route):
     devices, links = crawler.discover(shared['username'], shared['password'], '127.0.0.11',
                                     login_neighbours=True)
     assert {(d['name'], d['ip'], d['type'], d['managed']) for d in devices} == {
-        ('R1', '127.0.0.11', 'router', True), ('SW1', '127.0.0.12', 'switch', True),
+        ('MOCK-R1', '127.0.0.11', 'router', True), ('SW1', '127.0.0.12', 'switch', True),
         ('SW2', '127.0.0.13', 'switch', True)}
-    assert set(links) == {('R1', 'Gi0/1', 'SW1', 'Gi0/1'), ('SW1', 'Gi0/2', 'SW2', 'Gi0/1')}
+    assert set(links) == {('MOCK-R1', 'Gi0/1', 'SW1', 'Gi0/1'), ('SW1', 'Gi0/2', 'SW2', 'Gi0/1')}
 
 
 def test_default_discovery_logs_in_to_the_seed_only(route, monkeypatch):
-    """Real Netmiko + Paramiko, strict SSH options: R1 is logged in to; its CDP neighbour
+    """Real Netmiko + Paramiko, strict SSH options: MOCK-R1 is logged in to; its CDP neighbour
     SW1 is listed but never receives the login."""
     from discovery import crawler
     logins = []
@@ -470,5 +490,5 @@ def test_default_discovery_logs_in_to_the_seed_only(route, monkeypatch):
     shared = CONFIG['shared_scan_account']
     devices, links = crawler.discover(shared['username'], shared['password'], '127.0.0.11')
     assert logins == ['127.0.0.11']
-    assert {(d['name'], d['managed']) for d in devices} == {('R1', True), ('SW1', False)}
-    assert set(links) == {('R1', 'Gi0/1', 'SW1', 'Gi0/1')}
+    assert {(d['name'], d['managed']) for d in devices} == {('MOCK-R1', True), ('SW1', False)}
+    assert set(links) == {('MOCK-R1', 'Gi0/1', 'SW1', 'Gi0/1')}

@@ -14,7 +14,8 @@ that is skipped, with the reason. Nothing is sent until Apply is clicked.
 
 Apply runs in a background thread (the window never freezes) and configures the
 devices one after the other through config.multi.run_devices, which calls
-apply_config for each: every device gets its own backup, checks and save. The
+apply_config for each: every device gets its own encrypted backup (.ncbak; the backup
+key is checked before anything starts), checks and save. The
 SSH session console shows each device's real commands and replies; the worker
 thread only posts into queues, and only the window's own thread touches widgets.
 
@@ -138,6 +139,9 @@ class ConfigureTab(ttk.Frame):
         self._pending_saves = {}                  # device id -> (user, password) to save if accepted
         self._cred_source = {}                    # device id -> 'saved' / 'typed' (this Apply)
         self.apply_fn = connect.apply_config      # tests replace this with a fake
+        # Before any login is asked for or any SSH session opened: is the backup encryption
+        # key usable? (None, or why not.) Without it nothing is sent to any device.
+        self.backup_preflight = connect.backup_key_problem
         self.results = queue.Queue()
         self.busy = False
         self.devices = []                         # managed devices offered in the picker
@@ -706,8 +710,8 @@ class ConfigureTab(ttk.Frame):
         lines = [(f'# {label} for {len(targets)} device{"" if len(targets) == 1 else "s"}: '
                   f'{", ".join(features)}', 'comment')]
         if len(targets) > 1:
-            lines.append(('# Every device gets the same commands, its own backup, its own '
-                          'checks, and is saved only if its checks pass.', 'comment'))
+            lines.append(('# Every device gets the same commands, its own encrypted backup, its '
+                          'own checks, and is saved only if its checks pass.', 'comment'))
             lines.append(('# Edit a section to change what one device receives.', 'comment'))
         for d, why in skipped:
             lines.append((f"# SKIPPED  {d['name']}  {d['ip']}  {d['type']}: {why}", 'skipped'))
@@ -830,8 +834,8 @@ class ConfigureTab(ttk.Frame):
         if len(jobs) == 1 and not left_out:
             d = jobs[0]['device']
             text = (f"Send {len(jobs[0]['commands'])} commands to {d['name']} ({d['ip']})?\n\n"
-                    f"A backup of its configuration is saved first, and the result is "
-                    f"checked afterwards.")
+                    f"An encrypted backup of its configuration (.ncbak) is saved and "
+                    f"verified first, and the result is checked afterwards.")
         else:
             text = f'Configure {len(jobs)} device(s), one after the other:\n'
             text += ''.join(f"\n   {j['device']['name']}  ({j['device']['ip']})  -  "
@@ -842,7 +846,8 @@ class ConfigureTab(ttk.Frame):
                 text += ''.join(f"\n   {d['name']}: "
                                 f"{multi.incompatibility(d, kind) or 'not in the preview'}"
                                 for d in left_out)
-            text += ('\n\nEach device: backup first, then the commands, then its checks; it is '
+            text += ('\n\nEach device: encrypted backup first, then the commands, then its '
+                     'checks; it is '
                      'saved only if its own checks pass. If a device rejects a command, the '
                      'devices after it are not started.')
         edited = [j['device']['name'] for j in jobs if j['edited']]
@@ -909,6 +914,15 @@ class ConfigureTab(ttk.Frame):
             return
         if not database_ready(self):        # logins and the result log live in the database
             return
+        key_problem = self.backup_preflight()
+        if key_problem:                     # no encrypted backup possible: nothing may be sent
+            self.status.config(text='Apply not started: the backup encryption key is not '
+                                    'available. Nothing was sent.')
+            messagebox.showerror('Backup encryption key not available',
+                                 f'{key_problem}\n\nEvery device gets an encrypted backup before '
+                                 f'any change, so nothing was sent to any device. Set up the key '
+                                 f'with backup_keys.py (see docs/BACKUP_ENCRYPTION.md).')
+            return
         if not messagebox.askyesno('Apply to devices' if len(jobs) > 1 else 'Apply to device',
                                    self._confirm_text(jobs)):
             return
@@ -963,7 +977,8 @@ class ConfigureTab(ttk.Frame):
             results = multi.run_devices(
                 jobs, self.apply_fn, post=self.session.post,
                 on_result=lambda r: self.results.put(('device', r)),
-                stop=self._stop, stop_on_failure=stop_on_failure)
+                stop=self._stop, stop_on_failure=stop_on_failure,
+                preflight=self.backup_preflight)
         except Exception as err:                       # a bug, not a device problem
             self.session.post('error', f'Error: {type(err).__name__}: {err}')
             results = None

@@ -86,7 +86,7 @@ class OperationsConsole(tk.Frame):
         holder = tk.Frame(parent, background=theme.SURFACE)
         text = tk.Text(holder, height=6, wrap='none', font=theme.mono(theme.CONSOLE_SIZE),
                        relief='flat',
-                       background='#FAFAF8', foreground=theme.TEXT, padx=10, pady=6,
+                       background=theme.CARD, foreground=theme.TEXT, padx=10, pady=6,
                        borderwidth=0, highlightthickness=0, state='disabled', cursor='arrow')
         scroll = ttk.Scrollbar(holder, orient='vertical', command=text.yview)
         text.configure(yscrollcommand=scroll.set)

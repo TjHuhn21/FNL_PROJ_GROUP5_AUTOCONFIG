@@ -2,7 +2,10 @@
 
 check_runtime_grants(): problems if the RUNTIME account could change or remove audit
 history (UPDATE, DELETE, DROP, ALTER, TRIGGER, or ALL on audit_log, its database or every
-database), or create/drop tables. can_see_triggers(): whether an account may read
+database), change or remove the append-only shared records (app_status_events,
+app_config_logs, app_job_events, app_device_backups: the same privileges), delete, drop or
+alter any other shared application table (app_*: soft delete and snapshot replacement
+need no DELETE), or create/drop tables. can_see_triggers(): whether an account may read
 information_schema.TRIGGERS rows for audit_log (MySQL hides them without TRIGGER).
 
 Roles granted to an account are reported but not expanded (their privileges are unknown
@@ -14,6 +17,15 @@ _GRANT = re.compile(r'^GRANT\s+(?P<privs>.+?)\s+ON\s+(?P<scope>\S+)\s+TO\s+', re
 _ROLE_GRANT = re.compile(r'^GRANT\s+(?!.+\s+ON\s+)(?P<roles>.+?)\s+TO\s+', re.I | re.S)
 AUDIT_DANGEROUS = ('ALL', 'ALL PRIVILEGES', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'TRIGGER')
 SCHEMA_DANGEROUS = ('CREATE', 'DROP', 'ALTER')
+# Shared application tables (Phase C, migrations 2-4). Append-only ones: like audit_log,
+# the runtime account may only read and add rows. The others: no DELETE/DROP/ALTER (devices
+# are soft-deleted, findings superseded, locks released by UPDATE).
+APPEND_ONLY_TABLES = ('app_status_events', 'app_config_logs', 'app_job_events',
+                      'app_device_backups')
+SHARED_TABLES = ('app_devices', 'app_device_credentials', 'app_links', 'app_findings',
+                 'app_status_events', 'app_config_logs', 'app_jobs', 'app_job_devices',
+                 'app_job_events', 'app_device_locks', 'app_device_backups')
+SHARED_DANGEROUS = ('ALL', 'ALL PRIVILEGES', 'DELETE', 'DROP', 'ALTER', 'TRIGGER')
 
 
 def _name(part):
@@ -79,6 +91,18 @@ def check_runtime_grants(lines, database):
             if bad:
                 problems.append(f'{", ".join(bad)} on {"*.*" if db == "*" else db + ".*"} '
                                 f'lets it create or drop tables')
+            bad = sorted(p for p in privs if p in SHARED_DANGEROUS)
+            if bad:
+                problems.append(f'{", ".join(bad)} on {"*.*" if db == "*" else db + ".*"} '
+                                f'would let it delete or alter shared application records')
+        elif _applies(db, table, database) and table.lower() in SHARED_TABLES:
+            name = table.lower()
+            dangerous = AUDIT_DANGEROUS if name in APPEND_ONLY_TABLES else SHARED_DANGEROUS
+            bad = sorted(p for p in privs if p in dangerous)
+            if bad:
+                kind = ('change or remove append-only records' if name in APPEND_ONLY_TABLES
+                        else 'delete or alter shared application records')
+                problems.append(f'{", ".join(bad)} on {db}.{table} would let it {kind}')
     if roles:
         problems.append('roles are granted (' + ', '.join(roles) + '); their privileges cannot '
                         'be confirmed here')
@@ -102,6 +126,19 @@ RUNTIME_GRANTS = (
     ('sessions', ('SELECT', 'INSERT', 'UPDATE')),
     ('audit_log', ('SELECT', 'INSERT')),                 # append-only: no UPDATE, no DELETE
     ('schema_migrations', ('SELECT',)),
+    # Shared application data (migrations 2-4). Still no DELETE anywhere: devices are
+    # soft-deleted, findings superseded, locks released and jobs finished by UPDATE.
+    ('app_devices', ('SELECT', 'INSERT', 'UPDATE')),
+    ('app_device_credentials', ('SELECT', 'INSERT', 'UPDATE')),
+    ('app_links', ('SELECT', 'INSERT', 'UPDATE')),       # UPDATE: names follow a rename
+    ('app_findings', ('SELECT', 'INSERT', 'UPDATE')),    # UPDATE: superseded_at only
+    ('app_status_events', ('SELECT', 'INSERT')),         # append-only
+    ('app_config_logs', ('SELECT', 'INSERT')),           # append-only
+    ('app_jobs', ('SELECT', 'INSERT', 'UPDATE')),
+    ('app_job_devices', ('SELECT', 'INSERT', 'UPDATE')),
+    ('app_job_events', ('SELECT', 'INSERT')),            # append-only
+    ('app_device_locks', ('SELECT', 'INSERT', 'UPDATE')),
+    ('app_device_backups', ('SELECT', 'INSERT')),        # append-only
 )
 MIGRATION_GRANTS = (
     ('schema_migrations', ('SELECT', 'INSERT', 'DELETE', 'CREATE')),
@@ -109,6 +146,19 @@ MIGRATION_GRANTS = (
     ('email_challenges', ('SELECT', 'CREATE', 'DROP')),
     ('sessions', ('SELECT', 'CREATE', 'DROP')),
     ('audit_log', ('SELECT', 'CREATE')),                 # deliberately NO DROP (see below)
+    # Shared application tables. REFERENCES only on the tables other tables point to
+    # (MySQL needs it on the PARENT table to create a foreign key).
+    ('app_devices', ('SELECT', 'CREATE', 'DROP', 'REFERENCES')),
+    ('app_device_credentials', ('SELECT', 'CREATE', 'DROP')),
+    ('app_links', ('SELECT', 'CREATE', 'DROP')),
+    ('app_findings', ('SELECT', 'CREATE', 'DROP')),
+    ('app_status_events', ('SELECT', 'CREATE', 'DROP')),
+    ('app_config_logs', ('SELECT', 'CREATE', 'DROP')),
+    ('app_jobs', ('SELECT', 'CREATE', 'DROP', 'REFERENCES')),
+    ('app_job_devices', ('SELECT', 'CREATE', 'DROP')),
+    ('app_job_events', ('SELECT', 'CREATE', 'DROP')),
+    ('app_device_locks', ('SELECT', 'CREATE', 'DROP')),
+    ('app_device_backups', ('SELECT', 'CREATE', 'DROP')),
 )
 # Never granted to the migration or runtime account: done by an administrator only.
 # Dropping audit_log destroys audit history (DROP and TRUNCATE bypass the triggers), so a
@@ -152,7 +202,8 @@ def recommended_grants_sql(database):
               '-- account drop them; leave it out to verify as an administrator instead.',
               f"-- GRANT TRIGGER ON `{database}`.`audit_log` TO {MIGRATION_ACCOUNT};",
               '', '-- 2) RUNTIME account: what the backend uses. Run AFTER `migrate up` (table',
-              '--    grants need the tables). No DELETE anywhere; audit_log is append-only.',
+              '--    grants need the tables). No DELETE anywhere; audit_log and the app_ event,',
+              '--    log and backup tables are append-only.',
               f"CREATE USER {RUNTIME_ACCOUNT} IDENTIFIED BY '<chosen by the DBA>';"]
     lines += grant_statements(RUNTIME_GRANTS, database, RUNTIME_ACCOUNT)
     return '\n'.join(lines)

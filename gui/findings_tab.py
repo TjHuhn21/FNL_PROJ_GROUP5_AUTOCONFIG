@@ -76,7 +76,7 @@ class FindingsTab(ttk.Frame):
         self.stored_btn.pack(side='right', padx=4)
         self.score = ttk.Label(self, text='Health score: -', font=theme.FONT_BOLD)
         self.score.pack(anchor='w', pady=(theme.PAD, 0))
-        self.note = ttk.Label(self, text='Click Run review.', foreground='#555',
+        self.note = ttk.Label(self, text='Click Run review.', foreground=theme.TEXT_SOFT,
                               wraplength=900, justify='left')
         self.note.pack(anchor='w')
 
@@ -91,7 +91,7 @@ class FindingsTab(ttk.Frame):
             self.tree.tag_configure(sev, background=color)
         self.tree.pack(fill='both', expand=True, pady=theme.PAD)
         self.tree.bind('<<TreeviewSelect>>', lambda e: self.show_fix())
-        self.fix = ttk.Label(self, text='', foreground='#333', justify='left')
+        self.fix = ttk.Label(self, text='', foreground=theme.TEXT, justify='left')
         self.fix.pack(anchor='w')
         bar = ttk.Frame(self); bar.pack(fill='x', pady=(theme.PAD, 0))
         self.send_btn = ttk.Button(bar, text='Send to Configure', command=self.send_selected)
@@ -110,7 +110,7 @@ class FindingsTab(ttk.Frame):
         self.busy = True
         self.run_btn.state(['disabled'])
         self.stored_btn.state(['disabled'])
-        self.note.config(text=text, style='TLabel', foreground='#555')
+        self.note.config(text=text, style='TLabel', foreground=theme.TEXT_SOFT)
         # The thread gets only plain values and the queue, never self or a widget.
         threading.Thread(target=target, args=args + (self.results,), daemon=True).start()
         self.after(POLL_MS, self.check_queue)
@@ -148,7 +148,7 @@ class FindingsTab(ttk.Frame):
         if self.view in (None, 'stored', 'error', 'empty'):
             self.load_stored()
         elif self.findings:
-            self.note.config(text=self.view_label, style='TLabel', foreground='#555')
+            self.note.config(text=self.view_label, style='TLabel', foreground=theme.TEXT_SOFT)
 
     # ---------------------------------------------------------------- results (main thread)
     def check_queue(self):
@@ -210,7 +210,7 @@ class FindingsTab(ttk.Frame):
         self._fill([])
         self.view, self.view_label = 'empty', ''
         self.score.config(text='Health score: -   (no registered devices)')
-        self.note.config(text=EMPTY_MESSAGE, style='TLabel', foreground='#555')
+        self.note.config(text=EMPTY_MESSAGE, style='TLabel', foreground=theme.TEXT_SOFT)
 
     def show(self, findings, score, notes=(), source='', saved=None, save_error=None):
         """A review completed just now. saved: store.replace_findings' result, or None
@@ -246,7 +246,7 @@ class FindingsTab(ttk.Frame):
             self.note.config(text=full, style='Sample.TLabel', foreground=theme.SAMPLE_COLOR)
         else:
             self.note.config(text=full, style='TLabel',
-                             foreground=theme.DANGER if save_error is not None else '#555')
+                             foreground=theme.DANGER if save_error is not None else theme.TEXT_SOFT)
 
     def show_stored(self, snapshot):
         """The stored review (snapshot from the database)."""
@@ -255,7 +255,7 @@ class FindingsTab(ttk.Frame):
         if not found:
             self.view, self.view_label = 'stored', ''
             self.score.config(text='Health score: -   (no stored findings)')
-            self.note.config(text=NO_STORED_MESSAGE, style='TLabel', foreground='#555')
+            self.note.config(text=NO_STORED_MESSAGE, style='TLabel', foreground=theme.TEXT_SOFT)
             return
         score = max(0, 100 - sum(POINTS[f['severity']] for f in found))
         when = snapshot['saved_at'].strftime('%Y-%m-%d %H:%M') if snapshot['saved_at'] else '?'
@@ -268,7 +268,7 @@ class FindingsTab(ttk.Frame):
         if gone:
             text += ' Devices deleted since: ' + ', '.join(gone) + '.'
         self.view, self.view_label = 'stored', text
-        self.note.config(text=text, style='TLabel', foreground='#555')
+        self.note.config(text=text, style='TLabel', foreground=theme.TEXT_SOFT)
 
     # ---------------------------------------------------------------- selection
     def selected(self):

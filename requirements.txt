@@ -2,7 +2,8 @@
 # (Windows). Install with the backend's file too:
 #   .\venv\Scripts\python.exe -m pip install -r requirements.txt -r backend\requirements.txt
 netmiko==4.8.0
-paramiko==4.0.0          # 4.x on purpose: 5.x removed SHA-1 key exchange and ssh-rsa (older Cisco IOS)
+pyserial==3.5           # console (COM port) access; Netmiko's cisco_ios_serial driver uses it
+paramiko==4.0.0         # 4.x on purpose: 5.x removed SHA-1 key exchange and ssh-rsa (older Cisco IOS)
 PyMySQL==1.2.4
 python-dotenv==1.2.4     # the same version as backend/requirements.txt
 cryptography==50.0.2

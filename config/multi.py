@@ -8,7 +8,7 @@ call them directly with fake devices.
     print(summary_text(results))
 
 Every device goes through config.connect.apply_config on its own, so every
-device gets its own backup, its own checks, and is saved only when its own
+device gets its own encrypted backup, its own checks, and is saved only when its own
 checks pass. One failure never changes another device's result.
 """
 import inspect
@@ -81,8 +81,13 @@ def _accepts_log(fn):
     return any(p.name == 'log' or p.kind == p.VAR_KEYWORD for p in params)
 
 
-def run_devices(jobs, apply_fn, post=None, on_result=None, stop=None, stop_on_failure=False):
+def run_devices(jobs, apply_fn, post=None, on_result=None, stop=None, stop_on_failure=False,
+                preflight=None):
     """Configure the devices one after the other.
+
+    preflight: called ONCE before the first device (for example the backup encryption
+    key check, config.connect.backup_key_problem). It returns None, or a reason: then no
+    device is contacted at all and every device is NOT RUN with that reason.
 
     jobs:      [{'device': {...}, 'creds': {...}, 'commands': [...], 'checks': [...]}]
     apply_fn:  apply_config(creds, commands, checks[, log=])  (a fake in the tests)
@@ -98,6 +103,14 @@ def run_devices(jobs, apply_fn, post=None, on_result=None, stop=None, stop_on_fa
     post = post or (lambda *a: None)
     live = _accepts_log(apply_fn)
     results, halt = [], None
+    if preflight is not None and jobs:
+        try:
+            problem = preflight()
+        except Exception as err:                    # a failing check never lets devices run
+            problem = f'the check before the first device failed ({type(err).__name__})'
+        if problem:
+            halt = f'{str(problem).rstrip(".")}. No device was contacted.'
+            post('error', f'NOT STARTED: {halt}')
     for i, job in enumerate(jobs):
         d = job['device']
         if halt is None and stop is not None and stop.is_set():

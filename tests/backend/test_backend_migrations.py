@@ -23,7 +23,12 @@ from backend.settings import parse_settings
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATE_SECRET = 'Migrate-Account-Secret-6612'
-EXPECTED = MIGRATIONS[0].expected_columns()
+# The columns every migration creates (the fake database reports exactly these).
+EXPECTED = {t: c for m in MIGRATIONS for t, c in m.expected_columns().items()}
+# The authentication migration alone: the rollback/repair tests below are about its
+# rules (audit_log needs an administrator); the full chain 1-4 is tested in
+# test_backend_app_migrations.py.
+AUTH_ONLY = MIGRATIONS[:1]
 
 
 def trigger_rows(**override):
@@ -153,9 +158,9 @@ def runner(schema, migrations=MIGRATIONS):
     return MigrationRunner(schema, migrations, log=lines.append), lines
 
 
-def applied_schema(**kw):
+def applied_schema(migrations=MIGRATIONS, **kw):
     schema = FakeSchema(**kw)
-    runner(schema)[0].up()
+    runner(schema, migrations)[0].up()
     schema.executed.clear()
     schema.events.clear()
     return schema
@@ -168,7 +173,7 @@ def app_statements(schema):
 # ================================================================ definitions
 def test_migration_definitions_are_valid_and_ordered():
     check_definitions()
-    assert [m.version for m in MIGRATIONS] == [1]
+    assert [m.version for m in MIGRATIONS] == [1, 2, 3, 4]
     assert MIGRATIONS[0].tables == ('users', 'email_challenges', 'sessions', 'audit_log')
 
 
@@ -261,7 +266,7 @@ def test_trigger_verification():
 def test_up_creates_tables_only_and_says_audit_is_not_yet_protected():
     schema = FakeSchema()
     r, log = runner(schema)
-    assert r.up() == [1]
+    assert r.up() == [1, 2, 3, 4]
     assert {'users', 'email_challenges', 'sessions', 'audit_log', TRACKING_TABLE} <= schema.tables_
     assert set(APP_TABLES) <= schema.tables_ and app_statements(schema) == []
     assert not any('TRIGGER' in s.upper() for s in schema.executed)
@@ -288,7 +293,7 @@ def test_status_reports_protected_only_when_both_triggers_are_verified():
 def test_up_twice_does_nothing_the_second_time_and_dry_run_changes_nothing():
     schema = FakeSchema()
     r, log = runner(schema)
-    assert r.up(dry_run=True) == [1] and schema.executed == []
+    assert r.up(dry_run=True) == [1, 2, 3, 4] and schema.executed == []
     r.up()
     count = len(schema.executed)
     assert r.up() == [] and len(schema.executed) == count
@@ -351,7 +356,7 @@ def test_a_failure_part_way_is_reported_honestly_and_can_be_repaired():
     assert r.down_partial(1) == [1]
     assert not (set(M1.TABLES) & schema.tables_) and set(APP_TABLES) <= schema.tables_
     assert ('lock', ('users', 'email_challenges')) in schema.events      # locked while dropped
-    assert r.up() == [1] and r.status().problems == []
+    assert r.up() == [1, 2, 3, 4] and r.status().problems == []
 
 
 def test_lost_connection_is_reported_as_uncertain():
@@ -451,8 +456,8 @@ def test_migration_account_cannot_drop_audit_log():
 
 
 def test_full_rollback_continues_after_the_administrator_removes_audit_log():
-    schema = applied_schema()
-    r, _ = runner(schema)
+    schema = applied_schema(AUTH_ONLY)
+    r, _ = runner(schema, AUTH_ONLY)
     with pytest.raises(MigrationError):
         r.down(0)
     schema.admin_drop('audit_log')
@@ -471,10 +476,10 @@ def test_full_rollback_continues_after_the_administrator_removes_audit_log():
 def test_a_write_just_before_the_lock_is_seen_and_stops_the_drop():
     """The emptiness check happens UNDER the table lock: a row written by a running backend
     after `status` but before the lock is counted, and nothing is dropped."""
-    schema = applied_schema()
+    schema = applied_schema(AUTH_ONLY)
     schema.admin_drop('audit_log')
     schema.on_lock_tables = lambda: schema.rows.update(sessions=1)
-    r, _ = runner(schema)
+    r, _ = runner(schema, AUTH_ONLY)
     with pytest.raises(MigrationError) as err:
         r.down(0)
     assert 'sessions: it holds 1 rows' in str(err.value)
@@ -482,9 +487,9 @@ def test_a_write_just_before_the_lock_is_seen_and_stops_the_drop():
 
 
 def test_down_refuses_to_lose_data():
-    schema = applied_schema()
+    schema = applied_schema(AUTH_ONLY)
     schema.admin_drop('audit_log')
-    r, _ = runner(schema)
+    r, _ = runner(schema, AUTH_ONLY)
     schema.rows['users'] = 3
     with pytest.raises(MigrationError) as err:
         r.down(0)
@@ -503,10 +508,10 @@ def test_audit_history_is_never_dropped_by_the_tool_even_with_both_flags():
 
 
 def test_failed_bookkeeping_after_drops_is_finished_by_running_down_again():
-    schema = applied_schema()
+    schema = applied_schema(AUTH_ONLY)
     schema.admin_drop('audit_log')
     schema.forget_error = BackendDatabaseUnavailable('lost')
-    r, _ = runner(schema)
+    r, _ = runner(schema, AUTH_ONLY)
     with pytest.raises(MigrationError) as err:
         r.down(0)
     assert 'Run the same `down` command again' in str(err.value)
@@ -522,10 +527,10 @@ def test_failed_bookkeeping_after_drops_is_finished_by_running_down_again():
 
 
 def test_rollback_interrupted_mid_drop_is_finished_by_running_it_again():
-    schema = applied_schema()
+    schema = applied_schema(AUTH_ONLY)
     schema.admin_drop('audit_log')
     schema.fail_at = 2                                             # email_challenges drop fails
-    r, _ = runner(schema)
+    r, _ = runner(schema, AUTH_ONLY)
     with pytest.raises(MigrationError) as err:
         r.down(0)
     assert 'Running the same command again finishes it' in str(err.value)
@@ -566,7 +571,7 @@ def test_partial_repair_after_audit_log_was_created_needs_the_administrator():
     assert schema.executed == REMAINING_DROPS
     assert not (set(M1.TABLES) & schema.tables_) and r.status().problems == []
     del schema.record                                # the instance override; the class method returns
-    assert r.up() == [1]
+    assert r.up() == [1, 2, 3, 4]
 
 
 def test_cli_rollback_explains_the_administrator_step():

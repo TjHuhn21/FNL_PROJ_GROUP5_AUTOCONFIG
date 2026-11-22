@@ -28,7 +28,10 @@ PERMISSIONS = {
     'admin': _OPERATOR | {MANAGE_ACCOUNTS},                       # + account management
 }
 # Pages that need a permission (others need only VIEW).
-PAGE_PERMISSIONS = {'scan': SCAN, 'configure': CONFIGURE, 'accounts': MANAGE_ACCOUNTS}
+# Initial Setup ('setup') talks to devices over the console and will configure them in a
+# later phase, so it needs the same permission as Configure.
+PAGE_PERMISSIONS = {'scan': SCAN, 'configure': CONFIGURE, 'setup': CONFIGURE,
+                    'accounts': MANAGE_ACCOUNTS}
 ROLE_TITLES = {'viewer': 'Viewer', 'operator': 'Operator', 'admin': 'Admin'}
 
 

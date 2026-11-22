@@ -7,11 +7,13 @@ from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutExc
 from config import connect
 
 CREDS = {'host': '10.0.0.2', 'username': 'admin', 'password': 'S3cretPass!'}
+# What a Cisco switch returns for show running-config (it always ends with "end").
+RUNNING = 'Building configuration...\n\nCurrent configuration : 30 bytes\n!\nhostname SW1\n!\nend\n'
 
 
 class FakeIOS:
     """Behaves like a Netmiko connection to a Cisco switch named SW1."""
-    def __init__(self, reject=(), shows=None, start_prompt='SW1#', running='hostname SW1\n'):
+    def __init__(self, reject=(), shows=None, start_prompt='SW1#', running=RUNNING):
         self.reject = set(reject)
         self.shows = shows or {}
         self.prompt = start_prompt
@@ -27,6 +29,8 @@ class FakeIOS:
     def send_command(self, cmd):
         if cmd == 'show running-config':
             return self.running
+        if cmd == 'show privilege' and cmd not in self.shows:
+            return 'Current privilege level is 15'           # as a privileged IOS session
         return self.shows.get(cmd, '')
 
     def config_mode(self):
@@ -83,7 +87,7 @@ def test_success_shows_every_stage_command_and_reply(monkeypatch, tmp_path):
     assert 'SW1# write mem' in commands
     assert any(k == 'output' and 'STAFF' in t for k, t in log)          # real reply shown
     assert any(k == 'output' and '[OK]' in t for k, t in log)           # save reply shown
-    assert any(k == 'ok' and 'Backup saved' in t for k, t in log)
+    assert any(k == 'ok' and 'Encrypted backup saved and verified' in t for k, t in log)
     assert any(k == 'ok' and t.startswith('SUCCESS') for k, t in log)
 
 
@@ -149,8 +153,8 @@ def test_timeout_in_the_middle_of_the_session(monkeypatch, tmp_path):
 
 
 def test_credentials_never_appear_in_the_log(monkeypatch, tmp_path):
-    fake = FakeIOS(start_prompt='SW1>', running='enable secret 5 $1$abc$XYZ\nusername admin '
-                                                 'password 0 S3cretPass!\n')
+    fake = FakeIOS(start_prompt='SW1>', running='hostname SW1\nenable secret 5 $1$abc$XYZ\n'
+                                                 'username admin password 0 S3cretPass!\nend\n')
     fake.netcommand_enabled = True
     ok, msg, log = run(monkeypatch, tmp_path, fake,
                        ['username backup secret Hidden123', 'snmp-server community Pub123 RO'])
@@ -172,16 +176,18 @@ def test_a_broken_log_callback_does_not_break_the_session(monkeypatch, tmp_path)
     assert ok and fake.saved
 
 
-def test_long_backup_is_shortened_in_the_console_but_complete_on_disk(monkeypatch, tmp_path):
-    running = ''.join(f'line {i}\n' for i in range(200))
+def test_long_backup_is_shortened_in_the_console_but_complete_on_disk(monkeypatch, tmp_path,
+                                                                      synthetic_backup_key):
+    running = ''.join(f'line {i}\n' for i in range(200)) + 'hostname SW1\nend\n'
     fake = FakeIOS(running=running)
     ok, msg, log = run(monkeypatch, tmp_path, fake, ['vlan 10'])
     assert ok
     backup_out = [t for k, t in log if k == 'output' and 'line 0' in t][0]
     assert 'line 24' in backup_out and 'line 25' not in backup_out
-    assert any('175 more lines' in t for k, t in log if k == 'info')
+    assert any('177 more lines' in t for k, t in log if k == 'info')
     (file,) = list(tmp_path.iterdir())
-    assert file.read_text(encoding='utf-8') == running
+    assert file.suffix == '.ncbak'
+    assert synthetic_backup_key.decrypt(file)[0] == running.encode('utf-8')   # complete
 
 
 def test_split_reply_and_rejection_helpers():

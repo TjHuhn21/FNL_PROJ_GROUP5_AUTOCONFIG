@@ -159,15 +159,18 @@ def opener_returning(status, body, headers=None):
     return opener
 
 
-@pytest.mark.parametrize('error', [urllib.error.URLError('refused'), ConnectionRefusedError(),
-                                   TimeoutError(), OSError('down')])
-def test_unreachable_server(error):
+@pytest.mark.parametrize('error, message', [
+    (urllib.error.URLError('refused'), api_client.UNREACHABLE),
+    (ConnectionRefusedError(), api_client.REFUSED),           # Phase B: a more precise message
+    (TimeoutError(), api_client.TIMED_OUT),                   # Phase B: a more precise message
+    (OSError('down'), api_client.UNREACHABLE)])
+def test_unreachable_server(error, message):
     def opener(request, timeout=None):
         raise error
     client = AuthApiClient('http://127.0.0.1:8000', opener=opener)
     with pytest.raises(ApiUnavailable) as err:
         client.login('a@example.com', PASSWORD)
-    assert str(err.value) == api_client.UNREACHABLE and PASSWORD not in str(err.value)
+    assert str(err.value) == message and PASSWORD not in str(err.value)
 
 
 @pytest.mark.parametrize('status, body', [

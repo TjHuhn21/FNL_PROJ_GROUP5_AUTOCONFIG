@@ -231,29 +231,29 @@ class OverviewPage(tk.Frame):
 
     # ------------------------------------------------------------ building blocks
     def _card(self, parent, title):
-        frame = tk.Frame(parent, background=theme.SURFACE, highlightthickness=1,
+        frame = tk.Frame(parent, background=theme.CARD, highlightthickness=1,
                          highlightbackground=theme.BORDER, padx=14, pady=10)
-        tk.Label(frame, text=title, font=theme.mono(8, 'bold'), background=theme.SURFACE,
+        tk.Label(frame, text=title, font=theme.mono(8, 'bold'), background=theme.CARD,
                  foreground=theme.TEXT_MUTED, anchor='w').pack(fill='x')
         value = tk.Label(frame, text='—', font=(theme.FONT_FAMILY, 22, 'bold'),
-                         background=theme.SURFACE, foreground=theme.TEXT, anchor='w')
+                         background=theme.CARD, foreground=theme.TEXT, anchor='w')
         value.pack(fill='x')
-        detail = tk.Label(frame, text='', font=theme.FONT, background=theme.SURFACE,
+        detail = tk.Label(frame, text='', font=theme.FONT, background=theme.CARD,
                           foreground=theme.TEXT_SOFT, anchor='w', justify='left')
         detail.pack(fill='x')
-        note = tk.Label(frame, text='', font=theme.FONT_SMALL, background=theme.SURFACE,
+        note = tk.Label(frame, text='', font=theme.FONT_SMALL, background=theme.CARD,
                         foreground=theme.TEXT_MUTED, anchor='w', justify='left', wraplength=230)
         note.pack(fill='x', pady=(2, 0))
         return {'frame': frame, 'value': value, 'detail': detail, 'note': note}
 
     def _list(self, parent, title, columns):
-        frame = tk.Frame(parent, background=theme.SURFACE, highlightthickness=1,
+        frame = tk.Frame(parent, background=theme.CARD, highlightthickness=1,
                          highlightbackground=theme.BORDER)
         tk.Label(frame, text=title, font=theme.mono(8, 'bold'), background=theme.SURFACE_2,
-                 foreground=theme.TEXT_SOFT, anchor='w', padx=10, pady=5).pack(fill='x')
+                 foreground=theme.ACCENT, anchor='w', padx=10, pady=5).pack(fill='x')
         # the table and its own scroll bar (shown only when the rows do not fit); the
         # mouse wheel scrolls only the list under the pointer (bind_wheel)
-        holder = tk.Frame(frame, background=theme.SURFACE)
+        holder = tk.Frame(frame, background=theme.CARD)
         holder.grid_columnconfigure(0, weight=1)
         holder.grid_rowconfigure(0, weight=1)
         tree = ttk.Treeview(holder, columns=[c[0] for c in columns], show='headings',
@@ -267,7 +267,7 @@ class OverviewPage(tk.Frame):
         tree.tag_configure('failed', foreground=theme.DANGER)
         tree.tag_configure('down', foreground=theme.DANGER)
         tree.tag_configure('up', foreground=theme.SUCCESS)
-        empty = tk.Label(frame, text='', font=theme.FONT, background=theme.SURFACE,
+        empty = tk.Label(frame, text='', font=theme.FONT, background=theme.CARD,
                          foreground=theme.TEXT_MUTED, wraplength=280, justify='left', anchor='nw',
                          padx=10, pady=10)
         return {'frame': frame, 'tree': tree, 'empty': empty, 'holder': holder, 'bar': bar}

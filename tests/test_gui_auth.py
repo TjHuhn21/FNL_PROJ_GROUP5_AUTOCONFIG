@@ -271,6 +271,11 @@ def test_operator_can_scan_and_configure_but_not_manage_accounts(root, backend, 
 def test_admin_has_everything_plus_accounts(root, backend, monkeypatch):
     refs, _, signed_out = workbench(root, backend, 'admin', monkeypatch)
     assert refs['pages'][-1] == 'accounts' and 'scan' in refs['pages']
+    item = refs['nav'].items['accounts']
+    if item.icon is not None:                           # an icon font is installed
+        from gui.components import icons
+        assert item.icon.cget('text') == icons.glyph('accounts') != ''
+    assert item.text.cget('text') == 'Accounts'         # label unchanged
     refs['show_page']('accounts')
     assert refs['current_page']() == 'accounts'
     refs['sign_out_button'].invoke()

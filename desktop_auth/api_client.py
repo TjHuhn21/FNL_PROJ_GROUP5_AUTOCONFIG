@@ -1,30 +1,45 @@
 """HTTP client for the backend's sign-in and account API (urllib; no extra dependency).
 
-Where the API is (NETCOMMAND_API_URL, not a secret):
-  1. the NETCOMMAND_API_URL environment variable, when set;
-  2. otherwise the NETCOMMAND_API_URL line of the project's .env (only that line is used);
-  3. otherwise http://127.0.0.1:8000 (the backend's default address).
+Settings (none is a secret). Each is read from the environment variable, otherwise from
+that line of the project's .env (only that line is used):
+  NETCOMMAND_API_URL      where the API is; default http://127.0.0.1:8000.
+  NETCOMMAND_API_CA_FILE  for https:// only, and then REQUIRED: the server's certificate
+                          (server.crt from python -m backend.tls_cert). It is the ONLY
+                          certificate trusted for the connection (not the Windows store):
+                          the server's certificate is pinned. A relative path is relative
+                          to the project folder.
+  NETCOMMAND_API_ADDRESS  optional, https:// only: the IP address to connect to for the
+                          server name in the URL (for a phone hotspot whose addresses
+                          change, without editing the hosts file). The certificate is still
+                          checked against the NAME in the URL; nothing is relaxed.
 Plain http is accepted only for this computer (127.0.0.1, localhost, ::1): anywhere else
-the token would cross the network unencrypted, so https is required.
+the token would cross the network unencrypted, so https is required. An https:// URL is
+never retried over http.
 
 Safety rules kept here:
   * the token travels only in the Authorization: Bearer header, never in a URL;
   * redirects are refused (a redirect could carry the Authorization header elsewhere) and
     no proxy is used;
+  * certificate and host-name verification are always on, with TLS 1.2 or newer;
   * nothing is logged; errors carry the server's fixed message (short, one line) or a
-    fixed message of our own, never a password, code, token or response body.
+    fixed message of our own, never a password, code, token, path or response body.
 """
+import http.client
 import ipaddress
 import json
 import os
 import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 
 DEFAULT_API_URL = 'http://127.0.0.1:8000'
 API_URL_VARIABLE = 'NETCOMMAND_API_URL'
-ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+CA_FILE_VARIABLE = 'NETCOMMAND_API_CA_FILE'
+ADDRESS_VARIABLE = 'NETCOMMAND_API_ADDRESS'
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(PROJECT_DIR, '.env')
 TIMEOUT = 15                       # seconds per request (a login sends an email)
 MAX_RESPONSE_BYTES = 256 * 1024
 ROLES = ('viewer', 'operator', 'admin')
@@ -56,8 +71,36 @@ class BadResponse(ApiError):
     """The server answered something this client does not understand."""
 
 
+class ApiTlsError(ApiUnavailable):
+    """The secure connection was refused because the server's certificate is not the
+    trusted one, or not valid for the server name. Nothing was sent."""
+
+
 UNREACHABLE = 'The NetCommand server could not be reached. Check that it is running.'
 UNEXPECTED = 'The NetCommand server sent an unexpected answer.'
+REFUSED = ('The NetCommand server refused the connection: it is not running on that address '
+           'and port, or the server laptop\'s firewall blocks it.')
+TIMED_OUT = ('The NetCommand server did not answer in time. Check the network connection and '
+             'that both laptops are on the same network.')
+NAME_UNKNOWN = ('The NetCommand server name could not be found on this network. Set '
+                f'{ADDRESS_VARIABLE} to the server\'s current IP address, or add the name to the '
+                'hosts file (see docs/LAN_DEPLOYMENT.md).')
+UNTRUSTED = ('The NetCommand server\'s certificate is not the trusted one in '
+             f'{CA_FILE_VARIABLE}. Nothing was sent. Copy the current server.crt from the server '
+             'laptop (and compare its fingerprint) if the certificate was replaced.')
+MISMATCH = ('The NetCommand server\'s certificate is not valid for the server name in '
+            f'{API_URL_VARIABLE}. Nothing was sent. Use the name the certificate was made for '
+            '(not an IP address).')
+TLS_FAILED = ('A secure (HTTPS) connection to the NetCommand server could not be set up. Check '
+              'that the server runs with HTTPS on that port. Nothing was sent.')
+CERT_NOT_CONFIGURED = (f'{API_URL_VARIABLE} uses https://, so {CA_FILE_VARIABLE} must name the '
+                       'server\'s certificate file (server.crt from the server laptop).')
+CERT_MISSING = f'The certificate file named by {CA_FILE_VARIABLE} was not found.'
+CERT_INVALID = (f'The file named by {CA_FILE_VARIABLE} is not a valid certificate (PEM). Copy '
+                'server.crt again from the server laptop.')
+CERT_HAS_KEY = (f'The file named by {CA_FILE_VARIABLE} contains a PRIVATE KEY. A client needs '
+                'only server.crt; delete this copy of the server\'s private key from this '
+                'computer.')
 
 
 def _is_loopback(host):
@@ -86,15 +129,109 @@ def check_api_url(url):
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip('/'), '', ''))
 
 
-def api_url_from_environment(env_path=None):
-    """The configured API address (see the module notes), checked."""
-    url = os.environ.get(API_URL_VARIABLE, '').strip()
-    if not url:
+def _setting(name, env_path=None):
+    """The environment variable, else that line of the .env file, else ''."""
+    value = os.environ.get(name, '').strip()
+    if not value:
         path = env_path or ENV_PATH
         if os.path.exists(path):
             from dotenv import dotenv_values
-            url = (dotenv_values(path).get(API_URL_VARIABLE) or '').strip()
-    return check_api_url(url or DEFAULT_API_URL)
+            value = (dotenv_values(path).get(name) or '').strip()
+    return value
+
+
+def api_url_from_environment(env_path=None):
+    """The configured API address (see the module notes), checked."""
+    return check_api_url(_setting(API_URL_VARIABLE, env_path) or DEFAULT_API_URL)
+
+
+def check_address(address, base_url):
+    """NETCOMMAND_API_ADDRESS: an IP address, used only with an https:// URL that names
+    the server (the certificate is checked against that name)."""
+    text = (address or '').strip()
+    try:
+        ip = ipaddress.ip_address(text.strip('[]'))
+    except ValueError:
+        raise ApiConfigError(f'{ADDRESS_VARIABLE} must be an IP address (for example '
+                             f'10.0.0.5).') from None
+    parts = urllib.parse.urlsplit(base_url)
+    if parts.scheme != 'https':
+        raise ApiConfigError(f'{ADDRESS_VARIABLE} can only be used with an https:// '
+                             f'{API_URL_VARIABLE}.')
+    if _is_ip(parts.hostname):
+        raise ApiConfigError(f'With {ADDRESS_VARIABLE}, {API_URL_VARIABLE} must use the '
+                             f'server NAME (the one in its certificate), not an IP address.')
+    return str(ip)
+
+
+def _is_ip(host):
+    try:
+        ipaddress.ip_address((host or '').strip('[]'))
+        return True
+    except ValueError:
+        return False
+
+
+def tls_context(ca_file):
+    """An SSL context that trusts ONLY the certificate(s) in ca_file (the pinned server
+    certificate), with certificate and host-name verification on and TLS 1.2 or newer.
+    Never the system store; never unverified."""
+    if not ca_file:
+        raise ApiConfigError(CERT_NOT_CONFIGURED)
+    if not os.path.isfile(ca_file):
+        raise ApiConfigError(CERT_MISSING)
+    try:
+        with open(ca_file, 'rb') as f:
+            content = f.read(1024 * 1024)
+    except OSError:
+        raise ApiConfigError(CERT_MISSING) from None
+    if b'PRIVATE KEY' in content:                      # the server's key must never be here
+        raise ApiConfigError(CERT_HAS_KEY)
+    if b'-----BEGIN CERTIFICATE-----' not in content:
+        raise ApiConfigError(CERT_INVALID)
+    try:
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    except (ssl.SSLError, ValueError, OSError):
+        raise ApiConfigError(CERT_INVALID) from None
+    if not context.cert_store_stats().get('x509'):     # nothing usable was loaded
+        raise ApiConfigError(CERT_INVALID)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to the URL's host name, optionally connecting to a given IP address instead
+    of resolving the name. TLS (SNI and host-name verification) always uses the NAME."""
+
+    def __init__(self, host, address=None, **kwargs):
+        super().__init__(host, **kwargs)
+        self._address = address
+
+    def connect(self):
+        if not self._address:
+            return super().connect()
+        sock = socket.create_connection((self._address, self.port), self.timeout,
+                                        self.source_address)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, context, address=None):
+        super().__init__(context=context)
+        self._pinned_context, self._address = context, address
+
+    def https_open(self, req):
+        address = self._address
+
+        def connection(host, **kwargs):
+            return _PinnedHTTPSConnection(host, address=address, **kwargs)
+        return self.do_open(connection, req, context=self._pinned_context)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -106,6 +243,44 @@ def _default_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
 
 
+def _https_opener(context, address=None):
+    """Only the pinned HTTPS handler (it replaces urllib's default one), no proxy, no
+    redirects."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(),
+                                       _PinnedHTTPSHandler(context, address)).open
+
+
+def _connection_error(err):
+    """A fixed, safe ApiUnavailable / ApiTlsError for a failed connection."""
+    reason = err.reason if isinstance(err, urllib.error.URLError) else err
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        text = f'{getattr(reason, "verify_message", "")} {reason}'.lower()
+        if getattr(reason, 'verify_code', None) == 62 or 'mismatch' in text:
+            return ApiTlsError(MISMATCH)
+        return ApiTlsError(UNTRUSTED)
+    if isinstance(reason, ssl.SSLError):
+        return ApiTlsError(TLS_FAILED)
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return ApiUnavailable(TIMED_OUT)
+    if isinstance(reason, socket.gaierror):
+        return ApiUnavailable(NAME_UNKNOWN)
+    if isinstance(reason, ConnectionRefusedError):
+        return ApiUnavailable(REFUSED)
+    return ApiUnavailable(UNREACHABLE)
+
+
+def client_from_environment(env_path=None, timeout=None):
+    """The AuthApiClient for this computer's settings (see the module notes). Raises
+    ApiConfigError with a fixed message naming the setting at fault."""
+    url = api_url_from_environment(env_path)
+    ca_file = _setting(CA_FILE_VARIABLE, env_path)
+    if ca_file and not os.path.isabs(ca_file):
+        ca_file = os.path.join(PROJECT_DIR, ca_file)
+    address = _setting(ADDRESS_VARIABLE, env_path)
+    return AuthApiClient(url, timeout=timeout or TIMEOUT, ca_file=ca_file or None,
+                         address=address or None)
+
+
 def _safe_text(value, limit=300):
     if not isinstance(value, str):
         return None
@@ -114,13 +289,28 @@ def _safe_text(value, limit=300):
 
 
 class AuthApiClient:
-    def __init__(self, base_url, timeout=TIMEOUT, opener=None):
+    def __init__(self, base_url, timeout=TIMEOUT, opener=None, ca_file=None, address=None):
+        """https:// needs ca_file (the pinned server certificate); address (optional, https
+        only) is the IP address to connect to for the URL's server name. opener: tests."""
         self.base_url = check_api_url(base_url)
         self.timeout = timeout
-        self._open = opener or _default_opener()
+        https = self.base_url.startswith('https://')
+        if address is not None:
+            address = check_address(address, self.base_url)
+        if opener is not None:
+            self._open = opener
+        elif https:
+            self._open = _https_opener(tls_context(ca_file), address)
+        else:
+            self._open = _default_opener()                # http://: this computer only
 
     def __repr__(self):
         return f'AuthApiClient({self.base_url})'
+
+    def health(self):
+        """GET /health: True when the server answers (a connection test; no sign-in)."""
+        _, p = self._request('GET', '/health')
+        return isinstance(p, dict) and p.get('status') == 'ok'
 
     # ------------------------------------------------------------ transport
     def _request(self, method, path, body=None, token=None, query=None):
@@ -147,8 +337,9 @@ class AuthApiClient:
                 raw = b''
             finally:
                 err.close()
-        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
-            raise ApiUnavailable(UNREACHABLE) from None
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError,
+                ssl.SSLError, OSError) as err:
+            raise _connection_error(err) from None
         if len(raw) > MAX_RESPONSE_BYTES:
             raise BadResponse(UNEXPECTED, status=status) from None
         payload = None

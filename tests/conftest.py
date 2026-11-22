@@ -17,11 +17,66 @@ import mysql_guard  # noqa: E402,F401  (records the shell's DB_NAME now: see its
 import pytest  # noqa: E402
 
 
+class SyntheticBackupKey:
+    """A random, in-memory backup key standing in for the user's DPAPI keyring, so no
+    test ever reads %LOCALAPPDATA%\\NetCommand or calls Windows DPAPI through Apply."""
+
+    def __init__(self, key_id='b1'):
+        self.key_id, self.key = key_id, os.urandom(32)
+
+    def key_for(self, key_id):
+        import backup_crypto
+        if key_id != self.key_id:
+            raise backup_crypto.UnknownKey(f'Backup key {key_id} is not in this keyring.')
+        return self.key
+
+    def active_key(self):
+        from config.connect import BackupKey
+        return BackupKey(self.key_id, self.key, self.key_for)
+
+    def decrypt(self, path):
+        """(configuration bytes, header) of an .ncbak written with this key."""
+        import backup_crypto
+        with open(path, 'rb') as f:
+            return backup_crypto.decrypt_backup(f.read(), self.key_for)
+
+
+@pytest.fixture(autouse=True)
+def synthetic_backup_key(monkeypatch):
+    """Apply (config.connect) encrypts backups with this synthetic key in every test."""
+    try:
+        from config import connect
+    except Exception:                       # tests that cannot import it do not need it
+        return None
+    source = SyntheticBackupKey()
+    monkeypatch.setattr(connect, 'KEY_SOURCE', source)
+    return source
+
+
 @pytest.fixture(autouse=True)
 def private_layout_file(tmp_path, monkeypatch):
     path = tmp_path / 'topology_layout.json'
     monkeypatch.setenv('NETCOMMAND_LAYOUT_FILE', str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def no_real_serial_ports(monkeypatch):
+    """No test may see or open this computer's real COM ports (the Initial Setup page and
+    console tests). The operating system's port list is empty, and opening a port fails
+    the test. Tests that need ports install their own fakes on top of this."""
+    try:
+        import serial
+        import serial.tools.list_ports as list_ports
+    except Exception:                       # no pyserial: nothing could open a port
+        return
+    real = serial.Serial
+
+    class NoRealPort(real):
+        def __init__(self, *args, **kwargs):
+            raise AssertionError('a test tried to open a real serial port')
+    monkeypatch.setattr(serial, 'Serial', NoRealPort)
+    monkeypatch.setattr(list_ports, 'comports', lambda *a, **k: [])
 
 
 @pytest.fixture(autouse=True)

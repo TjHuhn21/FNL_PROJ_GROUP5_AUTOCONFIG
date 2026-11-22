@@ -16,7 +16,9 @@ GLYPHS = {
     'topology':  '',   # hierarchy
     'findings':  '',   # shield
     'configure': '',   # gear
+    'setup':     '',   # screen with a plugged-in cable (console connection)
     'logs':      '',   # history
+    'accounts':  '',   # people (user accounts; admins only)
 }
 
 _family_cache = {}

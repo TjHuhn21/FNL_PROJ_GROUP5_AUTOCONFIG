@@ -7,8 +7,12 @@
     fail NAME MODE   change a device's failure mode while the lab runs
                      (none, auth_fail, offline, hang, drop, slow; new connections only)
     check            check that every address in lab_config.json can be used, then exit
+    reset            SIMULATION ONLY: after typing RESET MOCK LAB, stop the lab and start it
+                     again, so every simulated device is rebuilt from lab_config.json and
+                     every failure mode is cleared. Talks to no device at all.
 """
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -200,6 +204,75 @@ def cmd_check(args):
     return 1 if problems else 0
 
 
+RESET_PHRASE = 'RESET MOCK LAB'
+RESET_LINE_END = '\r\n'              # only a typed line ending is ignored; nothing else is
+RESET_NOTICE = ('SIMULATION ONLY: this stops the NetCommand Mock Lab and starts it again, so its '
+                'SIMULATED devices are rebuilt from lab_config.json and every failure mode is '
+                'cleared. No real device is contacted and no command is sent to any router or '
+                'switch; nothing is erased on any device.')
+
+
+def loopback_problems(config):
+    """Devices in the lab configuration whose address is not 127.x.x.x (must be none)."""
+    problems = []
+    for d in config.get('devices') or []:
+        try:
+            ok = ipaddress.IPv4Address(str(d.get('host'))).is_loopback
+        except ValueError:
+            ok = False
+        if not ok:
+            problems.append(f"{d.get('name', '?')}: {d.get('host')!r}")
+    return problems
+
+
+def _start_background():
+    return cmd_start(argparse.Namespace(fail=[], background=True))
+
+
+def cmd_reset(args, ask=None):
+    """Restart the mock lab from lab_config.json. Only the lab's own process and files in
+    mock-lab/state are touched: no SSH, Telnet, serial or other connection is opened (the
+    lab is found through its process id file, and stopped through its stop file).
+    ask: how the confirmation is read (default: input)."""
+    ask = ask or input
+    try:
+        with open(CONFIG, encoding='utf-8') as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as err:
+        print(f'Reset refused: lab_config.json cannot be read ({type(err).__name__}). '
+              f'Nothing was changed.')
+        return 2
+    problems = loopback_problems(raw)
+    if problems or not raw.get('devices'):
+        print('Reset refused: every device in lab_config.json must use a loopback address '
+              '(127.x.x.x); these do not: ' + (', '.join(problems) or 'no devices') +
+              '. Nothing was changed.')
+        return 2
+    load_config(CONFIG)                      # every other lab rule (raises LabError)
+    print(RESET_NOTICE)
+    try:
+        answer = ask(f'Type {RESET_PHRASE} to continue: ')
+    except (EOFError, KeyboardInterrupt):
+        answer = None
+    if answer is None or answer.rstrip(RESET_LINE_END) != RESET_PHRASE:
+        print('Reset cancelled. Nothing was changed.')
+        return 1
+    was_running = _alive(_pid())
+    if was_running:
+        cmd_stop(args)
+    if os.path.exists(CONTROL):              # failure modes changed while it ran
+        os.remove(CONTROL)
+    if not was_running:
+        print('The lab was not running. Failure modes were cleared; the next '
+              '"python -m mocklab start" builds every simulated device from lab_config.json.')
+        return 0
+    code = _start_background()
+    if code == 0:
+        print('Mock lab reset: the simulated devices were rebuilt from lab_config.json '
+              '(running in the background; stop with "python -m mocklab stop").')
+    return code
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='python -m mocklab', description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -210,13 +283,15 @@ def main(argv=None):
     sub.add_parser('stop')
     sub.add_parser('status')
     sub.add_parser('check')
+    sub.add_parser('reset', help='SIMULATION ONLY: restart the lab from lab_config.json '
+                                 '(asks for RESET MOCK LAB)')
     f = sub.add_parser('fail')
     f.add_argument('name')
     f.add_argument('mode')
     args = p.parse_args(argv)
     try:
         return {'start': cmd_start, 'stop': cmd_stop, 'status': cmd_status, 'fail': cmd_fail,
-                'check': cmd_check}[args.command](args)
+                'check': cmd_check, 'reset': cmd_reset}[args.command](args)
     except LabError as err:
         print(err)
         return 1
