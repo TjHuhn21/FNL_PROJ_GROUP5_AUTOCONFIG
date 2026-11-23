@@ -13,10 +13,12 @@ widget: they put their result on a queue.Queue that the page reads with after().
 import queue
 import threading
 import tkinter as tk
+from datetime import datetime
 from tkinter import ttk, messagebox
 
 from gui import theme
 from gui.db_status import database_ready, report_error
+from gui.event_log import log_event
 from review.rules import POINTS, review_network
 from store_errors import outcome_text
 
@@ -28,8 +30,9 @@ POLL_MS = 200
 
 
 # ---------------------------------------------------------------- workers (no widgets here)
-def _review_worker(collect, store, results):
-    """Run the review, then store it (not sample data). Puts exactly one message."""
+def _review_worker(collect, store, sample_store, results):
+    """Run the review, then store it. Sample data is stored only in the in-memory sample
+    store (sample_store True), never in the database. Puts exactly one message."""
     try:
         devices, links, configs, notes, source = collect()
         if not devices:                    # nothing registered: nothing reviewed or stored
@@ -40,7 +43,7 @@ def _review_worker(collect, store, results):
         results.put(('error', err))
         return
     saved, save_error = None, None
-    if not source.startswith('SAMPLE'):    # sample data is never stored as a review
+    if sample_store or not source.startswith('SAMPLE'):   # never sample data in the database
         try:
             saved = store.replace_findings(findings)   # empty list: clears the snapshot
         except Exception as err:
@@ -56,10 +59,15 @@ def _snapshot_worker(store, results):
 
 
 class FindingsTab(ttk.Frame):
-    def __init__(self, parent, store, collect, send_to_configure):
-        """collect() -> (devices, links, configs, notes, source), may be slow."""
+    def __init__(self, parent, store, collect, send_to_configure, sample_store=False):
+        """collect() -> (devices, links, configs, notes, source), may be slow.
+        sample_store: store is the in-memory sample store (sample mode)."""
         super().__init__(parent, padding=theme.PAD)
         self.store, self.collect, self.send = store, collect, send_to_configure
+        self.sample_store = bool(sample_store)
+        # The newest review completed in this session that the Overview may show (stored,
+        # or sample mode): {'at': datetime, 'findings': [...]}. None until one ran.
+        self.last_review = None
         self.results = queue.Queue()
         self.findings, self.busy = [], False
         # What the page shows: None (nothing yet), 'stored', 'fresh' (saved), 'unsaved'
@@ -118,13 +126,15 @@ class FindingsTab(ttk.Frame):
     def run(self):
         if self.read_only or self.busy or not database_ready(self):
             return
+        log_event('findings', 'Running the configuration review...')
         self._start('Reading configurations and reviewing...', _review_worker,
-                    self.collect, self.store)
+                    self.collect, self.store, self.sample_store)
 
     def load_stored(self):
         """Load the stored review (in the background). False if busy."""
         if self.busy:
             return False
+        log_event('findings', 'Loading the stored review...')
         self._start('Loading the stored review...', _snapshot_worker, self.store)
         return True
 
@@ -183,11 +193,13 @@ class FindingsTab(ttk.Frame):
             text = 'Review failed: the database could not be read. Nothing was stored.'
         else:
             text = 'Review failed. Nothing was stored.'
+        log_event('findings', f'Review FAILED. {err}', 'error')
         self.note.config(text=text + kept, style='TLabel', foreground=theme.DANGER)
         messagebox.showerror('Review failed', str(err))
 
     def _snapshot_failed(self, err):
         report_error(self, err)
+        log_event('findings', f'Loading the stored review FAILED. {err}', 'error')
         text = f'Could not load the stored review: {err}'
         if self.findings:                      # keep them, clearly not refreshed
             text += ' The results shown below were not refreshed and may be out of date.'
@@ -208,6 +220,7 @@ class FindingsTab(ttk.Frame):
         """Real database with no registered devices: say so. No score is shown and
         the stored findings are left exactly as they are (nothing is cleared)."""
         self._fill([])
+        log_event('findings', 'Review not run: no registered devices to review.', 'warn')
         self.view, self.view_label = 'empty', ''
         self.score.config(text='Health score: -   (no registered devices)')
         self.note.config(text=EMPTY_MESSAGE, style='TLabel', foreground=theme.TEXT_SOFT)
@@ -215,10 +228,14 @@ class FindingsTab(ttk.Frame):
     def show(self, findings, score, notes=(), source='', saved=None, save_error=None):
         """A review completed just now. saved: store.replace_findings' result, or None
         when it was not stored (sample data, or save_error)."""
-        if saved is not None and getattr(self, 'on_saved', None):
-            self.on_saved()                        # e.g. the Overview's findings counts
-        self._fill(findings)
         sample = source.startswith('SAMPLE')
+        if saved is not None or (sample and self.sample_store):
+            # remembered with its time, so the Overview can show it even when nothing was
+            # stored (a review that found nothing, or only unregistered sample devices)
+            self.last_review = {'at': datetime.now(), 'findings': list(findings)}
+            if getattr(self, 'on_saved', None):
+                self.on_saved()                    # e.g. the Overview's findings counts
+        self._fill(findings)
         self.score.config(text=f'Health score: {score} / 100   ({len(self.findings)} findings)'
                                + ('   SAMPLE DATA' if sample else ''))
         text = source + ('. ' + '; '.join(notes) if notes else '')
@@ -241,6 +258,17 @@ class FindingsTab(ttk.Frame):
                            + ', '.join(saved['skipped']) + '.')
         full = text + ('. ' if text and status else '') + status
         self.view_label = full
+        severities = ', '.join(f"{n} {sev}" for sev in ('high', 'medium', 'low')
+                               for n in [sum(1 for f in self.findings if f['severity'] == sev)] if n)
+        found = f"{len(self.findings)} findings" + (f" ({severities})" if severities else '')
+        if save_error is not None:
+            log_event('findings', f'Review completed ({found}, health score {score}) but '
+                                  f'saving it FAILED. {save_error}', 'error')
+        else:
+            log_event('findings', f'Review SUCCESSFUL: {found}, health score {score}/100'
+                                  f"{' (sample data)' if sample else ''}.", 'ok')
+        for note in notes:
+            log_event('findings', f'Review note: {note}.', 'warn')
         # the explicit colour matters: it overrides the style, so set it every time
         if sample:
             self.note.config(text=full, style='Sample.TLabel', foreground=theme.SAMPLE_COLOR)
@@ -252,6 +280,8 @@ class FindingsTab(ttk.Frame):
         """The stored review (snapshot from the database)."""
         found = snapshot['findings']
         self._fill(found)
+        log_event('findings', f'Loading the stored review SUCCESSFUL ({len(found)} findings).',
+                  'ok')
         if not found:
             self.view, self.view_label = 'stored', ''
             self.score.config(text='Health score: -   (no stored findings)')

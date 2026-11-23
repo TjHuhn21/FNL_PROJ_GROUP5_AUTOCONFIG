@@ -529,7 +529,7 @@ def add_log(device_id, action, status, details=''):
                 'VALUES (%s, %s, %s, %s)', (device_id, action, status, details))
 
 
-def _log_filter(search, status):
+def _log_filter(search, status, within_hours=None):
     like = f'%{search}%'
     sql = ('FROM config_logs l JOIN devices d ON d.id = l.device_id '
            'WHERE (d.name LIKE %s OR l.action LIKE %s OR l.details LIKE %s)')
@@ -537,16 +537,21 @@ def _log_filter(search, status):
     if status:
         sql += ' AND l.status = %s'
         params.append(status)
+    if within_hours is not None:
+        # compared with the server's clock, the same clock that filled created_at
+        sql += ' AND l.created_at >= NOW() - INTERVAL %s HOUR'
+        params.append(int(within_hours))
     return sql, params
 
 
-def count_logs(search='', status=''):
-    sql, params = _log_filter(search, status)
+def count_logs(search='', status='', within_hours=None):
+    """within_hours: only entries from the last N hours (None: all of them)."""
+    sql, params = _log_filter(search, status, within_hours)
     return _run('SELECT COUNT(*) AS n ' + sql, params, 'one')['n']
 
 
-def get_logs(search='', page=1, per_page=15, status=''):
-    sql, params = _log_filter(search, status)
+def get_logs(search='', page=1, per_page=15, status='', within_hours=None):
+    sql, params = _log_filter(search, status, within_hours)
     return _run('SELECT l.id, l.created_at, d.name AS device, l.action, l.status, '
                 'l.details ' + sql + ' ORDER BY l.id DESC LIMIT %s OFFSET %s',
                 params + [per_page, (max(page, 1) - 1) * per_page], 'all')

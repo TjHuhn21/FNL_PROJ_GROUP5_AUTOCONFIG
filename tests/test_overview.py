@@ -84,9 +84,82 @@ def test_this_sessions_scans_are_listed_with_the_registrations():
 
 def test_when_text():
     today = datetime(2026, 11, 20, 14, 2).date()
-    assert when_text(datetime(2026, 11, 20, 14, 2), today) == '14:02'
-    assert when_text(datetime(2026, 11, 19, 9, 5), today) == 'Nov 19 09:05'
+    assert when_text(datetime(2026, 11, 20, 14, 2), today) == '2:02 PM'
+    assert when_text(datetime(2026, 11, 19, 9, 5), today) == 'Nov 19 9:05 AM'
     assert when_text(None) == '' and when_text('not a date') == ''
+
+
+def test_format_time_is_12_hour():
+    from gui.timefmt import format_date_time, format_time
+    assert format_time(datetime(2026, 11, 24, 3, 19, 39)) == '3:19 AM'
+    assert format_time(datetime(2026, 11, 24, 3, 19, 39), seconds=True) == '3:19:39 AM'
+    assert format_time(datetime(2026, 11, 24, 0, 5)) == '12:05 AM'          # midnight
+    assert format_time(datetime(2026, 11, 24, 12, 0)) == '12:00 PM'         # noon
+    assert format_time(datetime(2026, 11, 24, 23, 59, 1), True) == '11:59:01 PM'
+    assert format_time(None) == ''
+    assert format_date_time(datetime(2026, 11, 24, 15, 4, 5), True) == '2026-11-24 3:04:05 PM'
+
+
+def age_logs(hours):
+    """Move every stored log entry back in time (display tests only)."""
+    for log in db_fake._logs:
+        log['created_at'] -= timedelta(hours=hours)
+
+
+def test_configuration_changes_count_only_the_last_24_hours():
+    ids = populate()
+    age_logs(24 * 3)                                       # the two from populate: 3 days old
+    db_fake.add_log(ids['R1'], 'Configuration', 'failed', 'now')
+    d = summarize(db_fake)
+    assert (d['changes'], d['changes_ok'], d['changes_failed']) == (1, 0, 1)
+    assert [l['details'] for l in d['recent_changes']] == ['now']
+    assert db_fake.count_logs() == 3 and len(db_fake.get_logs()) == 3     # all still stored
+
+
+def test_status_is_broken_down_by_the_types_that_exist():
+    populate()                                     # R1 up, SW1 up, SW2 down, X1 up
+    assert summarize(db_fake)['by_type'] == [('Routers', 1, 0), ('Switches', 1, 1),
+                                             ('Unknown', 1, 0)]
+    db_fake.reset()
+    db_fake.save_device(None, {'name': 'S', 'ip': '10.0.0.9', 'type': 'switch', 'status': 'up'})
+    assert summarize(db_fake)['by_type'] == [('Switches', 1, 0)]        # only existing types
+
+
+def test_a_review_that_stored_nothing_is_still_shown_with_its_time():
+    when = datetime.now()
+    found = [{'device': 'R1', 'rule': 'r', 'severity': 'high', 'message': 'm', 'commands': []}]
+    d = summarize(db_fake, last_review={'at': when, 'findings': found})
+    assert (d['findings'], d['high'], d['review_saved_at']) == (1, 1, when)
+    d = summarize(db_fake, last_review={'at': when, 'findings': []})     # found nothing
+    assert (d['findings'], d['review_saved_at']) == (0, when)
+
+
+def test_sample_mode_review_reaches_the_overview():
+    """The Findings bug: a sample-mode review was never stored, so the Overview said 0."""
+    import queue
+    import sample_data, services
+    from gui.findings_tab import _review_worker
+    for dev in sample_data.DEVICES:
+        db_fake.upsert_device(dict(dev))
+    results = queue.Queue()
+    _review_worker(lambda: services.collect_review_inputs(db_fake, True), db_fake, True, results)
+    kind, findings, *_rest = results.get()
+    assert kind == 'done' and findings
+    d = summarize(db_fake)
+    assert d['findings'] == len(findings) and d['review_saved_at'] is not None
+
+
+def test_database_mode_never_stores_sample_findings():
+    import queue
+    from gui.findings_tab import _review_worker
+    calls, results = [], queue.Queue()
+
+    class Store:
+        def replace_findings(self, f):
+            calls.append(f)
+    sample = ([{'name': 'R1'}], [], {}, [], 'SAMPLE DATA (demo)')
+    _review_worker(lambda: sample, Store(), False, results)
+    assert results.get()[0] == 'done' and calls == []
 
 
 # ---------------------------------------------------------------- the page
@@ -125,6 +198,11 @@ def page(monkeypatch):
     root.destroy()
 
 
+def theme_danger():
+    from gui import theme
+    return theme.DANGER
+
+
 def card(p, key):
     c = p.cards[key]
     return c['value'].cget('text'), c['detail'].cget('text')
@@ -135,6 +213,7 @@ def test_empty_database_shows_friendly_empty_states(page):
     p.refresh(force=True)
     assert card(p, 'devices') == ('0', 'No devices registered yet.')
     assert card(p, 'findings')[1] == 'No review saved yet.'
+    assert card(p, 'changes') == ('0', 'No configuration changes in the last 24 hours.')
     for key, text in overview_page.NONE_YET.items():
         assert p.lists[key]['empty'].cget('text') == text
         assert p.lists[key]['empty'].winfo_manager() and not p.lists[key]['holder'].winfo_manager()
@@ -145,9 +224,17 @@ def test_populated_database_fills_cards_and_lists(page):
     populate()
     p.refresh(force=True)
     assert card(p, 'devices') == ('4', '1 routers  ·  2 switches  ·  1 unknown')
-    assert card(p, 'status') == ('3 up', '●  3 online    ■  1 offline')
-    assert card(p, 'findings') == ('4', '1 high  ·  2 medium  ·  1 low')
-    assert card(p, 'changes') == ('2', '1 successful  ·  1 failed')
+    assert card(p, 'status') == ('▲ 3', '●  3 online    ■  1 offline')
+    assert p.cards['status']['down'].cget('text') == '▼ 1'
+    types = p.cards['status']['types']
+    cell = {(int(w.grid_info()['row']), int(w.grid_info()['column'])): w
+            for w in types.winfo_children()}
+    assert [cell[(r, 0)].cget('text') for r in range(3)] == ['Routers', 'Switches', 'Unknown']
+    assert cell[(1, 2)].cget('text') == '1 down'
+    assert str(cell[(1, 2)].cget('foreground')) == theme_danger()           # down > 0: red
+    assert str(cell[(0, 2)].cget('foreground')) != theme_danger()           # 0 down: not red
+    assert card(p, 'findings') == ('4', '4 findings  ·  1 high  ·  2 medium  ·  1 low')
+    assert card(p, 'changes') == ('2', '1 successful  ·  1 failed  ·  last 24 hours')
     config = p.lists['config']['tree']
     rows = [config.item(i)['values'] for i in config.get_children()]
     assert [r[1:3] for r in rows] == [['SW1', 'failed'], ['R1', 'success']]
@@ -155,6 +242,33 @@ def test_populated_database_fills_cards_and_lists(page):
     status = p.lists['status']['tree']
     assert status.item(status.get_children()[0])['values'][1:3] == ['SW2', 'up → down']
     assert 'Updated' in p.updated.cget('text')
+
+
+@pytest.mark.parametrize('statuses, up, down, tip', [
+    (['up'] * 5, ('▲ 5', 'SUCCESS'), None, '5 devices up, 0 devices down'),
+    (['down'] * 5, ('▼ 5', 'DANGER'), None, '0 devices up, 5 devices down'),
+    (['up'] * 3 + ['down'] * 2, ('▲ 3', 'SUCCESS'), '▼ 2', '3 devices up, 2 devices down'),
+    ([], ('—', 'TEXT_MUTED'), None, 'No devices detected')])
+def test_status_indicator_uses_coloured_arrows(page, statuses, up, down, tip):
+    from gui import theme
+    root, p, store, _ = page
+    for i, status in enumerate(statuses):
+        db_fake.save_device(None, {'name': f'D{i}', 'ip': f'10.0.1.{i + 1}', 'type': 'switch',
+                                   'status': status})
+    p.refresh(force=True)
+    root.update()
+    s = p.cards['status']
+    assert s['value'].cget('text') == up[0]
+    assert str(s['value'].cget('foreground')) == getattr(theme, up[1])
+    assert s['value'].cget('font') == s['down'].cget('font') == p.cards['devices']['value'].cget('font')
+    if down:
+        assert s['down'].winfo_manager() and s['down'].cget('text') == down
+        assert str(s['down'].cget('foreground')) == theme.DANGER
+    else:
+        assert not s['down'].winfo_manager()
+    assert s['tooltip'].text == tip
+    if not statuses:
+        assert s['detail'].cget('text') == 'No devices detected'
 
 
 def test_opening_the_page_again_does_not_query_again_while_fresh(page):
@@ -210,6 +324,30 @@ def test_quick_actions_respect_the_role(page):
     assert set(p.actions) == {'devices', 'topology', 'findings', 'logs'}   # no scan, no configure
     p.open_topology.invoke()
     assert opened == ['topology']
+
+
+def test_main_window_overview_follows_a_sample_mode_review(monkeypatch):
+    """Wiring: Run review on the Findings page (sample mode) updates the Overview card."""
+    from tkinter import messagebox
+    from gui_helpers import new_root, pump
+    for name in ('showinfo', 'showerror', 'showwarning'):
+        monkeypatch.setattr(messagebox, name, lambda *a, **k: None)
+    root = new_root()
+    try:
+        from gui.main_window import build_main_window
+        r = build_main_window(root, db_fake, demo_store=True)
+        r['show_page']('dashboard')
+        root.update()
+        assert card(r['dashboard'], 'findings')[1] == 'No review saved yet.'
+        r['findings'].run()
+        assert pump(root, lambda: r['findings'].last_review is not None)
+        r['show_page']('dashboard')
+        value, detail = card(r['dashboard'], 'findings')
+        assert int(value) == len(r['findings'].findings) > 0
+        assert detail.startswith(f'{value} findings')
+        assert r['dashboard'].cards['findings']['note'].cget('text').startswith('Last review: ')
+    finally:
+        root.destroy()
 
 
 def test_main_window_overview_follows_scan_approval(monkeypatch):

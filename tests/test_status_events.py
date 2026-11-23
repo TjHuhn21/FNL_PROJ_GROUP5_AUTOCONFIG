@@ -278,8 +278,9 @@ def test_monitor_change_reaches_the_tab_through_the_main_thread(ui):
     finally:
         stop.set()
     console.flush()
-    assert any(src == 'monitor' and 'SW2 (10.0.0.2): up -> down (recorded)' in msg
-               for _t, src, msg, _l in console.lines)
+    assert any(src == 'monitor' and lvl == 'error' and
+               'SW2 (10.0.0.2): status check FAILED, the device is DOWN (was up). Recorded.' in msg
+               for _t, src, msg, lvl in console.lines)
 
 
 def test_monitor_callback_holds_no_widget(ui):

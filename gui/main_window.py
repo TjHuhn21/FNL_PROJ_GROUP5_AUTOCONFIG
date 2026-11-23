@@ -23,6 +23,7 @@ import customtkinter as ctk
 
 import services
 from gui import theme
+from gui.event_log import event_word, install_dialog_logging, log_event
 from gui.components.command_strip import CommandStrip
 from gui.components.console import OperationsConsole
 from gui.components.inspector import Inspector
@@ -43,8 +44,7 @@ from store_errors import DatabaseError
 # 'setup' is the Initial Setup page (console connection); "Setup" fits the narrow rail.
 PAGES = [('dashboard', 'Overview'), ('scan', 'Scan'), ('devices', 'Devices'),
          ('topology', 'Topology'), ('findings', 'Findings'), ('configure', 'Configure'),
-         # ('setup', 'Setup'),    # Initial Setup hidden for the presentation: uncomment to show
-         ('logs', 'Logs')]
+         ('setup', 'Setup'), ('logs', 'Logs')]
 FIRST_PAGE = 'dashboard'
 
 # Set to 1 only by the mock lab launcher (mock-lab/run_netcommand.py). DISPLAY ONLY: it adds
@@ -175,8 +175,9 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     host.grid_columnconfigure(0, weight=1)
     host.grid_rowconfigure(0, weight=1)
 
-    console = OperationsConsole(outer, store)
+    console = OperationsConsole(outer, store)      # log_event(...) writes here from now on
     refs['console'] = console
+    install_dialog_logging()                       # error/warning dialogs are logged too
 
     # ---------------------------------------------------------------- database status
     # Database mode only. A runtime outage NEVER switches to sample mode: the pages show
@@ -224,7 +225,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
 
     if not demo_store:
         refs['db_status'] = DatabaseStatus(root, store, on_down=on_db_down, on_up=on_db_up,
-                                           log=console.log)
+                                           log=log_event)
         default_handler = root.report_callback_exception
 
         def on_callback_error(exc, val, tb):
@@ -262,12 +263,12 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         result = refs['scan'].last_result or {}
         if result.get('ok'):
             noun = 'device' if result['total'] == 1 else 'devices'
-            console.log('scan', f"Approved {result['total']} {noun}: {result['added']} new, "
-                                f"{result['updated']} already registered (updated), "
-                                f"{result['links']} links saved.", 'ok')
+            log_event('scan', f"Approved {result['total']} {noun}: {result['added']} new, "
+                              f"{result['updated']} already registered (updated), "
+                              f"{result['links']} links saved.", 'ok')
         elif result:
-            console.log('scan', f"Approval stopped after {result['saved']} of {result['total']} "
-                                f"devices: {result['error']}", 'error')
+            log_event('scan', f"Approval FAILED after {result['saved']} of {result['total']} "
+                              f"devices: {result['error']}", 'error')
 
     def send_to_configure(commands, device_name):
         if not allowed('configure'):
@@ -275,10 +276,11 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
             return
         refs['configure'].load_commands(commands, device_name)
         show_page('configure')
-        console.log('findings', f'Sent {len(commands)} suggested lines for {device_name} to Configure.')
+        log_event('findings', f'Sent {len(commands)} suggested lines for {device_name} to '
+                              f'Configure: SUCCESSFUL.', 'ok')
 
     refs['devices'] = DevicesTab(host, store, on_change=after_data_change)
-    refs['configure'] = ConfigureTab(host, store, log=console.log, on_change=after_data_change,
+    refs['configure'] = ConfigureTab(host, store, log=log_event, on_change=after_data_change,
                                      on_applied=overview_stale)
     refs['scan'] = ScanTab(host, store, services.run_discovery,
                            on_approved=after_approval, demo_default=demo_store,
@@ -315,16 +317,17 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     layout_scope = 'sample' if demo_store else \
         f"database:{os.getenv('DB_NAME', 'netcommand')}@{os.getenv('DB_HOST', 'localhost')}"
     refs['topology'] = TopologyTab(host, get_network, on_select=on_map_select,
-                                   layout_scope=layout_scope, log=console.log)
+                                   layout_scope=layout_scope, log=log_event)
     refs['findings'] = FindingsTab(host, store, lambda: services.collect_review_inputs(store, demo_store),
-                                   send_to_configure)
+                                   send_to_configure, sample_store=demo_store)
     refs['findings'].on_saved = overview_stale
     refs['logs'] = LogsTab(host, store)
     if allowed('setup'):                    # not even built for roles that may not use it
-        refs['setup'] = SetupTab(host, log=console.log, backend=console_backend)
+        refs['setup'] = SetupTab(host, log=log_event, backend=console_backend)
     refs['dashboard'] = OverviewPage(
         host, lambda key: show_page(key), store=store, can_open=allowed,
         scan_history=lambda: refs['scan'].history,
+        last_review=lambda: refs['findings'].last_review,
         source_note='Sample mode: the data is kept in memory.' if demo_store else '')
     if access is not None:
         refs['devices'].set_read_only(not access.can(EDIT_DEVICES))
@@ -336,20 +339,30 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
 
     def backup_selected(selection):
         refs['backup_selection'] = selection
-        console.log('backups', f'Selected backup {os.path.basename(selection.path)} for a '
-                               f'future restore of {selection.device_name or selection.device_ip}'
-                               f' (nothing was sent to the device).')
+        log_event('backups', f'Selected backup {os.path.basename(selection.path)} for a '
+                             f'future restore of {selection.device_name or selection.device_ip}'
+                             f' (nothing was sent to the device).')
     refs['devices'].on_backup_selected = backup_selected
 
+    def outcome_level(status):
+        """A restore / save result's status as a console level."""
+        status = str(status or '').upper()
+        return 'ok' if status in ('SUCCESS', 'SUCCESSFUL', 'PASS') else \
+            'error' if status in ('FAILED', 'FAIL', 'ERROR') else 'warn'
+
     def restore_finished(result):
-        console.log('backups', f'Restore of {result.device_ip}: {result.status} (backup '
-                               f'{os.path.basename(result.backup_file or "?")}, safety backup '
-                               f'{result.safety_backup_file or "none"}).')
+        level = outcome_level(result.status)
+        log_event('backups', f'Restore of {result.device_ip} {event_word(level)} '
+                             f'({result.status}; backup '
+                             f'{os.path.basename(result.backup_file or "?")}, safety backup '
+                             f'{result.safety_backup_file or "none"}).', level)
     refs['devices'].on_restore_finished = restore_finished
 
     def save_finished(result):
-        console.log('backups', f'Save to startup on {result.device_ip}: {result.status} '
-                               f'(startup backup {result.startup_backup or "none"}).')
+        level = outcome_level(result.status)
+        log_event('backups', f'Save to startup on {result.device_ip} {event_word(level)} '
+                             f'({result.status}; startup backup '
+                             f'{result.startup_backup or "none"}).', level)
     refs['devices'].on_save_finished = save_finished
     if any(key == 'accounts' for key, _label in pages):
         from gui.accounts_page import AccountsPage
@@ -361,8 +374,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         conf = refs['configure']
         conf.refresh_devices()
         if not conf.select_device(name):
-            console.log('configure', f'{name} is not a managed device, so it cannot be configured.',
-                        'warn')
+            log_event('configure', f'{name} is not a managed device, so it cannot be configured.',
+                      'warn')
             return False
         return True
 
@@ -387,7 +400,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         set_inspector(True)
         d = refs['inspector'].show_device(device_id)
         if d:
-            console.log('find', f"Selected {d['name']} ({d['ip']}).")
+            log_event('find', f"Selected {d['name']} ({d['ip']}).")
 
     def on_operation(key, device_name):
         if not allowed(key):
@@ -490,7 +503,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
 
     def refuse(key):
         label = dict(all_pages).get(key, key)
-        console.log('access', f'Your role ({access.title}) cannot use {label}.', 'warn')
+        log_event('access', f'Your role ({access.title}) cannot use {label}.', 'warn')
 
     def show_page(key):
         """Show one page, hide the others. Opening the page already shown does
@@ -530,15 +543,16 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         if height > 2 * theme.CONSOLE_HEIGHT * s:
             restore_console(state['current'])
 
+    if demo_store:
+        log_event('app', 'Sample mode: no database connected. Data is kept in memory and '
+                         'lost on exit.', 'warn')
+    else:
+        log_event('app', 'Connected to the database: SUCCESSFUL.', 'ok')
+    if access is not None and access.demo:
+        log_event('app', 'DEMO MODE: started with --demo, so nobody is signed in.', 'warn')
+    elif account is not None:
+        log_event('app', f'Sign-in SUCCESSFUL: {account.session.email} ({access.title}).', 'ok')
+    log_event('app', 'NetCommand workbench started.')
     show_page(FIRST_PAGE)
     root.after(50, place_dividers)
-    if demo_store:
-        console.log('app', 'Sample mode: no database connected. Data is kept in memory and '
-                           'lost on exit.', 'warn')
-    else:
-        console.log('app', 'Connected to the database.', 'ok')
-    if access is not None and access.demo:
-        console.log('app', 'DEMO MODE: started with --demo, so nobody is signed in.', 'warn')
-    elif account is not None:
-        console.log('app', f'Signed in as {account.session.email} ({access.title}).', 'ok')
     return refs

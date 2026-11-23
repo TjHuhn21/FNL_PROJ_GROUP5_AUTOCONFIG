@@ -4,6 +4,7 @@ from tkinter import ttk, messagebox
 import validation
 from gui import theme
 from gui.db_status import database_ready, report_error
+from gui.event_log import log_event
 from store_errors import DATABASE_ERRORS, DeletedDeviceExists, DuplicateDeviceName, outcome_text
 
 PER_PAGE = 15
@@ -220,14 +221,21 @@ class DevicesTab(ttk.Frame):
             self.refresh()
             return
         if messagebox.askyesno('Delete device', f"Delete {d['name']} ({d['ip']})?"):
+            log_event('devices', f"Deleting {d['name']} ({d['ip']})...")
             try:
                 self.store.delete_device(did)
             except DATABASE_ERRORS as err:
                 report_error(self, err)
+                log_event('devices', f"Delete of {d['name']} FAILED. "
+                                     f"{outcome_text(err, 'Nothing was deleted.')} {err}", 'error')
                 messagebox.showerror('Delete failed',
                                      f"{outcome_text(err, 'Nothing was deleted.')} {err}")
                 return
+            log_event('devices', f"Delete of {d['name']} ({d['ip']}) SUCCESSFUL (its history "
+                                 f"is kept).", 'ok')
             self._saved()
+        else:
+            log_event('devices', f"Delete of {d['name']} cancelled. Nothing was deleted.")
 
     def _saved(self):
         self.refresh()
@@ -297,6 +305,8 @@ class DeviceDialog(tk.Toplevel):
             return
         data = {'name': name, 'ip': ip, 'type': v['type'], 'status': v['status'],
                 'managed': bool(v['managed'])}
+        action = 'Saving changes to' if self.device else 'Adding'
+        log_event('devices', f'{action} device {name} ({ip})...')
         try:                       # device and login together: both are saved, or neither
             self.store.save_device(own_id, data, username or None,
                                    password if username else None)
@@ -309,6 +319,8 @@ class DeviceDialog(tk.Toplevel):
                     f"{gone['name']}. Choose another IP, or use Add with this IP to restore "
                     f"{gone['name']}.", parent=self)
                 return
+            log_event('devices', f"IP {ip} belongs to the deleted device {err.device['name']}: "
+                                 f"asking whether to restore it. Nothing saved yet.", 'warn')
             self.restore_dialog = RestoreDialog(self, self.store, err.device, data,
                                                 on_restored=self._restored)
             return
@@ -322,6 +334,8 @@ class DeviceDialog(tk.Toplevel):
             report_error(self, err)            # an outage also shows in the main window
             messagebox.showerror('Cannot save', f'{outcome_text(err)} {err}', parent=self)
             return
+        log_event('devices', f"{'Edit' if self.device else 'Add'} of {name} ({ip}) SUCCESSFUL"
+                             f"{' (login saved, encrypted)' if username else ''}.", 'ok')
         self.destroy()
         self.on_saved()
 
@@ -417,5 +431,7 @@ class RestoreDialog(tk.Toplevel):
             messagebox.showerror('Restore failed',
                                  f"{outcome_text(err, 'Nothing was changed.')} {err}", parent=self)
             return
+        log_event('devices', f"Restore of {d['name']} ({d['ip']}) as {self.data['name']} "
+                             f"SUCCESSFUL.", 'ok')
         self.destroy()
         self.on_restored()

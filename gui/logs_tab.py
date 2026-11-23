@@ -3,6 +3,7 @@ from tkinter import ttk
 
 from gui import theme
 from gui.db_status import report_error
+from gui.event_log import log_event
 from store_errors import DATABASE_ERRORS
 
 PER_PAGE = 15
@@ -27,7 +28,7 @@ class LogsTab(ttk.Frame):
                            values=['all', 'success', 'failed'], font=theme.FONT_FORM)
         box.pack(side='left', padx=theme.PAD)
         box.bind('<<ComboboxSelected>>', lambda e: self.go_first())
-        ttk.Button(top, text='Refresh', command=self.refresh).pack(side='right')
+        ttk.Button(top, text='Refresh', command=self.refresh_clicked).pack(side='right')
 
         self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS], show='headings',
                                  style='Data.Treeview')
@@ -46,6 +47,12 @@ class LogsTab(ttk.Frame):
         self.next_btn.pack(side='left')
         self.refresh()
 
+    def refresh_clicked(self):
+        """The Refresh button: reload, and say so in the Console."""
+        log_event('logs', 'Refreshing the Logs page...')
+        if self.refresh():
+            log_event('logs', f'Refresh of the Logs page SUCCESSFUL ({self.total} entries).', 'ok')
+
     def go_first(self):
         self.page = 1
         self.refresh()
@@ -63,9 +70,11 @@ class LogsTab(ttk.Frame):
             self.page = min(max(self.page, 1), pages)
             rows = self.store.get_logs(text, self.page, PER_PAGE, status)
         except DATABASE_ERRORS as err:
+            log_event('logs', f'Reading the configuration log FAILED. {err}', 'error')
             self.show_unavailable(str(err))
             report_error(self, err)
-            return
+            return False
+        self.total = total
         self.tree.delete(*self.tree.get_children())
         for r in rows:
             when = r['created_at'].strftime('%Y-%m-%d %H:%M:%S')
@@ -77,6 +86,7 @@ class LogsTab(ttk.Frame):
         self.page_label.config(text=f'Page {self.page} of {pages}  ({total} entries)')
         self.prev_btn.state(['!disabled'] if self.page > 1 else ['disabled'])
         self.next_btn.state(['!disabled'] if self.page < pages else ['disabled'])
+        return True
 
     def show_unavailable(self, reason=''):
         """The log could not be read: show no rows at all (never old rows as if current)."""

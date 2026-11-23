@@ -281,7 +281,7 @@ def test_console_accepts_messages_from_worker_threads(app):
     t = threading.Thread(target=lambda: console.log('test', 'from a worker thread', 'ok'))
     t.start(); t.join()
     console.flush()
-    assert console.lines[-1][1:] == ('test', 'from a worker thread', 'ok')
+    assert console.lines[-1][1:] == ('test', 'SUCCESSFUL: from a worker thread', 'ok')
     assert 'from a worker thread' in console.text.get('1.0', 'end')
     console.clear()
     assert console.lines == [] and console.text.get('1.0', 'end').strip() == ''

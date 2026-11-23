@@ -1,7 +1,7 @@
 """Overview: the workbench's home page - a summary of the stored data.
 
     +--------------------------------------------------------------------------+
-    | Overview                                      Updated 14:02:31  [Refresh] |
+    | Overview                                    Updated 2:02:31 PM  [Refresh] |
     | [Devices 5]  [Status 4 online / 1 offline]  [Findings 7]  [Config 12]     |
     | Recent scan activity | Recent configuration activity | Recent status chg. |
     | Quick actions: Scan  Devices  Topology  Findings  Configure  Logs         |
@@ -33,8 +33,13 @@ from tkinter import ttk
 from gui import theme
 from gui.components.scroll_frame import auto_scrollbar, bind_wheel
 from gui.db_status import report_error
+from gui.event_log import log_event
+from gui.timefmt import format_time, now_text
 from store_errors import DATABASE_ERRORS
 
+RECENT_HOURS = 24    # the configuration card and list show only this many past hours
+BIG_FONT = (theme.FONT_FAMILY, 22, 'bold')       # the cards' big numbers
+UP_ARROW, DOWN_ARROW = '▲', '▼'
 FRESH_SECONDS = 15
 AUTO_SECONDS = 60
 RECENT = 6           # rows each list shows at least (its height); more scroll
@@ -44,7 +49,7 @@ QUICK_ACTIONS = [('scan', 'Scan network'), ('devices', 'Devices'), ('topology', 
                  ('findings', 'Findings'), ('configure', 'Configure'), ('logs', 'Logs')]
 NONE_YET = {
     'scan': 'No scans yet. Scans run on the Scan page; approved devices are listed here.',
-    'config': 'No configuration changes recorded yet.',
+    'config': 'No configuration changes in the last 24 hours.',
     'status': 'No status changes recorded yet. The background monitor records a change '
               'when a device goes down or comes back up.',
 }
@@ -61,13 +66,47 @@ def _all_devices(store):
         page += 1
 
 
-def summarize(store, scan_history=()):
+TYPE_LABELS = {'router': 'Routers', 'switch': 'Switches', 'unknown': 'Unknown'}
+TYPE_ORDER = ['router', 'switch']          # then any other type by name, 'unknown' last
+
+
+def type_label(kind):
+    return TYPE_LABELS.get(kind, kind.capitalize() + 's')
+
+
+def status_by_type(devices):
+    """[(label, up, down)] for the device types that exist, in TYPE_ORDER."""
+    counts = {}
+    for d in devices:
+        up_down = counts.setdefault(d.get('type') or 'unknown', [0, 0])
+        if d.get('status') == 'up':
+            up_down[0] += 1
+        elif d.get('status') == 'down':
+            up_down[1] += 1
+    order = TYPE_ORDER + sorted(k for k in counts if k not in TYPE_ORDER + ['unknown']) + ['unknown']
+    return [(type_label(k), *counts[k]) for k in order if k in counts]
+
+
+def latest_review(store, last_review=None):
+    """(findings, when) of the most recent review. The stored snapshot, unless this
+    session's own review (last_review, from the Findings page) is at least as new and
+    left nothing stored: a review that found nothing, or found only devices that are not
+    registered (sample data). when is None when no review is known."""
+    snapshot = store.get_findings_snapshot()
+    findings = [f for f in snapshot['findings'] if not f.get('device_deleted')]
+    when = snapshot.get('saved_at')
+    if last_review and last_review.get('at') and not findings and \
+            (when is None or _sortable(last_review['at']) >= _sortable(when)):
+        return list(last_review['findings']), last_review['at']
+    return findings, when
+
+
+def summarize(store, scan_history=(), last_review=None):
     """Everything the page shows, read from the store. Raises the store's errors."""
     devices = _all_devices(store)
     types = Counter((d.get('type') or 'unknown') for d in devices)
     status = Counter(d.get('status') for d in devices)
-    snapshot = store.get_findings_snapshot()
-    findings = [f for f in snapshot['findings'] if not f.get('device_deleted')]
+    findings, review_at = latest_review(store, last_review)
     severity = Counter(f['severity'] for f in findings)
     # This session's scans get up to SESSION_ROWS rows, so a scan that registered several
     # devices is not pushed off the list by those registrations; the rest are the newest
@@ -100,12 +139,15 @@ def summarize(store, scan_history=()):
         'unknown': len(devices) - types.get('router', 0) - types.get('switch', 0),
         'managed': sum(1 for d in devices if d.get('managed')),
         'online': status.get('up', 0), 'offline': status.get('down', 0),
+        'by_type': status_by_type(devices),
         'findings': len(findings), 'high': severity.get('high', 0),
         'medium': severity.get('medium', 0), 'low': severity.get('low', 0),
-        'review_saved_at': snapshot.get('saved_at'),
-        'changes': store.count_logs(), 'changes_ok': store.count_logs(status='success'),
-        'changes_failed': store.count_logs(status='failed'),
-        'recent_changes': store.get_logs(page=1, per_page=LIST_ROWS),
+        'review_saved_at': review_at,
+        # the last RECENT_HOURS only; older entries stay stored (Logs page)
+        'changes': store.count_logs(within_hours=RECENT_HOURS),
+        'changes_ok': store.count_logs(status='success', within_hours=RECENT_HOURS),
+        'changes_failed': store.count_logs(status='failed', within_hours=RECENT_HOURS),
+        'recent_changes': store.get_logs(page=1, per_page=LIST_ROWS, within_hours=RECENT_HOURS),
         'recent_events': store.get_events(limit=LIST_ROWS),
         'recent_activity': activity[:LIST_ROWS],
     }
@@ -121,15 +163,15 @@ def _sortable(when):
 
 
 def when_text(when, today=None):
-    """'14:02' for today, 'Nov 19 14:02' for another day, '' when unknown."""
+    """'2:02 PM' for today, 'Nov 19 2:02 PM' for another day, '' when unknown."""
     if not when:
         return ''
     when = _sortable(when)
     if when == datetime.min:
         return ''
     if when.date() == (today or date.today()):
-        return when.strftime('%H:%M')
-    return when.strftime('%b %d %H:%M')
+        return format_time(when)
+    return f"{when:%b %d} {format_time(when)}"
 
 
 def _short(text, limit=70):
@@ -138,16 +180,47 @@ def _short(text, limit=70):
 
 
 # ---------------------------------------------------------------- the page
+class Tooltip:
+    """A small hover text for one or more widgets (Tk has no built-in tooltip).
+    Change .text at any time; an empty text shows nothing."""
+    def __init__(self, widgets, text=''):
+        self.text, self.tip = text, None
+        for w in widgets:
+            w.bind('<Enter>', lambda e, w=w: self.show(w), add='+')
+            w.bind('<Leave>', lambda e: self.hide(), add='+')
+
+    def show(self, widget):
+        self.hide()
+        if not self.text:
+            return
+        self.tip = tk.Toplevel(widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f'+{widget.winfo_rootx() + 10}+{widget.winfo_rooty() + widget.winfo_height() + 4}')
+        tk.Label(self.tip, text=self.text, font=theme.FONT_SMALL, background=theme.CARD,
+                 foreground=theme.TEXT, relief='solid', borderwidth=1, padx=6,
+                 pady=3).pack()
+
+    def hide(self):
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except tk.TclError:
+                pass
+            self.tip = None
+
+
 class OverviewPage(tk.Frame):
     def __init__(self, parent, open_page, store=None, can_open=None, scan_history=None,
-                 source_note=''):
+                 source_note='', last_review=None):
         """open_page(key) switches to another page; can_open(key) says whether the
         signed-in role may open it (quick actions are offered only for those);
-        scan_history() returns the Scan page's session history."""
+        scan_history() returns the Scan page's session history; last_review() the
+        Findings page's newest review of this session (or None)."""
         super().__init__(parent, background=theme.SURFACE)
         self.open_page, self.store = open_page, store
         self.can_open = can_open or (lambda key: True)
         self.scan_history = scan_history or (lambda: [])
+        self.last_review = last_review or (lambda: None)
         self.data, self.loaded_at, self.stale, self.error = None, None, True, None
         self.db_down = False                     # a known outage: no automatic queries
         self._auto = None
@@ -163,7 +236,7 @@ class OverviewPage(tk.Frame):
             titles, text=('Summary of the stored network data. ' + source_note).strip(),
             font=theme.FONT_SMALL, background=theme.SURFACE, foreground=theme.TEXT_MUTED)
         self.message.pack(anchor='w')
-        self.refresh_button = ttk.Button(head, text='Refresh', command=lambda: self.refresh(True, manual=True))
+        self.refresh_button = ttk.Button(head, text='Refresh', command=self.refresh_clicked)
         self.refresh_button.pack(side='right')
         self.updated = tk.Label(head, text='', font=theme.mono(8), background=theme.SURFACE,
                                 foreground=theme.TEXT_MUTED)
@@ -188,6 +261,21 @@ class OverviewPage(tk.Frame):
             self.cards[key] = self._card(cards, title)
             self.cards[key]['frame'].grid(row=0, column=col, sticky='nsew',
                                           padx=(0 if col == 0 else 6, 0))
+        # the status card's big indicator: green '▲ 3' and red '▼ 2' side by side (one
+        # label cannot have two colours), replacing the card's single value label
+        status = self.cards['status']
+        status['value'].destroy()
+        big = tk.Frame(status['frame'], background=theme.CARD)
+        big.pack(fill='x', before=status['detail'])
+        status['value'] = tk.Label(big, text='—', font=BIG_FONT, background=theme.CARD,
+                                   foreground=theme.TEXT_MUTED, anchor='w')
+        status['value'].pack(side='left')
+        status['down'] = tk.Label(big, text='', font=BIG_FONT, background=theme.CARD,
+                                  foreground=theme.DANGER, anchor='w')
+        status['tooltip'] = Tooltip([big, status['value'], status['down']])
+        # the status card's per-type rows (Routers 1 up · 0 down), filled by _show
+        status['types'] = tk.Frame(status['frame'], background=theme.CARD)
+        status['types'].pack(fill='x', pady=(4, 0), before=status['note'])
 
         # ---- recent lists
         lists = tk.Frame(body, background=theme.SURFACE)
@@ -235,7 +323,7 @@ class OverviewPage(tk.Frame):
                          highlightbackground=theme.BORDER, padx=14, pady=10)
         tk.Label(frame, text=title, font=theme.mono(8, 'bold'), background=theme.CARD,
                  foreground=theme.TEXT_MUTED, anchor='w').pack(fill='x')
-        value = tk.Label(frame, text='—', font=(theme.FONT_FAMILY, 22, 'bold'),
+        value = tk.Label(frame, text='—', font=BIG_FONT,
                          background=theme.CARD, foreground=theme.TEXT, anchor='w')
         value.pack(fill='x')
         detail = tk.Label(frame, text='', font=theme.FONT, background=theme.CARD,
@@ -280,6 +368,13 @@ class OverviewPage(tk.Frame):
         if self.winfo_ismapped() and not self.db_down:
             self.refresh(force=True)
 
+    def refresh_clicked(self):
+        """The Refresh button: reload now (even during an outage), and say so."""
+        log_event('overview', 'Refreshing the Overview...')
+        self.refresh(True, manual=True)
+        if self.data is not None:
+            log_event('overview', 'Refresh of the Overview SUCCESSFUL.', 'ok')
+
     def refresh(self, force=False, manual=False):
         """Reload from the store when forced, stale or older than FRESH_SECONDS. During a
         known database outage only the Refresh button (manual) tries."""
@@ -289,19 +384,22 @@ class OverviewPage(tk.Frame):
         if not force and not self.stale and age is not None and age < FRESH_SECONDS:
             return
         try:
-            data = summarize(self.store, self.scan_history())
+            data = summarize(self.store, self.scan_history(), self.last_review())
         except DATABASE_ERRORS as err:
+            log_event('overview', f'Loading the Overview FAILED. {err}', 'error')
             report_error(self, err)
             self.show_unavailable(str(err))
             return
         except Exception as err:                       # never crash the home page
+            log_event('overview', f'Loading the Overview FAILED ({type(err).__name__}: {err}).',
+                      'error')
             self.show_unavailable(f'The overview could not be loaded ({type(err).__name__}).')
             return
         self.data, self.error, self.stale = data, None, False
         self.loaded_at = time.monotonic()
         self.banner.pack_forget()
         self._show(data)
-        self.updated.config(text=f"Updated {datetime.now().strftime('%H:%M:%S')}")
+        self.updated.config(text=f'Updated {now_text(seconds=True)}')
         self._schedule()
 
     def show_unavailable(self, reason=''):
@@ -314,6 +412,9 @@ class OverviewPage(tk.Frame):
             card['value'].config(text='—')
             card['detail'].config(text='')
             card['note'].config(text='')
+        self._status_indicator(None, None)
+        self.cards['status']['tooltip'].text = ''
+        self._fill_types([])
         for key in self.lists:
             self._fill(key, [], 'Not available while the database cannot be read.')
         self.updated.config(text='')
@@ -358,35 +459,40 @@ class OverviewPage(tk.Frame):
             c['devices']['note'].config(text=f"{d['managed']} managed (NetCommand can log in)")
 
         if d['devices'] == 0:
-            c['status']['value'].config(text='—', foreground=theme.TEXT)
-            c['status']['detail'].config(text='No devices to monitor.')
+            self._status_indicator(None, None)
+            c['status']['detail'].config(text='No devices detected')
             c['status']['note'].config(text='')
+            self._fill_types([])
         else:
-            c['status']['value'].config(text=f"{d['online']} up",
-                                        foreground=theme.SUCCESS if not d['offline'] else theme.TEXT)
+            self._status_indicator(d['online'], d['offline'])
             c['status']['detail'].config(text=f"●  {d['online']} online    ■  {d['offline']} offline")
             c['status']['note'].config(text='As last recorded by the background monitor.')
+            self._fill_types(d['by_type'])
 
-        if d['findings'] == 0:
+        if d['review_saved_at'] is None:
             c['findings']['value'].config(text='0')
-            c['findings']['detail'].config(
-                text='No review saved yet.' if not d['review_saved_at'] else
-                'The last review found nothing.')
-            c['findings']['note'].config(text='Run a review on the Findings page.'
-                                         if not d['review_saved_at'] else '')
+            c['findings']['detail'].config(text='No review saved yet.')
+            c['findings']['note'].config(text='Run a review on the Findings page.')
+        elif d['findings'] == 0:
+            c['findings']['value'].config(text='0')
+            c['findings']['detail'].config(text='The last review found nothing.')
+            c['findings']['note'].config(text=f"Last review: {when_text(d['review_saved_at'])}")
         else:
-            c['findings']['value'].config(text=str(d['findings']))
-            c['findings']['detail'].config(
-                text=f"{d['high']} high  ·  {d['medium']} medium  ·  {d['low']} low")
+            n = d['findings']
+            parts = [f"{n} finding{'' if n == 1 else 's'}"] + \
+                [f'{d[sev]} {sev}' for sev in ('high', 'medium', 'low') if d[sev]]
+            c['findings']['value'].config(text=str(n))
+            c['findings']['detail'].config(text='  ·  '.join(parts))
             c['findings']['note'].config(text=f"Last review: {when_text(d['review_saved_at'])}")
         c['findings']['value'].config(foreground=theme.DANGER if d['high'] else theme.TEXT)
 
         c['changes']['value'].config(text=str(d['changes']))
         if d['changes'] == 0:
-            c['changes']['detail'].config(text='No configuration applied yet.')
+            c['changes']['detail'].config(text=NONE_YET['config'])
         else:
             c['changes']['detail'].config(
-                text=f"{d['changes_ok']} successful  ·  {d['changes_failed']} failed")
+                text=f"{d['changes_ok']} successful  ·  {d['changes_failed']} failed"
+                     f"  ·  last {RECENT_HOURS} hours")
         c['changes']['note'].config(text='Every Apply is logged (Logs page).')
 
         self._fill('scan', [((when_text(a['when']), a['what'], _short(a['detail'])), ())
@@ -400,6 +506,38 @@ class OverviewPage(tk.Frame):
                                 _short(e.get('detail'), 40)),
                                (e['kind'],) if e['kind'] in ('up', 'down') else ())
                               for e in d['recent_events']], NONE_YET['status'])
+
+    def _status_indicator(self, up, down):
+        """The big status figure: '▲ 5' (green), '▼ 5' (red), both side by side when
+        mixed, or a grey '—' (up None: no devices / not available)."""
+        s = self.cards['status']
+        s['down'].pack_forget()
+        if up is None:
+            s['value'].config(text='—', foreground=theme.TEXT_MUTED)
+            s['tooltip'].text = 'No devices detected'
+            return
+        if down and not up:
+            s['value'].config(text=f'{DOWN_ARROW} {down}', foreground=theme.DANGER)
+        else:
+            s['value'].config(text=f'{UP_ARROW} {up}', foreground=theme.SUCCESS)
+            if down:
+                s['down'].config(text=f'{DOWN_ARROW} {down}')
+                s['down'].pack(side='left', padx=(14, 0))
+        s['tooltip'].text = (f"{up} device{'' if up == 1 else 's'} up, "
+                             f"{down} device{'' if down == 1 else 's'} down")
+
+    def _fill_types(self, by_type):
+        """The status card's rows: 'Routers   1 up  ·  0 down', down in red when > 0."""
+        frame = self.cards['status']['types']
+        for child in frame.winfo_children():
+            child.destroy()
+        for row, (label, up, down) in enumerate(by_type):
+            for col, (text, color) in enumerate([
+                    (label, theme.TEXT_SOFT), (f'{up} up  ·  ', theme.TEXT_SOFT),
+                    (f'{down} down', theme.DANGER if down else theme.TEXT_SOFT)]):
+                tk.Label(frame, text=text, font=theme.FONT_SMALL, background=theme.CARD,
+                         foreground=color, anchor='w').grid(row=row, column=col, sticky='w',
+                                                            padx=(0, 10 if col == 0 else 0))
 
     def _fill(self, key, rows, empty_text):
         part = self.lists[key]

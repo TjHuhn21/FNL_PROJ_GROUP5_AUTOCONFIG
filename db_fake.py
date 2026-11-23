@@ -2,7 +2,7 @@
 behaviour as db.py, so the screens work with either. Data is lost on exit."""
 import functools
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from store_errors import DeletedDeviceExists, DeviceNotDeleted, DuplicateDeviceName
 
@@ -307,13 +307,16 @@ def add_log(device_id, action, status, details=''):
     return lid
 
 
-def _log_rows(search, status):
+def _log_rows(search, status, within_hours=None):
     s = search.lower()
+    since = None if within_hours is None else datetime.now() - timedelta(hours=within_hours)
     rows = []
     for l in _logs:
         d = _devices.get(l['device_id'])
         name = d['name'] if d else '?'
         if status and l['status'] != status:
+            continue
+        if since is not None and l['created_at'] < since:
             continue
         if s and not (s in name.lower() or s in l['action'].lower()
                       or s in (l['details'] or '').lower()):
@@ -323,13 +326,14 @@ def _log_rows(search, status):
     return sorted(rows, key=lambda r: r['id'], reverse=True)
 
 
-def count_logs(search='', status=''):
-    return len(_log_rows(search, status))
+def count_logs(search='', status='', within_hours=None):
+    """Same as db.count_logs (within_hours: only the last N hours)."""
+    return len(_log_rows(search, status, within_hours))
 
 
-def get_logs(search='', page=1, per_page=15, status=''):
+def get_logs(search='', page=1, per_page=15, status='', within_hours=None):
     start = (max(page, 1) - 1) * per_page
-    return _log_rows(search, status)[start:start + per_page]
+    return _log_rows(search, status, within_hours)[start:start + per_page]
 
 
 # ---------------------------------------------------------------- findings

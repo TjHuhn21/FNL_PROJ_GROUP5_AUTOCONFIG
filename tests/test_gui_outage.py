@@ -379,7 +379,7 @@ def test_monitor_failure_reaches_the_window_from_its_thread(ui):
     finally:
         stop.set()
     r['console'].flush()
-    assert any(src == 'database' and msg.startswith('monitor: paused')
+    assert any(src == 'database' and 'monitor: paused' in msg
                for _t, src, msg, _l in r['console'].lines)
     assert r['store'].writes() == []
 

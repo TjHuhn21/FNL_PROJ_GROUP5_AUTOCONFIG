@@ -30,6 +30,7 @@ from tkinter import ttk
 from desktop_auth.api_client import ApiError
 from desktop_auth.session import AuthSession
 from gui import background, theme
+from gui.event_log import log_event
 
 APPROVAL_NEEDED = ('Email address verified. An administrator must approve your account '
                    'before you can sign in.')
@@ -52,6 +53,23 @@ TITLES = {
 }
 BANNER = {'error': (theme.DANGER_SOFT, theme.DANGER), 'success': (theme.SUCCESS_SOFT, theme.SUCCESS),
           'info': (theme.ACCENT_SOFT, theme.TEXT)}
+
+
+MASK = '*****'              # always 5, so the masked text does not reveal the name's length
+NO_EMAIL_TEXT = 'your email'
+
+
+def mask_email(email):
+    """The email address as shown on screen: the name before the @ is partly hidden
+    (first 2 + ***** + last 2; names of 4 characters or fewer: first 1 + *****), the
+    domain is kept. Display only: requests always use the real address.
+    Empty or no '@' -> 'your email'."""
+    local, at, domain = (email or '').strip().rpartition('@')
+    if not at or not local or not domain:
+        return NO_EMAIL_TEXT
+    if len(local) <= 4:
+        return f'{local[0]}{MASK}@{domain}'
+    return f'{local[:2]}{MASK}{local[-2:]}@{domain}'
 
 
 def mmss(seconds):
@@ -260,7 +278,7 @@ class SignInWindow(ttk.Frame):
         self.current = name
         title, subtitle = TITLES[name]
         self.heading.config(text=title)
-        self.subtitle.config(text=subtitle.format(email=self.pending_email or 'your email'))
+        self.subtitle.config(text=subtitle.format(email=mask_email(self.pending_email)))
         if message is not None:
             self.say(message)
         if name in CODE_SCREENS:
@@ -312,16 +330,21 @@ class SignInWindow(ttk.Frame):
             return
         self._set_busy(True, busy_text)
         self.say(busy_text)
+        step = busy_text.rstrip('.').strip()            # e.g. 'Verifying the code'
+        log_event('sign-in', f'{step}...')              # never a password or a code
 
         def done(result, error):
             self._set_busy(False)
             if isinstance(error, ApiError):
+                log_event('sign-in', f'{step}: FAILED. {error}', 'error')
                 if on_error:
                     on_error(error)
                 self.say(str(error), error=True)
             elif error is not None:
+                log_event('sign-in', f'{step}: FAILED. {GENERIC_FAILURE}', 'error')
                 self.say(GENERIC_FAILURE, error=True)
             else:
+                log_event('sign-in', f'{step}: SUCCESSFUL.', 'ok')
                 on_ok(result)
         background.run_async(self, fn, done)
 

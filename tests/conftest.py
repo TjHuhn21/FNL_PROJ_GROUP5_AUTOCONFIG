@@ -54,6 +54,18 @@ def synthetic_backup_key(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def fresh_console_history(monkeypatch):
+    """main.main() turns on the app-wide Console history (gui.event_log.keep_history);
+    each test starts without it, so no Console replays another test's lines."""
+    try:
+        from gui import event_log
+    except Exception:                       # tests that cannot import it do not need it
+        return
+    monkeypatch.setattr(event_log, '_history', [])
+    monkeypatch.setattr(event_log, '_keeping', [False])
+
+
+@pytest.fixture(autouse=True)
 def private_layout_file(tmp_path, monkeypatch):
     path = tmp_path / 'topology_layout.json'
     monkeypatch.setenv('NETCOMMAND_LAYOUT_FILE', str(path))

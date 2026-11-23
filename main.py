@@ -14,6 +14,8 @@ import sys
 import threading
 from tkinter import messagebox
 
+from gui.event_log import keep_history, log_event
+
 SIGNED_OUT, CLOSED = 'signed_out', 'closed'
 LOGOUT_WAIT = 3              # seconds to wait for the server to end the session on exit
 
@@ -173,13 +175,16 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
         def sign_out():
             if restore_window.block_shutdown(root) or apply_blocks(sign_out, 'sign out'):
                 return
+            log_event('app', 'Signing out...')
             end_server_session(client, session)
+            log_event('app', 'Sign-out SUCCESSFUL.', 'ok')
             finish(SIGNED_OUT)
 
         def session_ended(reason):
             message = ENDED_MESSAGES.get(reason, ENDED_MESSAGES['ended'])
             if outcome['done'] or outcome['deferred']:
                 return
+            log_event('app', f'Signed out by the server: {message}', 'warn')
             if restore_window.restore_activity():
                 # The session is over (its token is already cleared), but a restore is
                 # running: hide the workbench, let the restore finish and show its result,
@@ -213,6 +218,7 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
         def close_window():
             if restore_window.block_shutdown(root) or apply_blocks(close_window, 'close'):
                 return
+            log_event('app', 'Closing NetCommand (signing out)...')
             end_server_session(client, session)
             finish(CLOSED)
 
@@ -235,6 +241,7 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
         problem = security.check_key()
         if problem:                                      # warn and keep running
             print(f'Warning: {problem}')                 # safe: the message never contains the key
+            log_event('app', f'Encryption key check: {problem}', 'warn')
             root.after(200, lambda: messagebox.showwarning(
                 'Encryption key problem',
                 problem + '\n\nNetCommand will run, but device logins cannot be saved '
@@ -245,6 +252,8 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
         # status. Both callbacks are thread-safe and never touch a widget themselves.
         stop = start_monitor(store, on_change=refs['console'].status_changed,
                              on_error=refs['db_status'].post)
+        log_event('monitor', 'Background status monitor started (devices are checked for '
+                             'up/down).')
         root.bind('<Destroy>', lambda e: stop.set() if e.widget is root else None, add='+')
     root.mainloop()
     restore_window.workbench_closed()
@@ -252,6 +261,8 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
 
 
 def main():
+    keep_history()                           # the Console shows everything since app start
+    log_event('app', 'NetCommand started.')
     if '--demo' in sys.argv:                 # DEMO MODE: only ever by asking for it
         from desktop_auth.session import Access
         store, demo, startup_problem = choose_store(True)
@@ -269,11 +280,17 @@ def main():
         return
     store = None
     while True:
+        log_event('app', 'Waiting for sign-in...')
         session = sign_in(client)
         if session is None:                  # the sign-in window was closed
+            log_event('app', 'Sign-in window closed without signing in.', 'warn')
             return
         if store is None:
+            log_event('app', 'Connecting to the database...')
             store, demo, startup_problem = choose_store(False)
+            if startup_problem:
+                log_event('app', f'Connecting to the database FAILED: {startup_problem} '
+                                 f'Using sample mode.', 'error')
         if run_workbench(store, demo, startup_problem, access=session.access, client=client,
                          session=session) != SIGNED_OUT:
             return

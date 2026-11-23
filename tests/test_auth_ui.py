@@ -52,6 +52,28 @@ def to_code_screen(win, backend):
     assert win.current == 'login_code'
 
 
+# ---------------------------------------------------------------- masked email
+@pytest.mark.parametrize('email, shown', [
+    ('jfontillaz.9008@umak.edu.ph', 'jf*****08@umak.edu.ph'),
+    ('abcd@gmail.com', 'a*****@gmail.com'),
+    ('a@gmail.com', 'a*****@gmail.com'),
+    ('abcde@gmail.com', 'ab*****de@gmail.com'),
+    ('', 'your email'), (None, 'your email'), ('no-at-sign', 'your email'),
+    ('@gmail.com', 'your email'), ('abc@', 'your email')])
+def test_mask_email(email, shown):
+    assert auth_window.mask_email(email) == shown
+
+
+def test_code_screen_masks_the_email_but_requests_use_the_real_one(env):
+    root, win, backend, signed, clock = env
+    backend.user('jfontillaz.9008@example.com')
+    win.vars['email'].set('jfontillaz.9008@example.com')
+    win.vars['password'].set(PASSWORD)
+    win.submit_login()
+    assert win.subtitle.cget('text') == 'A 6-digit code was sent to jf*****08@example.com.'
+    assert win.pending_email == 'jfontillaz.9008@example.com'       # kept in full
+
+
 # ---------------------------------------------------------------- look and structure
 def test_every_screen_has_a_title_and_subtitle(env):
     root, win, *_ = env
@@ -209,7 +231,7 @@ def test_successful_verification_is_shown_as_success(env):
                         ('reg_password', PASSWORD), ('reg_confirm', PASSWORD)]:
         win.vars[name].set(value)
     win.submit_register()
-    assert win.subtitle.cget('text') == 'Enter the 6-digit code sent to new@example.com.'
+    assert win.subtitle.cget('text') == 'Enter the 6-digit code sent to n*****@example.com.'
     win.vars['reg_code'].set(backend.mailer.last_code())
     win.submit_register_code()
     assert win.message.cget('text') == auth_window.APPROVAL_NEEDED

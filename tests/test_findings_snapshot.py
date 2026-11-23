@@ -394,7 +394,10 @@ def test_deleted_devices_are_marked_on_the_page(ui):
     assert 'SW1 (deleted)' in devices and 'Devices deleted since: SW1.' in f.note.cget('text')
 
 
-def test_sample_review_is_never_stored(monkeypatch):
+def test_sample_review_is_stored_only_in_the_in_memory_sample_store(monkeypatch):
+    """Sample mode: the review goes to the in-memory sample store (so the Overview can
+    show it). Database mode never stores sample findings: see test_overview's
+    test_database_mode_never_stores_sample_findings."""
     try:
         root = tk.Tk()
     except tk.TclError as err:
@@ -405,10 +408,12 @@ def test_sample_review_is_never_stored(monkeypatch):
         refs = build_main_window(root, db_fake, demo_store=True)
         f = refs['findings']
         calls = []
-        monkeypatch.setattr(db_fake, 'replace_findings', lambda x: calls.append(x))
+        monkeypatch.setattr(db_fake, 'replace_findings',
+                            lambda x: calls.append(x) or {'saved': 0, 'skipped': []})
         f.run()
         assert pump(root, lambda: not f.busy)
-        assert f.view == 'sample' and f.findings and calls == []
+        assert f.view == 'sample' and f.findings and calls == [f.findings]
+        assert f.last_review and f.last_review['findings'] == f.findings
     finally:
         root.destroy()
 

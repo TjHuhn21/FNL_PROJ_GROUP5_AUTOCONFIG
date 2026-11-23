@@ -23,11 +23,11 @@ status history stay stored, and Refresh (or opening the tab again) shows them ag
 import queue
 import threading
 import tkinter as tk
-from datetime import datetime
 from tkinter import ttk
 
-from gui import theme
+from gui import event_log, theme
 from gui.db_status import report_error
+from gui.timefmt import format_date_time, now_text
 
 LEVEL_COLORS = {'info': None, 'ok': theme.SUCCESS, 'warn': theme.WARNING, 'error': theme.DANGER}
 CONFIG_LOG_ROWS = 50
@@ -73,9 +73,13 @@ class OperationsConsole(tk.Frame):
 
         self._timer = self.after(150, self._drain)
         self.bind('<Destroy>', self._stop, add='+')
+        event_log.attach(self.log)              # log_event(...) now writes here
 
     def _stop(self, event):
-        if event.widget is self and self._timer:     # window closing: stop the timer cleanly
+        if event.widget is not self:
+            return
+        event_log.detach(self.log)
+        if self._timer:                          # window closing: stop the timer cleanly
             try:
                 self.after_cancel(self._timer)
             except tk.TclError:
@@ -100,27 +104,38 @@ class OperationsConsole(tk.Frame):
         return text
 
     # ---------------------------------------------------------------- Console tab
-    def log(self, source, message, level='info'):
-        """Add one line. Safe to call from any thread."""
-        self._queue.put((datetime.now().strftime('%H:%M:%S'), source, message, level))
+    def log(self, source, message, level='info', when=None):
+        """Add one line: the sink of event_log.log_event (features call log_event, not
+        this). Safe from any thread. Outcome lines are labelled SUCCESSFUL / FAILED /
+        WARNING (event_log.normalize). when: the original time of a replayed line."""
+        message, level = event_log.normalize(message, level)
+        self._queue.put((when or now_text(seconds=True), source, message, level))
 
     @staticmethod
     def _make_status_callback(lines, changed):
         """The monitor's on_change(device, new_status): safe from any thread. A plain
-        function holding only a queue and an Event, never a widget."""
+        function holding only an Event, never a widget; the line goes through log_event."""
         def status_changed(device, new):
-            lines.put((datetime.now().strftime('%H:%M:%S'), 'monitor',
-                       f"{device['name']} ({device['ip']}): {device['status']} -> {new} "
-                       f"(recorded)", 'ok' if new == 'up' else 'warn'))
+            name = f"{device['name']} ({device['ip']})"
+            if new == 'up':
+                event_log.log_event('monitor', f"{name}: status check SUCCESSFUL, the device "
+                                               f"is UP (was {device['status']}). Recorded.", 'ok')
+            else:
+                event_log.log_event('monitor', f"{name}: status check FAILED, the device is "
+                                               f"DOWN (was {device['status']}). Recorded.",
+                                    'error')
             changed.set()
         return status_changed
 
     def _drain(self):
+        batch = []
         try:
             while True:
-                self._write(*self._queue.get_nowait())
+                batch.append(self._queue.get_nowait())
         except queue.Empty:
             pass
+        if batch:
+            self._write_many(batch)
         if self._events_changed.is_set():             # the monitor recorded a change
             self._events_changed.clear()
             if self._current_tab() == EVENTS_TAB:
@@ -132,22 +147,41 @@ class OperationsConsole(tk.Frame):
 
     def flush(self):
         """Put every queued line on screen now (used by tests and on shutdown)."""
+        batch = []
         try:
             while True:
-                self._write(*self._queue.get_nowait())
+                batch.append(self._queue.get_nowait())
         except queue.Empty:
             pass
+        if batch:
+            self._write_many(batch)
+
+    def _at_bottom(self):
+        """True unless the user scrolled up to read older lines."""
+        try:
+            return self.text.yview()[1] >= 0.999
+        except tk.TclError:
+            return True
+
+    def _write_many(self, batch):
+        """Append lines. The whole session is kept (nothing is trimmed); a tk Text widget
+        handles a long history without slowing down, and lines are written in batches.
+        Follows the newest line only when the view was already at the bottom."""
+        t = self.text
+        follow = self._at_bottom()
+        t.configure(state='normal')
+        for when, source, message, level in batch:
+            self.lines.append((when, source, message, level))
+            t.insert('end', f'{when:>11}', ('time',))         # '12:59:59 PM' is 11 wide
+            t.insert('end', '  ')
+            t.insert('end', f'{source:<9} ', ('source',))     # 'configure' is 9 letters: keep a gap
+            t.insert('end', message + '\n', (level,) if LEVEL_COLORS.get(level) else ())
+        if follow:
+            t.see('end')
+        t.configure(state='disabled')
 
     def _write(self, when, source, message, level):
-        self.lines.append((when, source, message, level))
-        t = self.text
-        t.configure(state='normal')
-        t.insert('end', when, ('time',))
-        t.insert('end', '  ')
-        t.insert('end', f'{source:<9} ', ('source',))     # 'configure' is 9 letters: keep a gap
-        t.insert('end', message + '\n', (level,) if LEVEL_COLORS.get(level) else ())
-        t.see('end')
-        t.configure(state='disabled')
+        self._write_many([(when, source, message, level)])
 
     def clear(self):
         """The Clear button: empty the tab that is shown. On the stored-data tabs only the
@@ -183,10 +217,17 @@ class OperationsConsole(tk.Frame):
         """The Refresh button, and after the database is back: reload the tab shown.
         On the Console tab: show any lines that are still waiting in the queue."""
         tab = self._current_tab()
-        if tab == CONFIG_TAB:
-            self.refresh_config_log()
-        elif tab == EVENTS_TAB:
-            self.refresh_events()
+        if tab in (CONFIG_TAB, EVENTS_TAB):
+            what = 'configuration log' if tab == CONFIG_TAB else 'status events'
+            event_log.log_event('console', f'Refreshing the {what}...')
+            rows = self.refresh_config_log() if tab == CONFIG_TAB else self.refresh_events()
+            text = (self.config_text if tab == CONFIG_TAB else self.events_text).get('1.0', '2.0')
+            if text.startswith(('Could not read', 'Database unavailable')):
+                event_log.log_event('console', f'Refresh of the {what} FAILED. {text.strip()}',
+                                    'error')
+            else:
+                event_log.log_event('console', f'Refresh of the {what} SUCCESSFUL '
+                                               f'({len(rows)} entries shown).', 'ok')
         else:
             self.flush()
 
@@ -218,7 +259,7 @@ class OperationsConsole(tk.Frame):
             t.insert('end', 'No status changes have been recorded yet. The background '
                             'monitor records them (database mode only).\n', ('time',))
         for r in rows:
-            when = r['created_at'].strftime('%Y-%m-%d %H:%M:%S') if r.get('created_at') else ''
+            when = format_date_time(r.get('created_at'), seconds=True)
             previous = r.get('previous') or '?'
             level = 'ok' if r['kind'] == 'up' else 'error' if r['kind'] == 'down' else 'info'
             t.insert('end', when, ('time',))
@@ -246,7 +287,7 @@ class OperationsConsole(tk.Frame):
         if rows is not None and not rows:
             t.insert('end', 'No configuration changes have been logged yet.\n', ('time',))
         for r in rows or []:
-            when = r['created_at'].strftime('%Y-%m-%d %H:%M:%S') if r.get('created_at') else ''
+            when = format_date_time(r.get('created_at'), seconds=True)
             level = 'ok' if r['status'] == 'success' else 'error'
             t.insert('end', when, ('time',))
             t.insert('end', f"  {r['device']:<10} {r['action']:<14} ")

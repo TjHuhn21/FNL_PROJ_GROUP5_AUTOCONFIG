@@ -691,8 +691,12 @@ class ConfigureTab(ttk.Frame):
                                 'Run a scan and approve devices if the list is empty.')
             return
         kind = self.config_kind()
+        names = ', '.join(d['name'] for d in chosen)
+        self.log('configure', f'{names}: validating the configuration...')
         targets, skipped = multi.split_targets(chosen, kind)
         if not targets:
+            self.log('configure', f'{names}: validation FAILED: none of them can receive '
+                                  f'{multi.KINDS[kind].lower()}.', 'error')
             messagebox.showinfo('No compatible device',
                                 f'None of the selected devices can receive '
                                 f'{multi.KINDS[kind].lower()}:\n\n'
@@ -700,9 +704,12 @@ class ConfigureTab(ttk.Frame):
             return
         built = self._build_plan(kind, len(targets))
         if built is None:
+            self.log('configure', f'{names}: validation FAILED (see the message shown).', 'error')
             return
         commands, checks, features = built
         if not commands:
+            self.log('configure', f'{names}: validation WARNING: no setting was filled in, so '
+                                  f'there is nothing to preview.', 'warn')
             messagebox.showinfo('Nothing to preview', 'Fill in at least one setting '
                                 '(a VLAN, ports, a trunk, a route, DHCP...) first.')
             return
@@ -735,6 +742,10 @@ class ConfigureTab(ttk.Frame):
         if skipped:
             text += f', {len(skipped)} skipped'
         self.status.config(text=text + '. Read them, then click Apply.')
+        self.log('configure', f"{', '.join(d['name'] for d in targets)}: validation SUCCESSFUL. "
+                              f"{text} ready to apply.", 'ok')
+        for d, why in skipped:
+            self.log('configure', f"{d['name']}: skipped ({why}).", 'warn')
 
     def _set_preview_lines(self, lines):
         self.preview.delete('1.0', 'end')
@@ -913,9 +924,13 @@ class ConfigureTab(ttk.Frame):
                 messagebox.showerror('Cannot apply', '\n'.join(problems))
             return
         if not database_ready(self):        # logins and the result log live in the database
+            self.log('configure', 'Apply FAILED: the database is unavailable. Nothing was sent.',
+                     'error')
             return
         key_problem = self.backup_preflight()
         if key_problem:                     # no encrypted backup possible: nothing may be sent
+            self.log('configure', f'Apply FAILED: the backup encryption key is not available. '
+                                  f'Nothing was sent. {key_problem}', 'error')
             self.status.config(text='Apply not started: the backup encryption key is not '
                                     'available. Nothing was sent.')
             messagebox.showerror('Backup encryption key not available',
@@ -925,6 +940,7 @@ class ConfigureTab(ttk.Frame):
             return
         if not messagebox.askyesno('Apply to devices' if len(jobs) > 1 else 'Apply to device',
                                    self._confirm_text(jobs)):
+            self.log('configure', 'Apply cancelled. Nothing was sent.', 'warn')
             return
         self._pending_saves = {}
         try:
@@ -936,6 +952,8 @@ class ConfigureTab(ttk.Frame):
             return
         if not creds:
             self.status.config(text='Apply cancelled: no login was entered. Nothing was sent.')
+            self.log('configure', 'Apply cancelled: no login was entered. Nothing was sent.',
+                     'warn')
             return
         for j in jobs:
             j['creds'] = creds[j['device']['id']]
@@ -955,6 +973,11 @@ class ConfigureTab(ttk.Frame):
         self.stop_btn.state(['!disabled'] if len(jobs) > 1 else ['disabled'])
         names = ', '.join(j['device']['name'] for j in jobs)
         self.status.config(text=f'Applying to {names}... the SSH session is shown below.')
+        for j in jobs:
+            d = j['device']
+            self.log('configure', f"{d['name']}: applying {len(j['commands'])} command"
+                                  f"{'' if len(j['commands']) == 1 else 's'} to {d['ip']} "
+                                  f"(encrypted backup first)...")
         if len(jobs) == 1:
             d = jobs[0]['device']
             self.session.start_run(d['name'], d['ip'], len(jobs[0]['commands']))
@@ -968,6 +991,8 @@ class ConfigureTab(ttk.Frame):
         """Do not start any more devices (the one in progress finishes safely)."""
         if self.busy:
             self._stop.set()
+            self.log('configure', 'Stop requested: no more devices will be started (the one in '
+                                  'progress finishes safely).', 'warn')
             self.stop_btn.state(['disabled'])
             self.status.config(text='Stopping after the current device...')
 
@@ -1005,7 +1030,7 @@ class ConfigureTab(ttk.Frame):
         """One device's result: into the device's log (database) and the workbench console."""
         d = r['device']
         if r['status'] == multi.NOT_RUN:
-            self.log('configure', f"{d['name']}: NOT RUN. {r['message']}", 'warn')
+            self.log('configure', f"{d['name']}: NOT RUN (WARNING). {r['message']}", 'warn')
             return
         try:
             self.store.add_log(d['id'], 'Configuration', 'success' if r['ok'] else 'failed',
@@ -1013,8 +1038,11 @@ class ConfigureTab(ttk.Frame):
         except Exception as err:
             report_error(self, err)
             r['message'] += f'  (could not write the log: {err})'
-        self.log('configure', f"{d['name']}: {r['status']}. {r['message']}",
-                 'ok' if r['ok'] else 'error')
+        if r['ok']:
+            self.log('configure', f"{d['name']}: apply SUCCESSFUL. {r['message']}", 'ok')
+        else:
+            state = '' if r['status'] == multi.FAILED else f" ({r['status']})"
+            self.log('configure', f"{d['name']}: apply FAILED{state}. {r['message']}", 'error')
 
     def _finish(self, results):
         self.busy = False
@@ -1037,6 +1065,8 @@ class ConfigureTab(ttk.Frame):
             self._save_confirmed_logins(results)
             self.on_applied()
         if not results:
+            self.log('configure', 'Apply FAILED before any device was configured. See the SSH '
+                                  'session.', 'error')
             self.status.config(text='The change did not complete. See the SSH session.')
             messagebox.showerror('Apply failed', 'Something went wrong before any device was '
                                                  'configured. See the SSH session.')

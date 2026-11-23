@@ -7,6 +7,7 @@ from tkinter import ttk, messagebox
 import validation
 from gui import theme
 from gui.db_status import database_ready, report_error
+from gui.event_log import log_event
 from store_errors import DatabaseUnavailable, DuplicateDeviceName
 
 SAMPLE_BLOCKED = ('These are sample devices. They can only be approved in sample mode '
@@ -138,7 +139,11 @@ class ScanTab(ttk.Frame):
             neighbours = bool(self.login_neighbours.get())
             if neighbours and not messagebox.askyesno('Log in to neighbours?',
                                                       NEIGHBOUR_WARNING, icon='warning'):
+                log_event('scan', 'Scan cancelled (the neighbour login was not confirmed). '
+                                  'Nothing was scanned.', 'warn')
                 return
+        log_event('scan', 'Loading the sample network...' if demo else
+                  f"Scanning from seed {seed}{' (also logging in to neighbours)' if neighbours else ''}...")
         self.scanning = True
         self._scan_seed = seed
         self._scan_is_demo = demo
@@ -160,6 +165,8 @@ class ScanTab(ttk.Frame):
         self.scan_btn.state(['!disabled'])
         if msg[0] == 'error':
             self.status.config(text='Scan failed.')
+            log_event('scan', f"Scan from {self._scan_seed or 'the sample network'} FAILED. "
+                              f"{msg[1]}", 'error')
             self._remember({'kind': 'scan', 'seed': self._scan_seed, 'failed': True,
                             'sample': self._scan_is_demo})
             messagebox.showerror('Scan failed', msg[1])
@@ -195,6 +202,10 @@ class ScanTab(ttk.Frame):
             'Select the ones to register and click Approve.'
         self.status.config(text=f'Found {len(self.found)} devices ({n_managed} managed) '
                                 f'and {len(self.found_links)} links{sample_note}. {next_step}')
+        log_event('scan', f'Scan SUCCESSFUL: found {len(self.found)} devices ({n_managed} '
+                          f'managed) and {len(self.found_links)} links{sample_note}.', 'ok')
+        if blocked:
+            log_event('scan', SAMPLE_BLOCKED, 'warn')
         self._remember({'kind': 'scan', 'seed': self._scan_seed, 'devices': len(self.found),
                         'managed': n_managed, 'links': len(self.found_links),
                         'sample': self.found_is_sample})
@@ -212,8 +223,11 @@ class ScanTab(ttk.Frame):
         if not picked:
             messagebox.showinfo('Nothing selected', 'Select at least one device.')
             return
+        log_event('scan', f"Approving {len(picked)} selected device{'' if len(picked) == 1 else 's'}...")
         if not database_ready(self):
             self.status.config(text='Database unavailable. Nothing was saved.')
+            log_event('scan', 'Approval FAILED: the database is unavailable. Nothing was saved.',
+                      'error')
             return
         if self.found_is_sample and not self.sample_store:     # never into the real database
             messagebox.showerror('Sample devices', SAMPLE_BLOCKED)
@@ -254,6 +268,7 @@ class ScanTab(ttk.Frame):
         'replace', 'device_id': id}} for IPs of deleted devices; None = the user cancelled."""
         if plan is None:
             self.status.config(text='Approval cancelled. Nothing was saved.')
+            log_event('scan', 'Approval cancelled. Nothing was saved.', 'warn')
             return
         saved, restored, skipped, added, updated, links = [], [], [], 0, 0, []
         current = None
@@ -322,6 +337,8 @@ class ScanTab(ttk.Frame):
                 lines.append('Not attempted: ' + ', '.join(d['name'] for d in not_tried) + '.')
             detail = detail + '\n' + '\n'.join(lines) if lines else detail
             self.status.config(text=f'Approval failed. {detail}')
+            if not saved:            # with saved devices the main window logs it (on_approved)
+                log_event('scan', f'Approval FAILED. {detail} {err}', 'error')
             messagebox.showerror('Could not save', f'{detail}\n\n{err}')
             if saved and self.on_approved:          # some data did change: refresh the lists
                 self.on_approved()
@@ -342,6 +359,10 @@ class ScanTab(ttk.Frame):
         if skipped:
             message += ' Not restored (still deleted): ' + ', '.join(d['name'] for d in skipped) + '.'
         self.status.config(text=f'{message} See the Devices page.')
+        for d in saved:
+            how = 'restored' if d in restored else 'registered'
+            log_event('devices', f"{d['name']} ({d['ip']}, {d.get('type') or 'unknown'}): "
+                                 f"{how} SUCCESSFUL.", 'ok')
         self._remember({'kind': 'approval', 'count': n})
         messagebox.showinfo('Approved', message)
         if self.on_approved:
