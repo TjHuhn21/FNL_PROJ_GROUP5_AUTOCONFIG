@@ -17,6 +17,8 @@ from mocklab.console import MockConsoleBackend  # noqa: E402
 
 PASSWORD = 'Str0ng-Pass!'
 FORBIDDEN_BUTTONS = ('apply', 'execute', 'send', 'save', 'write', 'run commands', 'configure')
+# Phase 5.1.2 (approved) added exactly these two buttons; nothing may save or write.
+APPLY_BUTTONS = {'apply ssh configuration', 'stop after the current step'}
 
 
 def ready(root, port='SIM8', backend=None):
@@ -71,13 +73,25 @@ def test_preview_is_enabled_after_detection_and_offers_device_key_sizes(root):
     assert list(tab.key_box.cget('values')) == ['1024', '2048'] and tab.key_var.get() == '2048'
 
 
-def test_there_is_no_way_to_execute_the_plan(root):
+def test_the_only_way_to_execute_the_plan_is_the_gated_apply(root):
+    # Updated deliberately for phase 5.1.2: the preview itself still runs nothing; the only
+    # execution controls are Apply / Stop, and Apply without the typed confirmation sends
+    # nothing. There is still no save / write button anywhere.
     tab = ready(root)
     fill(tab)
     tab.preview()
     names = [b.lower() for b in buttons(tab)]
-    assert not any(word in name for name in names for word in FORBIDDEN_BUTTONS), names
+    others = [n for n in names if n not in APPLY_BUTTONS]
+    assert not any(word in name for name in others for word in FORBIDDEN_BUTTONS), others
+    assert APPLY_BUTTONS <= set(names)
+    assert not any(w in n for n in names for w in ('save', 'write'))
     assert tab.preview_widgets['commands'].cget('state') == 'disabled'       # read-only text
+    sent = list(tab.session.sent)
+    tab.apply_vars['password'].set(PASSWORD)
+    tab.apply_vars['confirm'].set(PASSWORD)
+    tab.apply_ssh()                                          # no typed confirmation
+    assert tab.session.sent == sent and tab.session.config_sent == []
+    assert 'Nothing was sent' in tab.apply_error.cget('text')
 
 
 # ------------------------------------------------------------------ the preview

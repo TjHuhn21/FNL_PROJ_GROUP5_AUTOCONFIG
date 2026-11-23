@@ -208,7 +208,31 @@ simulated, deterministic, and without real waiting:
 **Console events** (`console={...}` on a scenario in `mocklab/console.py`):
 `timeout_on`, `partial_timeout_on` (part of the output arrives, is kept in
 `partial_output` for tests, and is never returned), `unexpected_prompt_on` (a
-`rommon N >` boot-loader prompt from then on), `unplug_on` (connection lost).
+`rommon N >` boot-loader prompt from then on), `unplug_on` (connection lost). Since
+phase 5.1.2 an event may name a configuration line of an approved plan as well as a
+`show` command, and two more exist: `keys_appear_on` (an RSA key appears just before
+that line, as if made by someone else after detection, so key generation asks to
+replace it) and `modulus_question_on` (key generation asks for the key size as if none
+was given). Tests set events after detection (`session.console = {...}`). Phase 5.1.3
+adds `reject_on` (the line is refused with `% Invalid input ...` and not applied; the
+prompt stays as it was) and `wrong_prompt_on` (the line runs, then every reply ends at
+`<host>(config-if)#`). `MockConsoleSession.graceful_disconnects` counts disconnects that
+would have logged out with `exit` (none after `cancel()`), and a prompt re-read is
+recorded in `config_sent` as `<Enter>`.
+
+**Enable passwords (phase 5.1.3).** A device spec with `"no_enable_secret": true` has
+`enable_configured = False`: only then does `enable` go straight to `#`. A configured
+enable secret whose value is unknown (`enable_secret = None`, for example after replaying
+an `enable secret 5 <hash>` NetCommand cannot reverse) asks for the password and refuses
+every answer.
+
+**Configuration through the simulated console (phase 5.1.2).** `MockConsoleSession` has
+the same gated configuration methods as the real console session (`allow_config`,
+`enter_config`, `send_config_line`, `refresh_prompt`, `end_config`), the same line guard
+(`console.link.check_config_line`) and the same reply rules
+(`console.link.classify_reply`): a question, a password prompt or a boot-loader prompt is
+never answered and ends the session; a reply without a recognised prompt is a timeout.
+`config_sent` records the lines as templates (`<SSH_PASSWORD>`, never the value).
 
 **Scenarios** (`EDGE_SCENARIOS`; listed only by `MockConsoleBackend(edge_cases=True)`,
 so the normal `--mock-console` port list is unchanged). Identifiers (`SCENARIO_IDS`,
@@ -226,6 +250,18 @@ so the normal `--mock-console` port list is unchanged). Identifiers (`SCENARIO_I
 | SIM25 | `prompt-lag` | | SIM35 | `console-partial-timeout` |
 | SIM26 | `prompt-garbled` | | SIM36 | `console-unexpected-prompt` |
 | SIM27 | `domain-rejected` | | SIM37 | `console-interrupted` |
+| SIM38 | `enable-no-password` (factory router in user mode, no enable password: `enable` goes straight to `#`) | | SIM39 | `enable-password-prompt` (user mode; `enable` asks for a password, never answered) |
+| SIM40 | `console-silent` (idle console: nothing printed) | | SIM41 | `startup-press-return` ("Press RETURN to get started") |
+| SIM42 | `startup-setup-dialog` (the initial configuration dialog question) | | SIM43 | `console-pending-confirm` (a pending `[confirm]` question: refused) |
+| SIM44 | `console-pending-password` (a pending password prompt: refused) | | SIM45 | `console-boot-loader` (ROMMON: refused) |
+| SIM46 | `console-unknown` (unrecognised output: refused) | | | |
+
+**Before connecting (phase 5.1.6).** `MockConsoleSession.listen()` / `connect(confirm_idle,
+startup_action)` follow the real session through the same `console.link.gate()`. Each
+scenario says what its console shows before anything is sent (`preflight`): by default its
+prompt (verified), `silent` for the device that never answers (SIM6) and SIM40, and the
+states above for SIM41-SIM46. (A real idle console is usually silent; the simulated ports
+show their prompt by default so the existing scenarios keep testing what they test.)
 
 Existing scenarios that already cover a case are listed under its identifier too:
 `ssh-keys-but-disabled` (SIM15), `vty-multiple-ranges` / `vty-password-login` /
@@ -279,6 +315,21 @@ devices' running configurations and behaviour are unchanged.
   seconds). With `"management_ip"` set, removing that address from an up interface
   makes the device unreachable (sessions cut, connections refused) until a rollback.
   `RESTORE_SCENARIOS` / `restore_spec(spec, name)` build a device spec for each case.
+* **Save-to-startup quirks (Phase 4H)** for `write memory`: `save_fails` (an NVRAM error,
+  nothing saved), `save_prompts` (asks "Overwrite the previous NVRAM
+  configuration?[confirm]"; Enter or `y` would save, as on IOS), `drop_during_save` (saved,
+  then the connection is cut) and `startup_mismatch` (the saved startup configuration gets
+  one extra line). Scenarios of the same names. Used by `tests/test_startup_save.py`.
+* **Restore-engine quirks (Phase 4F):** `replace_prompts` (`configure replace` asks a
+  question even with `force`; scenario `unexpected_prompt`) and `confirm_ignored`
+  (`configure confirm` answers nothing but the timer keeps running; scenario
+  `confirm_fails`). Used by `tests/test_restore_engine.py`.
+* **Identity for the restore preflight (Phase 4E, optional, synthetic).** Spec key
+  `"serial"` (a string, or a list of strings to simulate an ambiguous device) adds
+  `Processor board ID <serial>` lines to `show version`; `"inventory"` (a list of
+  `{"name", "descr", "pid", "vid", "sn"}`) makes `show inventory` exist and print those
+  entries. Neither is in `lab_config.json`, so the default devices show no serial and do
+  not know `show inventory`, as before. Tested by `tests/test_restore_preflight.py`.
 
 The wording of these messages is written for the lab and is not copied from Cisco
 output (uncertain wording is marked `(SIMULATED)`). **Mock Lab success says nothing

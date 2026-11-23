@@ -43,7 +43,8 @@ from store_errors import DatabaseError
 # 'setup' is the Initial Setup page (console connection); "Setup" fits the narrow rail.
 PAGES = [('dashboard', 'Overview'), ('scan', 'Scan'), ('devices', 'Devices'),
          ('topology', 'Topology'), ('findings', 'Findings'), ('configure', 'Configure'),
-         ('setup', 'Setup'), ('logs', 'Logs')]
+         # ('setup', 'Setup'),    # Initial Setup hidden for the presentation: uncomment to show
+         ('logs', 'Logs')]
 FIRST_PAGE = 'dashboard'
 
 # Set to 1 only by the mock lab launcher (mock-lab/run_netcommand.py). DISPLAY ONLY: it adds
@@ -339,6 +340,17 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
                                f'future restore of {selection.device_name or selection.device_ip}'
                                f' (nothing was sent to the device).')
     refs['devices'].on_backup_selected = backup_selected
+
+    def restore_finished(result):
+        console.log('backups', f'Restore of {result.device_ip}: {result.status} (backup '
+                               f'{os.path.basename(result.backup_file or "?")}, safety backup '
+                               f'{result.safety_backup_file or "none"}).')
+    refs['devices'].on_restore_finished = restore_finished
+
+    def save_finished(result):
+        console.log('backups', f'Save to startup on {result.device_ip}: {result.status} '
+                               f'(startup backup {result.startup_backup or "none"}).')
+    refs['devices'].on_save_finished = save_finished
     if any(key == 'accounts' for key, _label in pages):
         from gui.accounts_page import AccountsPage
         refs['accounts'] = AccountsPage(host, account)

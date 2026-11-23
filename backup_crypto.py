@@ -53,7 +53,9 @@ _KEY_ID = re.compile(r'^b[1-9][0-9]{0,5}$')          # b1, b2, ... (rotation add
 _HEX64 = re.compile(r'^[0-9a-f]{64}$')
 _HEX32 = re.compile(r'^[0-9a-f]{32}$')
 # Optional, non-secret descriptive metadata a caller may add to a backup header.
-METADATA_FIELDS = {'host': str, 'source': str, 'privilege': int, 'app': str}
+# purpose (Phase 4E): why the backup was made, e.g. "pre-restore" for the safety backup
+# taken just before a restore; absent for ordinary Apply backups.
+METADATA_FIELDS = {'host': str, 'source': str, 'privilege': int, 'app': str, 'purpose': str}
 # Device identity (Phase 4A), read from the device when the backup is made. Three states,
 # so an unknown value can never be mistaken for a real one:
 #   field absent      not recorded (backups made before Phase 4A)

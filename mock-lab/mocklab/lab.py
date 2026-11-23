@@ -101,6 +101,34 @@ def _check_restore_keys(d):
         maximum = archive.get('maximum')
         if maximum is not None and (not isinstance(maximum, int) or not 1 <= maximum <= 14):
             raise LabError(f'{name}: archive maximum must be 1 to 14.')
+    _check_identity_keys(d)
+
+
+def _plain(value):
+    """A single-line value without the characters that delimit show output."""
+    return isinstance(value, str) and value.isprintable() and '"' not in value and \
+        len(value) <= 80
+
+
+def _check_identity_keys(d):
+    """The restore-preflight keys (optional, synthetic): "serial" (a string, or a list of
+    them for an ambiguous device) and "inventory" (a list of {"name", "descr", "pid", "vid",
+    "sn"} entries)."""
+    name = d['name']
+    if 'serial' in d:
+        serial = d['serial']
+        values = [serial] if isinstance(serial, str) else serial
+        if not isinstance(values, list) or not values or \
+                not all(_plain(v) and v.strip() for v in values):
+            raise LabError(f'{name}: serial must be a non-empty string or a list of them.')
+    if 'inventory' in d:
+        items = d['inventory']
+        if not isinstance(items, list) or not all(
+                isinstance(i, dict) and _plain(i.get('name')) and
+                set(i) <= {'name', 'descr', 'pid', 'vid', 'sn'} and
+                all(_plain(v) for v in i.values()) for i in items):
+            raise LabError(f'{name}: inventory must be a list of {{"name", "descr", "pid", '
+                           f'"vid", "sn"}} entries (single-line text).')
 
 
 def read_control(path=CONTROL):

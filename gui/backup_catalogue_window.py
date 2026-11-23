@@ -26,10 +26,12 @@ def short(value, length=12):
 
 class BackupCatalogueWindow(tk.Toplevel):
     def __init__(self, parent, device, can_select, on_select=None, backup_dir=None,
-                 key_source=None):
-        """device: backup_catalogue.Device; on_select(selection) records a choice."""
+                 key_source=None, on_restore=None):
+        """device: backup_catalogue.Device; on_select(selection) records a choice;
+        on_restore(selection) opens the Restore window (Phase 4G) for the selected backup."""
         super().__init__(parent)
         self.device, self.can_select, self.on_select = device, bool(can_select), on_select
+        self.on_restore = on_restore
         self.backup_dir, self.key_source = backup_dir, key_source
         self.entries, self.verifications, self.busy = {}, {}, False
         self.title(f'Backups - {device.hostname or device.ip} ({device.ip})')
@@ -68,6 +70,9 @@ class BackupCatalogueWindow(tk.Toplevel):
         for b in (self.refresh_btn, self.verify_btn, self.verify_all_btn):
             b.pack(side='left', padx=(0, 6))
         ttk.Button(bar, text='Close', command=self.destroy).pack(side='right')
+        self.restore_btn = ttk.Button(bar, text='Restore...', command=self.open_restore)
+        self.restore_btn.pack(side='right')
+        self.restore_btn.state(['disabled'])                # enabled once a backup is selected
         self.select_btn.pack(side='right', padx=6)
         self.status = ttk.Label(bar, text='', foreground=theme.TEXT_MUTED)
         self.status.pack(side='left', padx=theme.PAD)
@@ -147,7 +152,11 @@ class BackupCatalogueWindow(tk.Toplevel):
             lines.append(f'Match with {self.device.hostname or "?"} ({self.device.ip}): '
                          f'{m.summary}')
             lines += [f'  - {text}' for _field, _outcome, text in m.checks]
-            if m.requires_legacy_confirmation and not m.blocked:
+            if m.live_identity_required and not m.blocked:
+                lines.append('  PENDING RESTORE CANDIDATE, NOT a verified match: the restore '
+                             'preflight must read the device\'s serial number and platform and '
+                             'find both equal to this backup, or the restore is blocked.')
+            elif m.requires_legacy_confirmation and not m.blocked:
                 lines.append('  A future restore of this backup needs the legacy-backup '
                              'confirmation (matching IP and the typed device name).')
         return '\n'.join(lines)
@@ -217,10 +226,25 @@ class BackupCatalogueWindow(tk.Toplevel):
         self.selection = selection
         if self.on_select:
             self.on_select(selection)
-        note = ('\n\nIts hardware identity is not confirmed by serial number: a future restore '
-                'will need the legacy-backup confirmation.'
-                if selection.requires_legacy_confirmation else '')
+        if self.on_restore and self.can_select:
+            self.restore_btn.state(['!disabled'])
+        if selection.live_identity_required:
+            note = ('\n\nThis is a PENDING CANDIDATE, not a verified match: its recorded IP '
+                    'address differs. The restore preflight will read the device\'s serial '
+                    'number and platform and block the restore unless both match.')
+        elif selection.requires_legacy_confirmation:
+            note = ('\n\nIts hardware identity is not confirmed by serial number: a future '
+                    'restore will need the legacy-backup confirmation.')
+        else:
+            note = ''
         messagebox.showinfo('Backup selected',
                             f'{e.filename} is selected for a future restore of '
                             f'{self.device.hostname or self.device.ip}.\n\nNothing was sent to '
                             f'the device; restoring is not available yet.{note}', parent=self)
+
+    def open_restore(self):
+        """The Restore window for the selected backup (it connects only when the user runs
+        its checks)."""
+        if self.selection is None or not self.can_select or not self.on_restore:
+            return
+        self.on_restore(self.selection)

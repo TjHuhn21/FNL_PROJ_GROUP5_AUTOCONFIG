@@ -22,6 +22,7 @@ Every value that could not be read is None (or SshCapability.UNKNOWN). Nothing i
 guessed. Like ConsoleSession, this blocks on serial I/O: run it in a worker thread.
 """
 import re
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -218,6 +219,9 @@ class DetectionResult:
     simulated: bool = False
     complete: bool = True         # False: the session ended and some commands were skipped
     detected_at: object = None    # datetime when detection finished
+    # a unique identifier of this detection (phase 5.1.6): two detections within one clock
+    # tick (Windows: often ~1-16 ms) have equal timestamps but never the same id
+    detection_id: str = None
 
     @property
     def succeeded(self):
@@ -752,6 +756,7 @@ def detect_device(session, elevate=False, command_timeout=None, progress=None):
     result.ssh.config_present = _ssh_config_present(result, users.ok)
     result.limitations += _limitations(result)
     result.detected_at = datetime.now()
+    result.detection_id = uuid.uuid4().hex
     return result
 
 

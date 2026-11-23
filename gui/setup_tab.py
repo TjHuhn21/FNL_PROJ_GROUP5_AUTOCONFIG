@@ -8,11 +8,20 @@ device detection (Console-Based SSH Auto-Setup, phase 3).
                             and the technical details (evidence, limitations, commands)
     D  SSH Configuration    (phase 4) a plan made by console.plan from the detection and the
        Preview              values typed here: status of each setting, the proposed commands
-                            in order, what each does, conflicts and unknowns. PREVIEW ONLY:
-                            there is no button that sends it.
+                            in order, what each does, conflicts and unknowns. The preview
+                            itself sends nothing.
+    E  Apply SSH            (phase 5.1.2) console.apply runs the previewed plan one step at a
+       Configuration        time, verifying each with show commands. It needs the new
+                            account's password typed again, the typed confirmation
+                            "APPLY SSH <hostname>", and a tick for every disruptive step.
+                            Running configuration only: nothing is saved, no IP address is
+                            set and no network SSH login is tried. Stopping takes effect
+                            between steps only, never during a command exchange.
 
-Nothing on this page changes a device's configuration: it only reads. The preview
-password fields are emptied when a preview is made; plans only contain <SSH_PASSWORD>.
+Detection and preview only read. Only the Apply section changes the device, and only
+with the plan it was shown. The preview password fields are emptied when a preview is
+made; plans only contain <SSH_PASSWORD>. The Apply password fields are emptied the moment
+Apply is clicked; the password then exists only in the running apply.
 
 Every serial operation (listing ports, connecting, detecting, disconnecting) runs on a
 worker thread through gui.background.run_async; results come back on the Tk thread. One
@@ -32,9 +41,12 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import ttk
 
+from console import apply as ssh_apply
+from gui import apply_guard
 from console.detect import SshCapability, detect_device
-from console.link import (BAUD_RATES, CANCELLED, DEFAULT_BAUD, ConsoleError,
-                          ConsoleSession, check_baudrate)
+from console import link
+from console.link import (BAUD_RATES, CANCELLED, DEFAULT_BAUD, IDLE_CONFIRMATION,
+                          ConsoleError, ConsoleSession, check_baudrate)
 from console.plan import (CONFLICT, DEFAULT_KEY_SIZE, PREVIEW_NOTICE, STATUS_TEXT, UNKNOWN,
                           build_plan, key_sizes, plan_is_stale, validate_request)
 from console.ports import discover_ports
@@ -44,7 +56,8 @@ from gui.components.scroll_frame import ScrollFrame, bind_wheel
 # ---------------------------------------------------------------- page states
 DISCONNECTED, DISCOVERING_PORTS, CONNECTING = 'disconnected', 'discovering_ports', 'connecting'
 CONNECTED, DETECTING, DETECTED = 'connected', 'detecting', 'detected'
-DISCONNECTING, ERROR = 'disconnecting', 'error'
+DISCONNECTING, ERROR, APPLYING = 'disconnecting', 'error', 'applying'
+AWAITING = 'awaiting_decision'      # the port is open, NOTHING was sent: the operator decides
 STATE_TEXT = {
     DISCONNECTED: ('Not connected', theme.TEXT_MUTED),
     DISCOVERING_PORTS: ('Looking for ports...', theme.TEXT_SOFT),
@@ -54,8 +67,10 @@ STATE_TEXT = {
     DETECTED: ('Connected - detection finished', theme.SUCCESS),
     DISCONNECTING: ('Disconnecting...', theme.WARNING),
     ERROR: ('Not connected - the last attempt failed', theme.DANGER),
+    APPLYING: ('Connected - applying the SSH configuration...', theme.WARNING),
+    AWAITING: ('Port open, nothing sent - your decision is needed', theme.WARNING),
 }
-BUSY = (DISCOVERING_PORTS, CONNECTING, DETECTING, DISCONNECTING)
+BUSY = (DISCOVERING_PORTS, CONNECTING, DETECTING, DISCONNECTING, APPLYING)
 
 SSH_TEXT = {
     SshCapability.SUPPORTED_ENABLED: (
@@ -73,14 +88,58 @@ SSH_TEXT = {
 }
 SIMULATED_BANNER = 'SIMULATED DEVICE — NOT PHYSICAL HARDWARE'
 NOT_AVAILABLE = 'Unknown'
+# phase 5.1.6: what the console showed before anything was sent
+PREFLIGHT_TITLE = {
+    link.CONSOLE_PROMPT: 'Normal prompt detected (verified by NetCommand)',
+    link.CONSOLE_SILENT: 'Console silent; manual confirmation required',
+    link.CONSOLE_PRESS_RETURN: 'Known startup prompt detected',
+    link.CONSOLE_SETUP_DIALOG: 'Known startup prompt detected',
+}
+REFUSED_TITLE = 'Unsafe or unknown state; connection refused'
+CONFIRMATION_NOTE = ('This confirmation is your responsibility: NetCommand cannot see the '
+                     'console\'s state while it is silent, and it does not check this for you. '
+                     'If the device is really waiting at a question, the Enter NetCommand '
+                     'sends next would answer it.')
+CONTINUE_TEXT = {
+    link.CONSOLE_SILENT: 'Continue (send Enter)',
+    link.CONSOLE_PRESS_RETURN: 'Press Enter to start the console session',
+    link.CONSOLE_SETUP_DIALOG: 'Answer "no" and continue',
+}
+STARTUP_TEXT = {
+    link.CONSOLE_PRESS_RETURN: ('The device shows "Press RETURN to get started" (after it '
+                                'starts, or after a console session ended). Approve pressing '
+                                'Enter once to start the console session.'),
+    link.CONSOLE_SETUP_DIALOG: ('The device asks "Would you like to enter the initial '
+                                'configuration dialog? [yes/no]". Policy: NetCommand answers '
+                                '"no" only with your approval (this skips the setup wizard and '
+                                'changes no configuration), then presses Enter once at the '
+                                '"Press RETURN to get started" that follows. It never answers '
+                                '"yes".'),
+}
+VERIFICATION_TEXT = {
+    link.VERIFIED: 'NetCommand saw the normal prompt before sending anything.',
+    link.OPERATOR_CONFIRMED: ('The console was silent: the first Enter relied on YOUR '
+                              'confirmation that the device was at a normal prompt '
+                              '(NetCommand did not verify it).'),
+    link.STARTUP_ACTION: 'Connected after the startup action you approved.',
+}
 NO_PORTS = ('No serial ports were found. Plug in the console cable (USB console cable or '
             'USB-to-serial adapter), check that its driver is installed, then click '
             'Refresh Ports.')
-SSH_LATER = ('This page only reads the device. An SSH setup can be previewed below, but it is '
-             'not sent to the device in this version.')
-STEPS_NOTE = ('Each command as a step: what it needs first and how it would be checked '
-              'afterwards with read-only show commands. These are definitions only; nothing '
-              'is run or sent in this version.')
+SSH_LATER = ('Detection only reads the device. An SSH setup can be previewed below and, after '
+             'you confirm it, applied step by step (section 5).')
+STEPS_NOTE = ('Each command as a step: what it needs first and how it is checked afterwards '
+              'with read-only show commands. Previewing runs nothing; Apply (section 5) runs '
+              'these steps in this order, one at a time.')
+APPLY_NOTICE = ('Apply sends the commands of the preview above through the console, one step '
+                'at a time, and checks each with show commands before the next. The changes stay '
+                'in the running configuration: nothing is saved (no write memory), no IP address '
+                'is configured, and no network SSH login is tried. Device questions are never '
+                'answered: Apply stops and tells you.')
+APPLY_STATUS_TEXT = {**ssh_apply.STATUS_TEXT, 'running': 'RUNNING...', 'pending': 'waiting'}
+APPLY_COLORS = {'verified': theme.SUCCESS_SOFT, 'failed': theme.DANGER_SOFT,
+                'uncertain': theme.WARNING_SOFT, 'blocked': theme.SURFACE_2,
+                'not run': theme.SURFACE, 'running': theme.ACCENT_SOFT, 'pending': theme.SURFACE}
 NO_NEW_PREVIEW = ('No new preview was made: detection did not finish (the console session ended '
                   'or was cancelled), so the configuration is not fully known. Connect again, '
                   'then use "Detect Again and Preview".')
@@ -97,9 +156,11 @@ class RealConsoleBackend:
     def discover_ports(self):
         return discover_ports()                      # only lists ports; never opens one
 
-    def open_session(self, port, baudrate, username, password, enable_password, log=None):
+    def open_session(self, port, baudrate, username, password, enable_password, log=None,
+                     enable_without_password=False):
         return ConsoleSession(port, baudrate=baudrate, username=username, password=password,
-                              enable_password=enable_password, log=log)
+                              enable_password=enable_password, log=log,
+                              enable_without_password=enable_without_password)
 
 
 def show(value):
@@ -148,11 +209,18 @@ class SetupTab(ttk.Frame):
         self.ports = []                    # ComPort list shown in the dropdown
         self.session = None                # the connected console session
         self._pending = None               # the session being connected (for Cancel)
+        self._awaiting = None              # (session, Preflight, secrets): port open, nothing sent
+        self.connection_verification = None   # how the first byte was allowed (link.VERIFIED...)
         self.result = None                 # the last DetectionResult
         self.result_live = False           # False: from a session that has ended
         self.result_time = None
         self._stop_after_detection = False
-        self.plan = None                   # the last SSH configuration preview (never executed)
+        self.plan = None                   # the last SSH configuration preview
+        self.plan_request = None           # the SetupRequest it was made from (no password)
+        self.plan_applied = False          # True once Apply ran for this preview
+        self.apply_result = None           # the last console.apply.ApplyResult
+        self._apply_cancel = threading.Event()
+        self._apply_progress = queue.Queue()
         self._preview_after_detection = None   # a SetupRequest waiting for "Detect Again"
         self._closed = threading.Event()   # the page was destroyed
         self._progress = queue.Queue()
@@ -179,6 +247,7 @@ class SetupTab(ttk.Frame):
         self._build_detection(page)
         self._build_results(page)
         self._build_preview(page)
+        self._build_apply(page)
         self._apply_state()
 
     # ================================================================ layout
@@ -234,7 +303,8 @@ class SetupTab(ttk.Frame):
             entry.grid(row=2, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
             self.entries[label] = entry
         self.enable_box = ttk.Checkbutton(
-            login, text='Use privileged mode (enable) for detection - needs the enable password',
+            login, text='Use privileged mode (enable) for detection - type the enable password, '
+                        'or leave it empty for a factory device that has none',
             variable=self.use_enable, style='Form.TCheckbutton', command=self._apply_state)
         self.enable_box.grid(row=3, column=0, columnspan=3, sticky='w', pady=(theme.PAD, 0))
         ttk.Label(login, text='Enable password').grid(row=4, column=0, sticky='w', pady=(4, 0))
@@ -258,6 +328,33 @@ class SetupTab(ttk.Frame):
         self.message = ttk.Label(page, text='', wraplength=820, justify='left',
                                  style='Form.TLabel')
         self.message.pack(anchor='w', fill='x', pady=(theme.PAD, 0))
+        self._build_decision(page)
+
+    def _build_decision(self, page):
+        """Phase 5.1.6: what the console showed before anything was sent, and - when it
+        is not a verified prompt - the operator's decision. Hidden until needed."""
+        self.preflight_label = tk.Label(page, text='', font=theme.FONT_FORM_BOLD, anchor='w',
+                                        justify='left', wraplength=820, padx=10, pady=5,
+                                        background=theme.BG)
+        self.preflight_label.pack(fill='x', pady=(theme.PAD, 0))
+        self.decision = ttk.Frame(page)
+        self.decision_text = ttk.Label(self.decision, text='', wraplength=820, justify='left',
+                                       style='Form.TLabel')
+        self.decision_text.pack(anchor='w')
+        self.idle_confirm = tk.IntVar(value=0)             # NEVER preselected
+        self.idle_box = ttk.Checkbutton(self.decision, text=IDLE_CONFIRMATION,
+                                        variable=self.idle_confirm, style='Form.TCheckbutton',
+                                        command=self._apply_state)
+        self.idle_note = ttk.Label(self.decision, text=CONFIRMATION_NOTE, wraplength=820,
+                                   justify='left', foreground=theme.WARNING)
+        bar = ttk.Frame(self.decision)
+        bar.pack(side='bottom', anchor='w', pady=(theme.PAD, 0))
+        self.continue_btn = ttk.Button(bar, text='Continue', style='Accent.TButton',
+                                       command=self.continue_connect)
+        self.continue_btn.pack(side='left')
+        self.abort_btn = ttk.Button(bar, text='Cancel and close the port',
+                                    command=self.abort_connect)
+        self.abort_btn.pack(side='left', padx=theme.PAD)
 
     def _build_detection(self, page):
         self._heading(page, '2  Device Detection')
@@ -294,6 +391,12 @@ class SetupTab(ttk.Frame):
     def _apply_state(self):
         s = self.phase
         no_session = self.session is None and s in (DISCONNECTED, ERROR)
+        if hasattr(self, 'continue_btn'):
+            awaiting = s == AWAITING and self._awaiting is not None
+            needs_tick = awaiting and self._awaiting[1].state == link.CONSOLE_SILENT
+            self.continue_btn.state(['!disabled'] if awaiting and (
+                not needs_tick or self.idle_confirm.get() == 1) else ['disabled'])
+            self.abort_btn.state(['!disabled'] if awaiting else ['disabled'])
         selected = self._selected_port() is not None
 
         def able(widget, on):
@@ -308,10 +411,10 @@ class SetupTab(ttk.Frame):
         able(self.enable_entry, no_session and bool(self.use_enable.get()))
         able(self.connect_btn, no_session and selected)
         able(self.detect_btn, s in (CONNECTED, DETECTED) and self.session is not None)
-        can_stop = s in (CONNECTING, DETECTING) or (s in (CONNECTED, DETECTED)
-                                                    and self.session is not None)
+        can_stop = s in (CONNECTING, DETECTING, AWAITING) or (s in (CONNECTED, DETECTED)
+                                                              and self.session is not None)
         able(self.disconnect_btn, can_stop)
-        self.disconnect_btn.configure(text='Cancel' if s in (CONNECTING, DETECTING)
+        self.disconnect_btn.configure(text='Cancel' if s in (CONNECTING, DETECTING, AWAITING)
                                       else 'Disconnect')
         text, color = STATE_TEXT[s]
         if s in (CONNECTED, DETECTED, DETECTING) and self.session is not None:
@@ -334,6 +437,19 @@ class SetupTab(ttk.Frame):
                 able(entry, not self.busy)
             self.key_box.configure(state='disabled' if self.busy or not self.key_box.cget('values')
                                    else 'readonly')
+        if hasattr(self, 'apply_btn'):
+            able(self.apply_btn, self._can_apply())
+            able(self.stop_btn, s == APPLYING and not self._apply_cancel.is_set())
+            for entry in self.apply_entries.values():
+                able(entry, not self.busy)
+            for box in self.approval_boxes:
+                able(box, not self.busy)
+
+    def _can_apply(self):
+        plan = self.plan
+        return (self.phase == DETECTED and self.session is not None and plan is not None
+                and plan.available and bool(plan.steps) and not self.plan_applied
+                and self.plan_request is not None)
 
     @property
     def busy(self):
@@ -431,10 +547,9 @@ class SetupTab(ttk.Frame):
         username = self.user_var.get().strip()
         password = self.password_var.get()
         enable_password = self.enable_var.get() if self.use_enable.get() else ''
-        if self.use_enable.get() and not enable_password:
-            self.set_state(self.phase, 'Enter the enable password, or untick privileged mode.',
-                           'error')
-            return
+        # B1: privileged mode without an enable password sends only "enable"; if the device
+        # asks for a password, it is never answered (the session stops instead)
+        bare_enable = bool(self.use_enable.get()) and not enable_password
         # The fields are emptied now: the passwords exist only in this attempt's session.
         self.password_var.set('')
         self.enable_var.set('')
@@ -443,38 +558,142 @@ class SetupTab(ttk.Frame):
         self._log(f'Connecting to {port.device} at {baud} baud.')
         closed, backend = self._closed, self.backend
 
+        self._show_preflight(None)
+
         def work():
+            extra = {'enable_without_password': True} if bare_enable else {}
             session = backend.open_session(port.device, baud, username, password,
-                                           enable_password, log=None)
+                                           enable_password, log=None, **extra)
             self._pending = session
             if closed.is_set():
                 raise ConsoleError(CANCELLED, 'Cancelled.')
             try:
-                result = session.connect()
+                # phase 5.1.6: open and LISTEN only; nothing is written before the decision
+                preflight = session.listen()
+                if preflight.refused:
+                    session.disconnect()
+                    return session, None, preflight
+                if preflight.needs is not None:          # the operator decides first
+                    return session, None, preflight
+                return session, session.connect(), preflight
             finally:
                 if closed.is_set():                     # the page was closed meanwhile
+                    session.cancel()
                     session.disconnect()
-            return session, result
 
         background.run_async(self, work, lambda res, err: self._connected(res, err, secrets))
+
+    def _show_preflight(self, preflight, refused=False):
+        if preflight is None:
+            self.preflight_label.configure(text='', background=theme.BG)
+            self.decision.pack_forget()
+            return
+        if refused:
+            title, back, fore = REFUSED_TITLE, theme.DANGER_SOFT, theme.DANGER
+        elif preflight.state == link.CONSOLE_PROMPT:
+            title, back, fore = PREFLIGHT_TITLE[preflight.state], theme.SUCCESS_SOFT, theme.SUCCESS
+        else:
+            title, back, fore = PREFLIGHT_TITLE[preflight.state], theme.WARNING_SOFT, theme.WARNING
+        self.preflight_label.configure(text=f'{title}: {preflight.message}', background=back,
+                                       foreground=fore)
+        if refused or preflight.needs is None:
+            self.decision.pack_forget()
+            return
+        self.idle_confirm.set(0)                           # never preselected
+        if preflight.state == link.CONSOLE_SILENT:
+            self.decision_text.configure(text='Before NetCommand sends its first Enter, check '
+                                              'the device yourself in a terminal program (then '
+                                              'close the terminal), and tick:')
+            self.idle_box.pack(anchor='w', pady=(4, 0))
+            self.idle_note.pack(anchor='w', pady=(4, 0))
+        else:
+            self.decision_text.configure(text=STARTUP_TEXT[preflight.state])
+            self.idle_box.pack_forget()
+            self.idle_note.pack_forget()
+        self.continue_btn.configure(text=CONTINUE_TEXT[preflight.state])
+        if not self.decision.winfo_manager():
+            self.decision.pack(fill='x', pady=(4, 0), after=self.preflight_label)
+
+    def continue_connect(self):
+        """The operator's decision for a silent console or a startup prompt."""
+        if self.phase != AWAITING or self._awaiting is None:
+            return
+        session, preflight, secrets = self._awaiting
+        kwargs = {}
+        if preflight.state == link.CONSOLE_SILENT:
+            if self.idle_confirm.get() != 1:
+                self.set_state(AWAITING, 'Tick the confirmation first, after checking the '
+                                         'console yourself.', 'error')
+                return
+            kwargs['confirm_idle'] = True
+        else:
+            kwargs['startup_action'] = preflight.needs
+        self._awaiting = None
+        self._pending = session
+        self.set_state(CONNECTING, 'Connecting...')
+        self._log(f'Connecting on {session.port}: '
+                  + ('operator confirmed the console was at a normal prompt.'
+                     if 'confirm_idle' in kwargs else f'approved startup action '
+                                                      f'"{kwargs["startup_action"]}".'), 'warn')
+        closed = self._closed
+
+        def work():
+            try:
+                return session, session.connect(**kwargs), preflight
+            except ConsoleError as err:
+                if err.kind == link.APPROVAL_REQUIRED:   # another startup prompt appeared
+                    return session, None, session.listen()
+                raise
+            finally:
+                if closed.is_set():
+                    session.cancel()
+                    session.disconnect()
+        background.run_async(self, work, lambda res, err: self._connected(res, err, secrets))
+
+    def abort_connect(self):
+        """Close the port that was only listened on: nothing was sent."""
+        awaiting, self._awaiting = self._awaiting, None
+        if awaiting is not None:
+            threading.Thread(target=self._quiet_close, args=(awaiting[0],), daemon=True).start()
+        self._show_preflight(None)
+        self.set_state(DISCONNECTED, 'The port was closed. Nothing was sent to the device.', 'ok')
+        self._log('Connection cancelled before anything was sent.')
 
     def _connected(self, res, err, secrets):
         self._pending = None
         if not self._alive():
             if res:
                 res[0].cancel()
+                res[0].disconnect()
             return
         if err is not None:
             text = describe_error(err, secrets)
             self.set_state(ERROR, text, 'error')
             self._log(f'Connection failed: {text}', 'error')
             return
-        self.session, result = res
+        session, result, preflight = res
+        if result is None and preflight.refused:
+            self._show_preflight(preflight, refused=True)
+            self.set_state(ERROR, preflight.message, 'error')
+            self._log(f'Connection refused: {preflight.message}', 'error')
+            return
+        if result is None:                               # the operator decides
+            self._awaiting = (session, preflight, secrets)
+            self._show_preflight(preflight)
+            self.set_state(AWAITING, 'The port is open and NOTHING has been sent. '
+                                     + preflight.message, 'warn')
+            self._log(f'{session.port}: {preflight.message}', 'warn')
+            return
+        self._show_preflight(preflight if preflight.state == link.CONSOLE_PROMPT else None)
+        self.session = session
         lines = [f'Connected to {result.port} at {result.baudrate} baud. Device prompt: '
                  f'{result.prompt}' + (' (privileged mode).' if result.privileged else
                                         ' (user mode).')]
         lines += [n for n in result.notices if 'answered "no"' in n and 'skipped' in n]
+        verification = getattr(result, 'verification', link.VERIFIED)
+        lines.append(VERIFICATION_TEXT.get(verification, ''))
         lines.append('Click Detect Device to read what the device is.')
+        self.connection_verification = verification
         self.set_state(CONNECTED, '\n'.join(lines), 'ok')
         self._log(f'Connected to {result.port} ({result.prompt}).', 'ok')
         if self.result is not None:
@@ -533,7 +752,7 @@ class SetupTab(ttk.Frame):
         self._fill_key_sizes()
         request, self._preview_after_detection = self._preview_after_detection, None
         if request is not None and result.complete and session.is_active():
-            self._show_plan(build_plan(result, request))
+            self._show_plan(build_plan(result, request), request)
         else:
             if request is not None:
                 self.preview_error.configure(text=NO_NEW_PREVIEW)
@@ -574,6 +793,9 @@ class SetupTab(ttk.Frame):
 
     # ================================================================ disconnecting
     def disconnect(self):
+        if self.phase == AWAITING:
+            self.abort_connect()
+            return
         if self.phase == CONNECTING:
             pending = self._pending
             if pending is not None:
@@ -617,6 +839,16 @@ class SetupTab(ttk.Frame):
         if event.widget is not self or self._closed.is_set():
             return
         self._closed.set()
+        if self._awaiting is not None:                 # listened only: nothing was sent
+            threading.Thread(target=self._quiet_close, args=(self._awaiting[0],),
+                             daemon=True).start()
+            self._awaiting = None
+        if self.phase == APPLYING:
+            # never cut a configuration exchange: the apply stops after its current step and
+            # its worker closes the session itself (see apply_ssh)
+            self._apply_cancel.set()
+            self.session = self._pending = None
+            return
         for session in (self._pending, self.session):
             if session is not None:
                 threading.Thread(target=self._quiet_close, args=(session,), daemon=True).start()
@@ -870,7 +1102,7 @@ class SetupTab(ttk.Frame):
             return
         request = self._read_request()
         if request is not None:
-            self._show_plan(build_plan(self.result, request))
+            self._show_plan(build_plan(self.result, request), request)
 
     def detect_and_preview(self):
         """Read the device again (show commands only), then make the plan from the fresh
@@ -901,8 +1133,8 @@ class SetupTab(ttk.Frame):
             if not label.winfo_manager():
                 label.pack(fill='x', pady=(0, 4), before=self.preview_widgets['first'])
 
-    def _show_plan(self, plan):
-        self.plan = plan
+    def _show_plan(self, plan, request=None):
+        self.plan, self.plan_request, self.plan_applied = plan, request, False
         self._inputs_changed = False
         self.preview_error.configure(text='')
         for child in self.preview_box.winfo_children():
@@ -1007,6 +1239,7 @@ class SetupTab(ttk.Frame):
         self._log(f'SSH configuration preview made: {len(plan.commands)} proposed command(s), '
                   f'{len(plan.conflicts)} conflict(s). Nothing was sent to the device.')
         self._refresh_staleness()
+        self._prepare_apply(plan)
 
     def _steps_view(self, box, plan):
         """The step definitions (dependencies and read-only checks), behind a toggle.
@@ -1049,3 +1282,259 @@ class SetupTab(ttk.Frame):
         if item is not None:
             self.preview_widgets['item_text'].configure(
                 text=f'{item.title} ({STATUS_TEXT[item.status]}): {item.explanation}')
+
+    # ================================================================ applying (phase 5.1.2)
+    def _build_apply(self, page):
+        self._heading(page, '5  Apply SSH Configuration')
+        self.apply_notice = tk.Label(page, text=APPLY_NOTICE, font=theme.FONT_FORM,
+                                     background=theme.WARNING_SOFT, foreground=theme.WARNING,
+                                     padx=10, pady=6, anchor='w', justify='left',
+                                     wraplength=900)
+        self.apply_notice.pack(fill='x', pady=(0, theme.PAD))
+        form = ttk.Frame(page)
+        form.pack(fill='x')
+        self.apply_vars = {k: tk.StringVar() for k in ('password', 'confirm', 'phrase')}
+        self.apply_entries = {}
+        self.apply_password_label = ttk.Label(form, text='Password for the new account, again '
+                                                        '(it is not kept)')
+        self.apply_password_label.grid(row=0, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        for col, key in enumerate(('password', 'confirm')):
+            entry = ttk.Entry(form, textvariable=self.apply_vars[key], width=24, show='*',
+                              font=theme.FONT_FORM)
+            entry.grid(row=1, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
+            self.apply_entries[key] = entry
+        self.approval_frame = ttk.Frame(page)
+        self.approval_frame.pack(fill='x', pady=(theme.PAD, 0))
+        self.approval_vars, self.approval_boxes = {}, []
+        self.phrase_label = ttk.Label(page, text='Type the confirmation shown here once a '
+                                                 'preview exists.', style='Form.TLabel')
+        self.phrase_label.pack(anchor='w', pady=(theme.PAD, 2))
+        entry = ttk.Entry(page, textvariable=self.apply_vars['phrase'], width=36,
+                          font=theme.FONT_FORM)
+        entry.pack(anchor='w', ipady=2)
+        self.apply_entries['phrase'] = entry
+        bar = ttk.Frame(page)
+        bar.pack(fill='x', pady=(theme.PAD, 0))
+        self.apply_btn = ttk.Button(bar, text='Apply SSH Configuration',
+                                    style='Large.Accent.TButton', command=self.apply_ssh)
+        self.apply_btn.pack(side='left')
+        self.stop_btn = ttk.Button(bar, text='Stop after the current step',
+                                   command=self.stop_apply)
+        self.stop_btn.pack(side='left', padx=theme.PAD)
+        self.apply_error = ttk.Label(page, text='', foreground=theme.DANGER, wraplength=900,
+                                     justify='left', style='Form.TLabel')
+        self.apply_error.pack(anchor='w', pady=(4, 0))
+        holder = ttk.Frame(page)
+        holder.pack(fill='x', pady=(theme.PAD, 0))
+        cols = [('step', 'Step', 300), ('status', 'Status', 130), ('details', 'Details', 600)]
+        self.apply_tree = ttk.Treeview(holder, columns=[c[0] for c in cols], show='headings',
+                                       height=4, style='Data.Treeview')
+        for key, title, width in cols:
+            self.apply_tree.heading(key, text=title)
+            self.apply_tree.column(key, width=width, anchor='w', stretch=key == 'details')
+        for status, color in APPLY_COLORS.items():
+            self.apply_tree.tag_configure(status, background=color)
+        self.apply_tree.grid(row=0, column=0, sticky='ew')
+        holder.grid_columnconfigure(0, weight=1)
+        bind_wheel(self.apply_tree)
+        self.apply_summary = tk.Label(page, text='', font=theme.FONT_FORM_BOLD, anchor='w',
+                                      justify='left', wraplength=900, padx=10, pady=5,
+                                      background=theme.BG)
+        self.apply_summary.pack(fill='x', pady=(theme.PAD, 0))
+        self.apply_recovery = ttk.Label(page, text='', wraplength=900, justify='left',
+                                        style='Form.TLabel')
+        self.apply_recovery.pack(anchor='w', pady=(4, 0))
+        self.apply_commands = ttk.Label(page, text='', wraplength=900, justify='left',
+                                        font=theme.mono(10), foreground=theme.TEXT_SOFT)
+        self.apply_commands.pack(anchor='w', pady=(4, 0))
+
+    def _prepare_apply(self, plan):
+        """A new preview: the Apply section shows its steps, approvals and confirmation."""
+        for child in self.approval_frame.winfo_children():
+            child.destroy()
+        self.approval_vars, self.approval_boxes = {}, []
+        steps = plan.steps if plan.available else []
+        needed = ssh_apply.approvals_needed(plan) if steps else []
+        if needed:
+            ttk.Label(self.approval_frame, text='Separate approval for each step that can cut '
+                                                'off current users:',
+                      font=theme.FONT_BOLD, foreground=theme.WARNING).pack(anchor='w')
+        for step in needed:
+            var = tk.IntVar(value=0)
+            box = ttk.Checkbutton(self.approval_frame, variable=var, style='Form.TCheckbutton',
+                                  text=f'I approve "{step.title}" ({step.command.text}): '
+                                       f'{step.approval_reason}')
+            box.pack(anchor='w')
+            self.approval_vars[step.step_id] = var
+            self.approval_boxes.append(box)
+        self.apply_password_label.configure(
+            text='Password for the new account, again (it is not kept)'
+            if steps and ssh_apply.needs_password(plan) else
+            'No password is needed: this plan creates no account.')
+        self.phrase_label.configure(
+            text=f'Type  {ssh_apply.confirmation_phrase(plan)}  to confirm' if steps else
+            'Nothing to apply for this preview.')
+        for key in ('password', 'confirm', 'phrase'):
+            self.apply_vars[key].set('')
+        self.apply_error.configure(text='')
+        self.apply_summary.configure(text='', background=theme.BG)
+        self.apply_recovery.configure(text='')
+        self.apply_commands.configure(text='')
+        self.apply_result = None
+        self._fill_apply_rows(plan)
+        self._apply_state()
+
+    def _fill_apply_rows(self, plan):
+        tree = self.apply_tree
+        tree.delete(*tree.get_children())
+        rows = (plan.steps + plan.invariants) if plan.available else []
+        for step in rows:
+            tree.insert('', 'end', iid=step.step_id, tags=('pending',),
+                        values=(step.title, APPLY_STATUS_TEXT['pending'], ''))
+        tree.configure(height=max(4, min(len(rows), 12)))
+
+    def _set_row(self, step_id, status, text):
+        tree = self.apply_tree
+        if step_id not in tree.get_children():
+            return
+        title = tree.item(step_id, 'values')[0]
+        tree.item(step_id, values=(title, APPLY_STATUS_TEXT.get(status, status),
+                                   (text or '')[:300]),
+                  tags=(status if status in APPLY_COLORS else 'pending',))
+
+    def apply_ssh(self):
+        """Run the previewed plan (console.apply). The password fields are emptied now."""
+        password = self.apply_vars['password'].get()
+        confirm = self.apply_vars['confirm'].get()
+        self.apply_vars['password'].set('')
+        self.apply_vars['confirm'].set('')
+        if not self._can_apply():
+            self.apply_error.configure(text='Make a preview of a connected, detected device first '
+                                            '(and only once per preview).')
+            return
+        plan, result, request, session = self.plan, self.result, self.plan_request, self.session
+        stale = plan_is_stale(plan, result, self.result_live) or (
+            'The values entered above were changed after this preview was made.'
+            if self._inputs_changed else None)
+        phrase = self.apply_vars['phrase'].get()
+        approvals = {sid for sid, var in self.approval_vars.items() if var.get()}
+        problems = ssh_apply.check_request(plan, result, request, self.result_live, stale, phrase,
+                                           approvals, password, confirm)
+        if problems:
+            self.apply_error.configure(text='Nothing was sent:\n' + '\n'.join(
+                f'•  {p}' for p in problems))
+            self._log('SSH apply refused before sending anything: ' + ' '.join(problems), 'warn')
+            return
+        self.apply_error.configure(text='')
+        self._apply_cancel = threading.Event()
+        cancel, progress, closed = self._apply_cancel, self._apply_progress, self._closed
+        # H1: NetCommand may not close while this runs (gui.apply_guard); a close request
+        # stops the run after its current step, never during an exchange
+        token = apply_guard.begin(session.port, cancel)
+        finish_fast = apply_guard.finish_fast_event(token)
+        self._fill_apply_rows(plan)
+        self.set_state(APPLYING, 'Applying the SSH configuration, one step at a time...')
+        self._log(f'Applying the SSH configuration to {session.port} '
+                  f'({len(plan.steps)} step(s)).', 'warn')
+
+        def work(pw=password, cf=confirm):
+            try:
+                return ssh_apply.apply_plan(
+                    session, plan, result, request, password=pw, confirm=cf,
+                    confirmation=phrase, approvals=approvals, stale_reason=stale, cancel=cancel,
+                    progress=lambda *event: progress.put(event), finish_fast=finish_fast)
+            finally:
+                pw = cf = None
+                # the page closed, or NetCommand is closing: the step has ended, so close
+                # the console port now (nothing typed), and only then allow the shutdown
+                if closed.is_set() or apply_guard.shutdown_requested(token):
+                    self._quiet_close(session)
+                apply_guard.end(token)
+        password = confirm = None
+        background.run_async(self, work, lambda res, err: self._applied(session, res, err))
+        self._drain_apply()
+
+    def stop_apply(self):
+        """Stop after the current step (never in the middle of a command exchange)."""
+        if self.phase != APPLYING:
+            return
+        self._apply_cancel.set()
+        self.message.configure(text='Stopping after the current step...')
+        self._apply_state()
+
+    def _drain_apply(self):
+        if not self._alive():
+            return
+        while True:
+            try:
+                step_id, status, text = self._apply_progress.get_nowait()
+            except queue.Empty:
+                break
+            self._set_row(step_id, status, text)
+            if step_id in ('preflight', 'detect'):
+                self.message.configure(text=text)
+        if self.phase == APPLYING:
+            try:
+                self.after(100, self._drain_apply)
+            except tk.TclError:
+                pass
+
+    def _applied(self, session, res, err):
+        if not self._alive():
+            return
+        self._drain_apply()
+        self.plan_applied = True
+        if err is not None or res is None:
+            text = describe_error(err) if err is not None else 'No result.'
+            # the console's state is not known: close the port without typing anything
+            self._quiet_close(session)
+            self.apply_summary.configure(text=f'Apply stopped unexpectedly: {text}',
+                                         background=theme.DANGER_SOFT, foreground=theme.DANGER)
+            self.apply_recovery.configure(text='•  The console port was closed without typing '
+                                               'anything. At the console, check the prompt and '
+                                               'resolve it yourself, then connect and detect '
+                                               'again.')
+            self._log(f'SSH apply stopped unexpectedly: {text}', 'error')
+            self._after_apply(session, f'Apply stopped unexpectedly: {text}', 'error')
+            return
+        self.apply_result = res
+        for rec in res.steps + res.invariants:
+            self._set_row(rec.step_id, rec.status, '; '.join(rec.reasons))
+        colors = {ssh_apply.SUCCESS: (theme.SUCCESS_SOFT, theme.SUCCESS),
+                  ssh_apply.FAILURE: (theme.DANGER_SOFT, theme.DANGER),
+                  ssh_apply.REFUSED: (theme.DANGER_SOFT, theme.DANGER)}
+        back, fore = colors.get(res.outcome, (theme.WARNING_SOFT, theme.WARNING))
+        self.apply_summary.configure(text=res.message, background=back, foreground=fore)
+        self.apply_recovery.configure(text='\n'.join(f'•  {r}' for r in res.recovery))
+        self.apply_commands.configure(
+            text=('Lines sent (the password is never shown):\n' +
+                  '\n'.join(f'    {c}' for c in res.commands_sent)) if res.commands_sent else
+            'No configuration line was sent.')
+        if res.outcome == ssh_apply.REFUSED:
+            self.plan_applied = False                       # nothing was sent: may try again
+            self.apply_error.configure(text='Nothing was sent:\n' + '\n'.join(
+                f'•  {p}' for p in res.problems))
+        level = {ssh_apply.SUCCESS: 'ok', ssh_apply.REFUSED: 'warn'}.get(res.outcome, 'error')
+        self._log(f'SSH apply: {res.outcome}. {res.message}', level)
+        if res.final_detection is not None:
+            self.result, self.result_live = res.final_detection, True
+            self.result_time = datetime.now()
+            self.render_result(res.final_detection)
+            self._refresh_staleness()
+        self._after_apply(session, res.message, level)
+
+    def _after_apply(self, session, message, level):
+        """Back to DETECTED only when the run left the console at its verified '#' prompt
+        (console.apply leaves the session open only then). Otherwise the session is gone:
+        the page goes to the error state, where Detect cannot run (M1)."""
+        if session is not self.session:
+            return
+        res = self.apply_result
+        if session.is_active() and not (res is not None and res.console_released):
+            self.set_state(DETECTED, message, level)
+            return
+        why = (' The console was not at the privileged prompt, so its port was closed without '
+               'typing anything: resolve it at the console, then connect again.'
+               if res is not None and res.console_released else
+               ' The console session ended; connect again.')
+        self._session_lost(message + why)

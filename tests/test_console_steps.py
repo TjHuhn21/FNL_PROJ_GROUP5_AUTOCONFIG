@@ -301,11 +301,29 @@ def test_no_steps_without_commands(port):
     assert plan.steps == [] and plan.invariants == []
 
 
-# ------------------------------------------------------------------ still no execution
-def test_console_session_has_no_way_to_configure():
+# ------------------------------------------------------------------ execution is gated
+# Phase 5.1.2 (approved) added configuration execution. These tripwires were updated
+# deliberately: the session's public interface is exactly the read-only one plus the five
+# gated configuration methods, and nothing can be configured until an approved plan's
+# lines are allowed (console.apply does that, after every check).
+# phase 5.1.6 added `listen` (opens the port and only reads; updated deliberately)
+READ_ONLY_API = {'connect', 'listen', 'find_prompt', 'send_show', 'enable', 'is_active',
+                 'cancel', 'disconnect'}
+CONFIG_API = {'allow_config', 'enter_config', 'send_config_line', 'refresh_prompt',
+              'end_config'}
+
+
+def test_console_session_configuration_interface_is_exactly_the_approved_one():
     public = {n for n in dir(ConsoleSession) if not n.startswith('_')}
-    assert public == {'connect', 'find_prompt', 'send_show', 'enable', 'is_active', 'cancel',
-                      'disconnect'}
+    assert public == READ_ONLY_API | CONFIG_API
+
+
+def test_configuration_lines_are_refused_until_a_plan_allows_them():
+    from console.link import REFUSED, ConsoleError
+    session = ConsoleSession('COM4')                     # never connected: nothing can open
+    with pytest.raises(ConsoleError) as err:
+        session.send_config_line('hostname R1')
+    assert err.value.kind == REFUSED and 'not part of the approved plan' in str(err.value)
 
 
 def test_steps_module_has_no_session_or_device_access():
@@ -333,7 +351,7 @@ def test_gui_shows_steps_as_definitions_only(root):
     assert not body.winfo_manager()
     tab.preview_widgets['steps_toggle'].invoke()
     text = body.cget('text')
-    assert text.startswith(STEPS_NOTE) and 'nothing is run or sent' in text
+    assert text.startswith(STEPS_NOTE) and 'Previewing runs nothing' in text
     assert 'SEPARATE APPROVAL NEEDED' in text and '[aaa_unchanged]' in text
     assert 'prompt:   changes to R1-new(config)#' in text
     assert tab.session.sent and set(tab.session.sent) <= set(DETECTION_COMMANDS)

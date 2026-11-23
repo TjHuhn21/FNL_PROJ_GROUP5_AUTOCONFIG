@@ -212,13 +212,14 @@ def test_command_output_is_not_kept_after_login(monkeypatch):
     import serial.tools.list_ports as list_ports
     from types import SimpleNamespace
     FakeSerial.instances, FakeSerial.open_error, FakeSerial.block = [], None, False
+    FakeSerial.on_open = ''
     FakeSerial.device = Device()
     monkeypatch.setattr(serial, 'Serial', FakeSerial)
     monkeypatch.setattr(list_ports, 'comports',
                         lambda: [SimpleNamespace(device='COM4', description='x', hwid='y')])
     monkeypatch.setattr('sys.platform', 'win32')
-    s = link.ConsoleSession('COM4', timeout=15)
-    s.connect()
+    s = link.ConsoleSession('COM4', timeout=15, listen_seconds=0.1, listen_quiet=0.05)
+    s.connect(confirm_idle=True)        # phase 5.1.6: an idle console, operator-confirmed
     assert s._transcript.getvalue() == b'' and not s._transcript.recording
     out = s.send_show('show version')                # normal command handling still works
     assert 'Version 15.4(3)M2' in out
@@ -227,18 +228,26 @@ def test_command_output_is_not_kept_after_login(monkeypatch):
     assert s._transcript.getvalue() == b''
 
 
-def test_failed_login_is_still_explained_and_then_wiped():
-    from netmiko.exceptions import NetmikoAuthenticationException
-    from test_console_link import FakeConn
-
-    def handler(**params):
-        return FakeConn('\r\nUser Access Verification\r\n\r\nPassword: \r\n% Bad passwords\r\n',
-                        NetmikoAuthenticationException('Login failed: serial'), **params)
-    s = link.ConsoleSession('COM4', password='x-pass', connect_handler=handler, timeout=5)
+def test_failed_login_is_still_explained_and_then_wiped(monkeypatch):
+    # phase 5.1.6 (updated deliberately): the login is NetCommand's own now, so the device
+    # itself refuses the password (it no longer fakes Netmiko's serial_login)
+    from test_console_link import Device, FakeSerial
+    import serial
+    import serial.tools.list_ports as list_ports
+    from types import SimpleNamespace
+    FakeSerial.instances, FakeSerial.open_error, FakeSerial.block = [], None, False
+    FakeSerial.on_open = ''
+    FakeSerial.device = Device(login_password='Right-pass-1')
+    monkeypatch.setattr(serial, 'Serial', FakeSerial)
+    monkeypatch.setattr(list_ports, 'comports',
+                        lambda: [SimpleNamespace(device='COM4', description='x', hwid='y')])
+    s = link.ConsoleSession('COM4', password='x-pass', timeout=5, listen_seconds=0.1,
+                            listen_quiet=0.05)
     with pytest.raises(link.ConsoleError) as err:
-        s.connect()
-    assert err.value.kind == link.AUTH                      # classified from the transcript
-    assert s._transcript.getvalue() == b''                  # then emptied
+        s.connect(confirm_idle=True)
+    assert err.value.kind == link.AUTH and 'refused the console login' in str(err.value)
+    assert s._transcript.getvalue() == b''                  # nothing kept
+    assert not FakeSerial.instances[0].is_open
 
 
 # ================================================================== M3 / M5: VTY coverage

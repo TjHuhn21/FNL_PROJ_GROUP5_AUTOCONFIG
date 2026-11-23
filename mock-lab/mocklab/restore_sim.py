@@ -544,7 +544,7 @@ def configure_replace(session, w):
     if minutes and not (dev.archive or {}).get('path'):
         return _reply('% Timed rollback needs the configuration archive: configure "archive" '
                       'and "path" first (SIMULATED)')
-    if 'force' in options:
+    if 'force' in options and 'replace_prompts' not in dev.quirks:
         return _do_replace(session, f, 'list' in options, minutes)
 
     def answer(typed):
@@ -619,6 +619,9 @@ def configure_confirm(session, w):
     dev = session.dev
     if dev.rollback is None:
         return _reply(NO_PENDING)
+    if 'confirm_ignored' in dev.quirks:          # the timer keeps running
+        dev.event('confirm_ignored', '')
+        return _reply()
     dev.rollback = None
     dev.event('confirm', '')
     return _reply()
@@ -645,6 +648,39 @@ def configure_revert(session, w):
     return _reply()
 
 
+# ---------------------------------------------------------------- write memory (Phase 4H)
+SAVE_MISMATCH_LINE = 'ip domain-lookup source-interface Loopback98'
+
+
+def write_memory(session):
+    """`write memory`: running -> startup, with the saving quirks."""
+    dev = session.dev
+    if 'save_prompts' in dev.quirks:
+        def answer(typed):
+            if typed.strip().lower() not in ('', 'y', 'yes'):      # [confirm]: Enter = yes
+                return _reply('%Save aborted (SIMULATED)')
+            return _write(session)
+        session.pending = answer
+        return _reply('Warning: Attempting to overwrite an NVRAM configuration previously '
+                      'written\nby a different version of the system image.\nOverwrite the '
+                      'previous NVRAM configuration?[confirm]', raw=True)
+    return _write(session)
+
+
+def _write(session):
+    dev = session.dev
+    if 'save_fails' in dev.quirks:
+        dev.event('save_failed', '')
+        return _reply('Building configuration...\n%Error: NVRAM write failed (SIMULATED)')
+    dev.save()
+    if 'startup_mismatch' in dev.quirks:
+        dev.startup = dev.startup.replace('\nend', f'\n{SAVE_MISMATCH_LINE}\nend', 1)
+    if 'drop_during_save' in dev.quirks:
+        dev.event('disconnect', 'during write memory (drop_during_save)')
+        return _reply(drop=True)
+    return _reply('Building configuration...\n[OK]')
+
+
 # ---------------------------------------------------------------- scenario specs
 # Device specs for each restore scenario, for tests and the future restore engine.
 RESTORE_SCENARIOS = {
@@ -666,6 +702,12 @@ RESTORE_SCENARIOS = {
     'cleanup_fails': {'quirks': ['delete_fails']},
     'reboot_during_restore': {'quirks': ['reboot_during_restore']},
     'scp': {'scp': True},
+    'unexpected_prompt': {'quirks': ['replace_prompts']},
+    'confirm_fails': {'quirks': ['confirm_ignored']},
+    'save_fails': {'quirks': ['save_fails']},
+    'save_prompts': {'quirks': ['save_prompts']},
+    'drop_during_save': {'quirks': ['drop_during_save']},
+    'startup_mismatch': {'quirks': ['startup_mismatch']},
 }
 
 

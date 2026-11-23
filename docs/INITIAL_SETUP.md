@@ -4,11 +4,11 @@ The **Initial Setup** page (rail item **Setup**) connects to a network device th
 **console cable** and finds out what the device is and whether it can use SSH. Use it for
 a new or reset device that cannot be reached over the network yet.
 
-**It only reads.** It sends `show` commands and nothing else (plus `enable` if you ask for
-privileged mode). It does not change the hostname, IP addresses, users, SSH, RSA keys or
-the VTY lines, and it never saves the configuration. It can show a **preview** of an SSH
-setup (section 4), but it does not send it: executing configuration commands is planned
-for a later phase, after the preview has been checked on real hardware.
+**Detection and preview only read.** They send `show` commands and nothing else (plus
+`enable` if you ask for privileged mode). Only section 5, **Apply SSH Configuration**,
+changes the device: it sends the previewed SSH setup one step at a time, after you
+confirm it, and checks each step. It never saves the configuration, never sets an IP
+address and never logs in over the network.
 
 **Who can use it.** Operators and administrators (the same permission as the Configure
 page). Viewers do not see the page. In `--demo` mode it is available as well.
@@ -34,10 +34,25 @@ page). Viewers do not see the page. In `--demo` mode it is available as well.
 5. Click **Connect**. The status next to the buttons shows *Connecting...*, then
    *Connected (COM4, 9600 baud)*. While connecting, the **Cancel** button stops the attempt.
 
-If an unconfigured device asks *"Would you like to enter the initial configuration
-dialog? [yes/no]"*, the console driver (Netmiko) answers **no**: this skips the setup
-wizard and changes nothing. The page says so when it happens. NetCommand never answers
-"yes".
+**What happens when you click Connect (phase 5.1.6).** NetCommand opens the port and first
+only **listens** for a few seconds: nothing is sent, not even Enter. What the device printed
+decides what happens next, and the page says which case applies:
+
+| The page shows | What it means | What you do |
+|---|---|---|
+| **Normal prompt detected (verified by NetCommand)** | The device printed its `>` or `#` prompt. | Nothing: NetCommand connects. |
+| **Console silent; manual confirmation required** | An idle console prints nothing until it receives a key, so NetCommand cannot see whether the device is at a prompt or waiting for an answer. | Check the device yourself in a terminal program (PuTTY, Tera Term), close the terminal, then tick *"I checked the console in a terminal and confirmed that the device is at a normal IOS `>` or `#` prompt."* and click **Continue**. The box is never ticked for you. This is **your** check, not NetCommand's: if the device is really waiting at a question, the Enter sent next would answer it. |
+| **Known startup prompt detected** - "Press RETURN to get started" | The device has just started (or a console session ended). | Click **Press Enter to start the console session** (one Enter). |
+| **Known startup prompt detected** - the initial configuration dialog | A new or erased device asks *"Would you like to enter the initial configuration dialog? [yes/no]"*. | Policy: NetCommand answers **no** only when you click **Answer "no" and continue** (this skips the setup wizard and changes no configuration), then presses Enter once at the *"Press RETURN to get started"* that follows. It never answers "yes". |
+| **Unsafe or unknown state; connection refused** | A question or `[confirm]`, a password or login prompt, the boot loader (ROMMON / `switch:`), configuration mode, unreadable output, output still streaming, or anything not recognised. | Nothing was sent and the port was closed. Resolve it at the console in a terminal program, then connect again. |
+
+**Cancel** (or **Cancel and close the port**) while the page waits for your decision closes
+the port: nothing has been sent. After connecting, the message says whether NetCommand
+verified the prompt or relied on your confirmation.
+
+The same open port is then used for everything (it is never closed and reopened in between),
+and NetCommand logs in itself: only the console's own username and password prompts are
+answered, with what you typed above.
 
 ## 2. Device Detection
 
@@ -60,6 +75,12 @@ level 15. If you connect in user mode (`>` prompt), the results say which inform
 missing for that reason. To include it, disconnect, tick **Use privileged mode**, enter
 the enable password and connect again: detection then sends `enable` first. `enable` is
 not a configuration change.
+
+**A factory device without an enable password (B1).** Tick **Use privileged mode** and
+leave the enable password empty: NetCommand then sends only `enable` and accepts the `#`
+prompt. If the device asks for a password instead, NetCommand does **not** answer it (no
+guess, no Enter): it closes the console port and says so. The device is left at its
+`Password:` prompt; connect again with the enable password.
 
 ## 3. Detection Results
 
@@ -95,9 +116,45 @@ or **Detect Again and Preview**. The page shows each setting's status, the propo
 commands in order with an explanation, conflicts and unknown settings, and which commands
 only add something and which change existing settings.
 
-**Preview only — no configuration commands have been sent to the device.** There is no
-button that sends or saves the plan. Passwords are shown only as `<SSH_PASSWORD>`. How the
-plan is made, and its safety rules, are described in `docs/SSH_CONFIGURATION_PREVIEW.md`.
+**Preview only — no configuration commands have been sent to the device.** The preview
+itself sends nothing; there is no button that saves. Passwords are shown only as
+`<SSH_PASSWORD>`. How the plan is made, and its safety rules, are described in
+`docs/SSH_CONFIGURATION_PREVIEW.md`.
+
+## 5. Apply SSH Configuration
+
+To send the previewed plan:
+
+1. Type the new account's password again, twice (it was discarded after the preview).
+2. Tick the approval of each step listed as able to cut off current users.
+3. Type the confirmation shown, exactly: `APPLY SSH <hostname>`.
+4. Click **Apply SSH Configuration**.
+
+NetCommand first checks privilege level 15 and reads the device again; if anything differs
+from the preview, nothing is sent. It then runs the steps one at a time: each in its own
+`configure terminal` ... `end`, each checked with `show` commands before the next. The
+table shows every step as VERIFIED, FAILED, UNCERTAIN, BLOCKED (needs a step that did not
+pass) or NOT RUN. The first step that does not pass stops the run.
+
+* **Questions are never answered.** If the device asks something (for example whether to
+  replace RSA keys), Apply stops, closes the console port and tells you what was asked.
+  Resolve it at the console yourself, then connect and detect again.
+* **Stop after the current step** stops between steps, never in the middle of a command.
+  Closing NetCommand (or signing out) during Apply works the same way: NetCommand stays
+  open until the current step has finished, closes the console port, and then closes.
+* If the console is not back at the normal `#` prompt at the end (for example an
+  unexpected prompt), NetCommand closes the console port without typing anything and the
+  page asks you to resolve the console by hand before connecting again.
+* The new account's password may not contain spaces or other whitespace.
+* **Nothing is saved.** The changes are in the running configuration only; saving is a
+  separate, later feature. No IP address is configured and SSH is not tried over the
+  network.
+* Afterwards the page shows a fresh detection of the device, the lines that were sent
+  (the password only as `<SSH_PASSWORD>`), and what to do next if something did not pass.
+* Apply runs once per preview; make a new preview to apply again (it will only propose
+  what is still missing).
+
+Details: `docs/SSH_CONFIGURATION_PREVIEW.md`, *Applying the plan*.
 
 ## Simulated results
 
@@ -157,8 +214,9 @@ or NetCommand while connecting or detecting cancels the work and closes the port
 
 ## Limitations
 
-* Tested offline only (simulated ports and the mock lab). It has not yet been used with a
-  real console cable and device.
+* Tested offline only (simulated ports, the mock lab, and the real Netmiko serial driver
+  over a fake port). It has not yet been used with a real console cable and device;
+  Apply in particular needs a separately approved test on the router.
 * One console session at a time.
 * A command that times out ends the session (see above).
 * Results are not saved anywhere; they are shown until the next detection.

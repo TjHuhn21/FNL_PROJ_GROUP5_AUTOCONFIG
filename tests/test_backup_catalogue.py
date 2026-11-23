@@ -348,9 +348,34 @@ def test_a_changed_ip_with_a_serial_match_is_allowed_with_a_warning():
                for w in m.warnings)
 
 
-def test_a_changed_ip_without_a_serial_match_blocks():
+def test_a_changed_ip_with_recorded_serial_and_platform_is_a_pending_candidate():
+    """The device side has no serial (device records do not store one): the backup becomes
+    a candidate whose identity the restore preflight must verify live. Never a match."""
     m = B.match(header(**IDENTITY), B.Device('10.0.0.9', 'SYNTH-R1'))
-    assert m.blocked and 'IP address differs' in m.block_reason
+    assert not m.blocked and m.live_identity_required
+    assert not m.hardware_match and not m.requires_legacy_confirmation
+    assert m.summary == 'Candidate: live identity check required (IP differs)'
+    assert 'match' not in m.summary.lower()                    # never called a match
+    assert any('Pending restore candidate' in w for w in m.warnings)
+    assert ('ip', 'mismatch') in [c[:2] for c in m.checks]
+    same_ip = B.match(header(**IDENTITY), B.Device('10.0.0.2', 'SYNTH-R1'))
+    assert not same_ip.live_identity_required                  # same-IP: unchanged
+
+
+@pytest.mark.parametrize('identity, device, reason', [
+    ({}, B.Device('10.0.0.9'), 'IP address differs'),                      # no identity
+    (dict(IDENTITY, serial=None), B.Device('10.0.0.9'), 'IP address differs'),
+    (dict(IDENTITY, serial='unknown'), B.Device('10.0.0.9'), 'IP address differs'),
+    (dict(IDENTITY, platform=None), B.Device('10.0.0.9'), 'IP address differs'),
+    ({k: v for k, v in IDENTITY.items() if k != 'platform'}, B.Device('10.0.0.9'),
+     'IP address differs'),
+    (IDENTITY, B.Device('10.0.0.9', serial='FTX0000SYN9'), 'Identity mismatch'),
+    (IDENTITY, B.Device('10.0.0.9', platform='CISCO1921/K9'), 'Platform mismatch'),
+])
+def test_a_changed_ip_without_a_possible_live_check_still_blocks(identity, device, reason):
+    m = B.match(header(**identity), device)
+    assert m.blocked and reason in m.block_reason
+    assert not m.live_identity_required and not m.hardware_match
 
 
 def test_a_changed_hostname_is_a_warning_and_a_hostname_never_proves_identity():
@@ -392,6 +417,36 @@ def test_a_serial_matched_backup_is_selected_without_legacy_confirmation(tmp_pat
     device = B.Device('10.0.0.2', 'SYNTH-R1', 'CISCO1941/K9', 'FTX0000SYN1')
     sel = B.select(entry, result, device, can_select=True)
     assert sel.hardware_match and not sel.requires_legacy_confirmation
+
+
+def test_a_changed_ip_candidate_is_selected_as_pending_and_contacts_nothing(
+        tmp_path, ring, source, monkeypatch):
+    monkeypatch.setattr(connect, '_open', lambda creds: pytest.fail('a device was contacted'))
+    monkeypatch.setattr(connect, 'ConnectHandler',
+                        lambda **kw: pytest.fail('a device was contacted'))
+    monkeypatch.setattr(connect, '_save_backup', lambda *a, **k: pytest.fail('backup made'))
+    folder = tmp_path / 'b'
+    path = write_backup(folder, 'a.ncbak', ring, **IDENTITY)        # recorded for 10.0.0.2
+    entry, result = verified(path, source)
+    sel = B.select(entry, result, B.Device('10.0.0.9', 'SYNTH-R1', device_id=8), True)
+    assert sel.live_identity_required and not sel.hardware_match
+    assert not sel.requires_legacy_confirmation and sel.device_ip == '10.0.0.9'
+    assert any('Pending restore candidate' in w for w in sel.warnings)
+    assert sorted(os.listdir(folder)) == ['a.ncbak']                # nothing written
+
+
+def test_same_ip_selections_are_unchanged(tmp_path, ring, source):
+    path = write_backup(tmp_path / 'b', 'a.ncbak', ring, **IDENTITY)
+    entry, result = verified(path, source)
+    sel = B.select(entry, result, DEVICE, can_select=True)
+    assert not sel.live_identity_required and not sel.hardware_match
+    assert sel.requires_legacy_confirmation
+    legacy = write_backup(tmp_path / 'b', 'old.ncbak', ring)
+    entry, result = verified(legacy, source)
+    sel = B.select(entry, result, DEVICE, can_select=True)
+    assert not sel.live_identity_required and sel.requires_legacy_confirmation
+    with pytest.raises(B.SelectionRefused, match='IP address differs'):
+        B.select(entry, result, B.Device('10.0.0.9', device_id=8), True)   # legacy elsewhere
 
 
 @pytest.mark.parametrize('case', ['viewer', 'unverified', 'unavailable', 'failed',
@@ -506,6 +561,27 @@ def test_window_lists_marks_unverified_and_verifies_without_freezing(window_root
     assert shown[-1][1] == 'Backup selected' and 'Nothing was sent' in shown[-1][2]
     text = win.details.get('1.0', 'end')
     assert no_secret(text, shown)
+
+
+def test_window_marks_a_changed_ip_candidate_as_pending_not_a_match(window_root, tmp_path,
+                                                                    ring, source):
+    from gui_helpers import pump
+    root, shown = window_root
+    path = write_backup(tmp_path / 'b', 'a.ncbak', ring, **dict(IDENTITY, host='10.0.0.99'))
+    selected = []
+    win = open_window(root, tmp_path / 'b', source, selected=selected)
+    assert win.tree.get_children() == (path,)                 # shown: same hostname
+    win.tree.selection_set(path)
+    win.verify_selected()
+    assert pump(root, lambda: not win.busy)
+    text = win.details.get('1.0', 'end')
+    assert 'PENDING RESTORE CANDIDATE, NOT a verified match' in text
+    assert 'legacy-backup confirmation' not in text
+    assert win.tree.item(path, 'values')[-1].startswith('Candidate: live identity check')
+    win.select()
+    assert selected[0].live_identity_required and not selected[0].hardware_match
+    assert shown[-1][1] == 'Backup selected' and 'PENDING CANDIDATE' in shown[-1][2]
+    assert 'Nothing was sent' in shown[-1][2]
 
 
 def test_window_never_enables_selection_for_a_viewer(window_root, tmp_path, ring, source):

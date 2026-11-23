@@ -78,13 +78,20 @@ class FakeSession:
         if self.cancelled and name not in ('disconnect',):
             raise ConsoleError(link.CANCELLED, 'Cancelled. The serial port was closed.')
 
-    def connect(self):
+    def listen(self):
+        """Phase 5.1.6: what the console showed before anything was sent. This fake
+        shows its prompt (a normal, verified state) unless a test sets self.preflight."""
+        self._record('listen')
+        return getattr(self, 'preflight', None) or link.Preflight(link.CONSOLE_PROMPT,
+                                                                   self.prompt)
+
+    def connect(self, confirm_idle=False, startup_action=None):
         self._record('connect')
         if self.connect_error is not None:
             raise self.connect_error
         self.connected = True
         return ConnectResult(self.port, self.baudrate, self.prompt,
-                             [link.NETMIKO_SETUP_DIALOG_NOTICE])
+                             [link.SETUP_DIALOG_NOTICE])
 
     def is_active(self):
         return self.connected and not self.cancelled
@@ -142,8 +149,10 @@ class FakeBackend:
             raise self.scan_error
         return PortScan(ports=tuple(self.ports))
 
-    def open_session(self, port, baudrate, username, password, enable_password, log=None):
+    def open_session(self, port, baudrate, username, password, enable_password, log=None,
+                     **extra):
         s = FakeSession(port, baudrate, username, password, enable_password, **self.options)
+        s.open_extra = extra                       # e.g. enable_without_password (B1)
         self.sessions.append(s)
         return s
 
@@ -370,7 +379,8 @@ def test_successful_connection_uses_the_chosen_speed(root):
     session = tab.backend.sessions[0]
     assert (session.port, session.baudrate) == ('COM4', 19200)
     assert 'Connected to COM4 at 19200 baud' in tab.message.cget('text')
-    assert session.calls[0] == ('connect', False)                     # not on the Tk thread
+    # phase 5.1.6: listen (nothing written) comes first, then connect; both off the Tk thread
+    assert session.calls[:2] == [('listen', False), ('connect', False)]
 
 
 @pytest.mark.parametrize('kind, text', [
@@ -611,7 +621,10 @@ def test_privileged_mode_only_when_asked(root):
     assert session.enable_password == ENABLE and session.sent[0] == 'enable'
 
 
-def test_privileged_mode_needs_the_enable_password(root):
+def test_privileged_mode_without_an_enable_password_is_a_bare_enable(root):
+    # Phase 5.1.2, decision B1 (approved; this test replaced "needs the enable password"):
+    # privileged mode with an empty enable password asks the session for a bare `enable`,
+    # which never answers a password prompt. With a password typed, nothing changes.
     tab = make(root)
     ports_ready(root, tab)
     assert disabled(tab.enable_entry)                             # only when ticked
@@ -619,8 +632,10 @@ def test_privileged_mode_needs_the_enable_password(root):
     tab._apply_state()
     assert not disabled(tab.enable_entry)
     tab.connect()
-    root.update()
-    assert tab.backend.sessions == [] and 'enable password' in tab.message.cget('text')
+    pump(root, lambda: tab.backend.sessions)
+    session = tab.backend.sessions[0]
+    assert session.open_extra == {'enable_without_password': True}
+    assert session.enable_password == ''
 
 
 def test_technical_details_are_separate(root):
@@ -684,6 +699,13 @@ def test_mock_lab_connection_failures(root, port, words):
     tab._show_port_hint()
     tab.connect()
     settle(root, tab)
+    if port == 'SIM6':
+        # phase 5.1.6: a device that never answers is a SILENT console: nothing is sent
+        # until the operator confirms; only then does the (simulated) timeout follow
+        assert tab.phase == setup_tab.AWAITING and tab.idle_confirm.get() == 0
+        tab.idle_box.invoke()                      # the operator ticks it
+        tab.continue_btn.invoke()
+        settle(root, tab)
     assert tab.phase == ERROR and words in tab.message.cget('text')
 
 

@@ -1,4 +1,10 @@
-"""console.link: one read-only console session. Offline.
+"""console.link: one console session. Offline.
+
+Phase 5.1.6 (N1): the session opens the port itself and LISTENS before writing anything.
+An idle fake device (like real IOS) prints nothing until it receives a line, so these
+tests connect with confirm_idle=True: the operator's confirmation that the console is at
+a normal prompt. FakeSerial.on_open is output that is already there when the port opens
+(what listening can see). Login is NetCommand's own (never Netmiko's serial_login).
 
 Two kinds of fake:
   * FakeSerial replaces serial.Serial, so the REAL Netmiko cisco_ios_serial driver runs
@@ -27,12 +33,13 @@ class Device:
     """A minimal Cisco IOS console: what it prints for each line it receives."""
 
     def __init__(self, login_password=None, enable_password=ENABLE_PW, setup_dialog=False,
-                 echo_secrets=False, privileged=False):
+                 echo_secrets=False, privileged=False, mute=False, no_password_set=False):
         self.login_password = login_password
         self.enable_password = enable_password
         self.setup_dialog = setup_dialog
         self.echo_secrets = echo_secrets
         self.privileged = privileged
+        self.mute, self.no_password_set = mute, no_password_set   # never answers / no password
         self.state = 'setup' if setup_dialog else ('login' if login_password else 'exec')
         self.greeted = False
         self.lines = []                         # every line NetCommand/Netmiko sent
@@ -43,6 +50,11 @@ class Device:
 
     def line(self, text):
         self.lines.append(text)
+        if self.mute:
+            return ''
+        if self.no_password_set:
+            return ('\r\nPassword required, but none set\r\n\r\nR1 con0 is now available\r\n'
+                    '\r\nPress RETURN to get started.\r\n')
         if self.state == 'setup':
             if not self.greeted:
                 self.greeted = True
@@ -96,13 +108,14 @@ class FakeSerial(serial.Serial):
     instances = []
     open_error = None             # an exception to raise when "opening" the port
     block = False                 # True: the device never answers and reads hang
+    on_open = ''                  # output already there when the port opens (listen sees it)
 
     def __init__(self, **settings):                       # no super(): never touch the OS
         if FakeSerial.open_error is not None:
             raise FakeSerial.open_error
         self.settings = settings
         self.is_open = True
-        self._out = bytearray()
+        self._out = bytearray(FakeSerial.on_open.encode('latin-1'))
         self._buffer = ''
         self._closed = threading.Event()
         self.close_calls = 0
@@ -152,6 +165,7 @@ def port(monkeypatch):
     FakeSerial.instances = []
     FakeSerial.open_error = None
     FakeSerial.block = False
+    FakeSerial.on_open = ''
     FakeSerial.device = Device()
     monkeypatch.setattr(serial, 'Serial', FakeSerial)
     monkeypatch.setattr(list_ports, 'comports',
@@ -164,6 +178,8 @@ def port(monkeypatch):
 def session(**kwargs):
     lines = []
     kwargs.setdefault('timeout', 15)
+    kwargs.setdefault('listen_seconds', 0.1)
+    kwargs.setdefault('listen_quiet', 0.05)
     s = ConsoleSession('COM4', log=lambda kind, text: lines.append((kind, text)), **kwargs)
     s.lines = lines
     return s
@@ -188,10 +204,11 @@ def assert_only_safe_lines(device):
 # ------------------------------------------------------------------ real Netmiko, fake port
 def test_connect_show_disconnect(port):
     s = session()
-    result = s.connect()
+    result = s.connect(confirm_idle=True)
     assert result.prompt == 'R1>' and not result.privileged
+    assert result.verification == link.OPERATOR_CONFIRMED
     assert result.port == 'COM4' and result.baudrate == 9600
-    assert link.NETMIKO_SETUP_DIALOG_NOTICE in result.notices
+    assert link.SETUP_DIALOG_NOTICE in result.notices
     assert link.SETUP_DIALOG_ANSWERED not in result.notices
     settings = port.instances[0].settings
     assert settings['port'] == 'COM4' and settings['baudrate'] == 9600
@@ -210,7 +227,7 @@ def test_connect_show_disconnect(port):
 
 def test_configurable_baud_rate(port):
     s = session(baudrate=115200)
-    s.connect()
+    s.connect(confirm_idle=True)
     assert port.instances[0].settings['baudrate'] == 115200
     s.disconnect()
 
@@ -226,7 +243,7 @@ def test_bad_baud_rate_is_refused_before_anything_opens(port):
 def test_console_password_and_enable(port):
     port.device = Device(login_password=LOGIN_PW)
     s = session(password=LOGIN_PW, enable_password=ENABLE_PW)
-    assert s.connect().prompt == 'R1>'
+    assert s.connect(confirm_idle=True).prompt == 'R1>'
     assert s.enable() == 'R1#'
     assert s.find_prompt() == 'R1#'
     s.disconnect()
@@ -235,7 +252,7 @@ def test_console_password_and_enable(port):
 
 def test_enable_without_password_sends_nothing(port):
     s = session()
-    s.connect()
+    s.connect(confirm_idle=True)
     sent = len(port.device.lines)
     with pytest.raises(ConsoleError) as err:
         s.enable()
@@ -247,20 +264,27 @@ def test_enable_without_password_sends_nothing(port):
 def test_enable_already_privileged(port):
     port.device = Device(privileged=True)
     s = session()
-    assert s.connect().privileged
+    assert s.connect(confirm_idle=True).privileged
     assert s.enable() == 'R1#'
     assert 'enable' not in port.device.lines
     s.disconnect()
 
 
-def test_setup_dialog_is_answered_no_and_reported(port):
+def test_setup_dialog_is_answered_no_only_after_approval(port):
+    # phase 5.1.6 (updated deliberately): Netmiko used to answer "no" by itself. Now the
+    # dialog stops the login with the port open and nothing answered; "no" is sent only
+    # with the approved startup action (and then one Enter at "Press RETURN").
     port.device = Device(setup_dialog=True)
     s = session()
-    result = s.connect()
-    assert result.prompt == 'R1>'
+    with pytest.raises(ConsoleError) as err:
+        s.connect(confirm_idle=True)
+    assert err.value.kind == link.APPROVAL_REQUIRED
+    assert port.device.lines == [''] and port.instances[0].is_open    # nothing answered
+    result = s.connect(startup_action=link.DECLINE_SETUP_ACTION)
+    assert result.prompt == 'R1>' and result.verification == link.STARTUP_ACTION
     assert result.notices[0] == link.SETUP_DIALOG_ANSWERED
-    assert ('warn', link.SETUP_DIALOG_ANSWERED) in s.lines
-    assert 'no' in port.device.lines and 'yes' not in port.device.lines
+    assert port.device.lines[:3] == ['', 'no', '']
+    assert 'yes' not in port.device.lines and len(port.instances) == 1   # never reopened
     s.disconnect()
     assert_only_safe_lines(port.device)
 
@@ -268,7 +292,7 @@ def test_setup_dialog_is_answered_no_and_reported(port):
 def test_passwords_never_shown_even_if_the_device_echoes_them(port):
     port.device = Device(login_password=LOGIN_PW, echo_secrets=True)
     s = session(username='admin', password=LOGIN_PW, enable_password=ENABLE_PW)
-    result = s.connect()
+    result = s.connect(confirm_idle=True)
     s.enable()
     s.send_show('show version')
     transcript = s._device_output()
@@ -281,7 +305,7 @@ def test_passwords_never_shown_even_if_the_device_echoes_them(port):
 def test_unknown_port(port):
     s = ConsoleSession('COM9')
     with pytest.raises(ConsoleError) as err:
-        s.connect()
+        s.connect(confirm_idle=True)
     assert err.value.kind == link.PORT_UNAVAILABLE
     assert 'COM9' in str(err.value) and 'available devices' not in str(err.value)
     assert port.instances == []
@@ -312,7 +336,7 @@ def test_connection_timeout_closes_the_port(port):
     s = session(timeout=1)
     started = time.monotonic()
     with pytest.raises(ConsoleError) as err:
-        s.connect()
+        s.connect(confirm_idle=True)
     assert time.monotonic() - started < 6
     assert err.value.kind == link.TIMEOUT
     assert port.instances[0].is_open is False
@@ -325,7 +349,7 @@ def test_cancel_from_another_thread(port):
     threading.Timer(0.3, s.cancel).start()
     started = time.monotonic()
     with pytest.raises(ConsoleError) as err:
-        s.connect()
+        s.connect(confirm_idle=True)
     assert err.value.kind == link.CANCELLED
     assert time.monotonic() - started < 6
     assert port.instances[0].is_open is False
@@ -333,7 +357,7 @@ def test_cancel_from_another_thread(port):
 
 def test_connect_twice_is_refused(port):
     s = session()
-    s.connect()
+    s.connect(confirm_idle=True)
     with pytest.raises(ConsoleError):
         s.connect()
     s.disconnect()
@@ -341,7 +365,7 @@ def test_connect_twice_is_refused(port):
 
 def test_disconnect_is_idempotent_and_context_manager_closes(port):
     with session() as s:
-        s.connect()
+        s.connect(confirm_idle=True)
     assert port.instances[0].is_open is False
     s.disconnect()
     s.disconnect()
@@ -350,7 +374,7 @@ def test_disconnect_is_idempotent_and_context_manager_closes(port):
 
 def test_use_after_disconnect(port):
     s = session()
-    s.connect()
+    s.connect(confirm_idle=True)
     s.disconnect()
     for call in (s.find_prompt, lambda: s.send_show('show clock'), s.enable):
         with pytest.raises(ConsoleError) as err:
@@ -367,7 +391,7 @@ def test_use_after_disconnect(port):
 ])
 def test_only_single_show_commands_are_sent(port, command):
     s = session()
-    s.connect()
+    s.connect(confirm_idle=True)
     sent = len(port.device.lines)
     with pytest.raises(ConsoleError) as err:
         s.send_show(command)
@@ -383,33 +407,31 @@ def test_show_command_accepted_forms():
     assert link.check_show_command('show run | include hostname') == 'show run | include hostname'
 
 
-# ------------------------------------------------------------------ failures (fake Netmiko)
+# ------------------------------------------------------------------ failures
 class FakeConn:
-    """A Netmiko connection that prints `transcript` to the session log, then raises
-    `error` while logging in, or behaves like a logged-in device."""
+    """A Netmiko connection stand-in, for what happens AFTER NetCommand's own login
+    (session preparation, prompts, commands, disconnect). It gets the fake port handed
+    over like the real driver. error: raised by the session preparation."""
     made = []
+    encoding, RETURN = 'utf-8', '\n'
 
     def __init__(self, transcript='', error=None, prompt='R1>', command_error=None, **kwargs):
         self.kwargs = kwargs
         self.session_log = kwargs['session_log']
-        self.transcript, self.error, self.prompt = transcript, error, prompt
+        self.error, self.prompt = error, prompt
         self.command_error = command_error
-        self.remote_conn = SimpleNamespace(is_open=True, close=self._close)
+        self.remote_conn = None
         self.disconnected = 0
-        self.closed = 0
         FakeConn.made.append(self)
 
-    def _close(self):
-        self.closed += 1
-        self.remote_conn.is_open = False
-
-    def establish_connection(self):
-        self.session_log.write(self.transcript.encode())
+    def _prepare(self, *a, **k):
         if self.error is not None:
             raise self.error
 
-    def _try_session_preparation(self):
-        pass
+    set_terminal_width = disable_paging = set_base_prompt = _prepare
+
+    def establish_connection(self):                     # must never be used any more
+        raise AssertionError('Netmiko establish_connection / serial_login was called')
 
     def find_prompt(self):
         return self.prompt
@@ -421,15 +443,18 @@ class FakeConn:
 
     def disconnect(self):
         self.disconnected += 1
-        self.remote_conn.is_open = False
+        if self.remote_conn is not None:
+            self.remote_conn.close()
 
 
-def fake_session(transcript='', error=None, prompt='R1>', command_error=None, **kwargs):
+def fake_session(error=None, prompt='R1>', command_error=None, **kwargs):
     FakeConn.made = []
 
     def handler(**params):
-        return FakeConn(transcript, error, prompt, command_error, **params)
+        return FakeConn('', error, prompt, command_error, **params)
     kwargs.setdefault('timeout', 5)
+    kwargs.setdefault('listen_seconds', 0.1)
+    kwargs.setdefault('listen_quiet', 0.05)
     lines = []
     s = ConsoleSession('COM4', connect_handler=handler,
                        log=lambda kind, text: lines.append((kind, text)), **kwargs)
@@ -437,113 +462,115 @@ def fake_session(transcript='', error=None, prompt='R1>', command_error=None, **
     return s
 
 
-def auth_failed():
-    from netmiko.exceptions import NetmikoAuthenticationException
-    return NetmikoAuthenticationException('Login failed: serial')
-
-
-def failure(**kwargs):
-    s = fake_session(**kwargs)
+def failure(port, s=None, **connect):
+    s = s or session()
     with pytest.raises(ConsoleError) as err:
-        s.connect()
-    conn = FakeConn.made[0]
-    assert conn.closed or conn.disconnected                  # cleaned up after the failure
+        s.connect(**(connect or {'confirm_idle': True}))
+    assert all(not p.is_open for p in port.instances)          # the port was closed
     assert not s.is_active()
     return err.value, s
 
 
-def test_handler_gets_serial_settings_and_no_auto_connect():
+def test_handler_gets_serial_settings_and_no_auto_connect(port):
     s = fake_session(password=LOGIN_PW, enable_password=ENABLE_PW, baudrate=19200)
-    s.connect()
+    s.connect(confirm_idle=True)
     params = FakeConn.made[0].kwargs
     assert params['device_type'] == 'cisco_ios_serial' and params['auto_connect'] is False
     assert params['serial_settings'] == {'port': 'COM4', 'baudrate': 19200, 'bytesize': 8,
                                          'parity': 'N', 'stopbits': 1}
     assert params['password'] == LOGIN_PW and params['secret'] == ENABLE_PW
+    # the port NetCommand opened and listened on is the one Netmiko got: never reopened
+    assert len(port.instances) == 1 and FakeConn.made[0].remote_conn is port.instances[0]
+    assert port.instances[0].settings['baudrate'] == 19200
     s.disconnect()
     assert FakeConn.made[0].disconnected == 1
 
 
-def test_wrong_password():
-    err, s = failure(transcript='\r\nUser Access Verification\r\n\r\nPassword: \r\n'
-                                '% Bad passwords\r\n\r\nPassword: ',
-                     error=auth_failed(), password=LOGIN_PW)
+def test_wrong_password(port):
+    port.device = Device(login_password=LOGIN_PW)
+    err, s = failure(port, session(password='Wr0ng-Password'))
     assert err.kind == link.AUTH and 'refused the console login' in str(err)
-    assert LOGIN_PW not in everything_shown(s, err)
+    assert LOGIN_PW not in everything_shown(s, err) and 'Wr0ng-Password' not in str(err)
 
 
-def test_password_asked_but_none_given():
-    err, _ = failure(transcript='\r\nPassword: ', error=auth_failed())
+def test_password_asked_but_none_given(port):
+    port.device = Device(login_password=LOGIN_PW)
+    err, _ = failure(port)
     assert err.kind == link.AUTH and 'Enter the console login' in str(err)
 
 
-def test_password_required_but_none_set():
-    from netmiko.exceptions import NetmikoAuthenticationException
-    err, _ = failure(transcript='\r\nPassword required, but none set\r\n',
-                     error=NetmikoAuthenticationException(
-                         'Login failed - Password required, but none set: serial'))
+def test_password_required_but_none_set(port):
+    port.device = Device(no_password_set=True)
+    err, _ = failure(port)
     assert err.kind == link.AUTH and 'has none set' in str(err)
 
 
-def test_wrong_speed_gives_unreadable_output():
-    garbage = '\x00\x1e\x86\xf8\x80\x00\xfe\x98\x1e\x00\xe6\x86' * 3
-    err, _ = failure(transcript=garbage, error=auth_failed())
-    assert err.kind == link.UNREADABLE and '9600' in str(err)
+def test_wrong_speed_gives_unreadable_output(port):
+    port.on_open = '\x00\x1e\x86\xf8\x80\x00\xfe\x98\x1e\x00\xe6\x86' * 3
+    err, _ = failure(port)
+    assert err.kind == link.UNREADABLE and 'wrong speed' in str(err)
+    assert port.device.lines == []                              # nothing was written
 
 
-def test_silent_device():
-    err, _ = failure(transcript='', error=auth_failed())
+def test_silent_device(port):
+    port.device = Device(mute=True)
+    err, _ = failure(port, session(timeout=2))
     assert err.kind == link.TIMEOUT and 'No answer on COM4' in str(err)
 
 
 @pytest.mark.parametrize('transcript', ['\r\nrommon 1 > ', '\r\nswitch: ', '\r\nloader> '])
-def test_boot_loader(transcript):
-    err, _ = failure(transcript=transcript, error=auth_failed())
+def test_boot_loader(port, transcript):
+    port.on_open = transcript
+    err, _ = failure(port)
     assert err.kind == link.UNEXPECTED_PROMPT and 'boot loader' in str(err)
+    assert port.device.lines == []
 
 
-def test_not_a_cisco_prompt_during_login():
-    err, _ = failure(transcript='\r\nWelcome to ExampleOS\r\n$ ', error=auth_failed())
+def test_not_a_cisco_prompt_during_login(port):
+    port.on_open = '\r\nWelcome to ExampleOS\r\n$ '
+    err, _ = failure(port)
+    assert err.kind == link.UNEXPECTED_PROMPT and port.device.lines == []
+
+
+def test_not_a_cisco_prompt_after_login(port):
+    err, _ = failure(port, fake_session(prompt='root@box:~$'))
     assert err.kind == link.UNEXPECTED_PROMPT
 
 
-def test_not_a_cisco_prompt_after_login():
-    err, _ = failure(prompt='root@box:~$')
-    assert err.kind == link.UNEXPECTED_PROMPT
-
-
-def test_netmiko_timeout_during_login():
+def test_netmiko_timeout_during_session_preparation(port):
     from netmiko.exceptions import ReadTimeout
-    err, _ = failure(transcript='R1>', error=ReadTimeout('Pattern not detected: secret'))
+    err, _ = failure(port, fake_session(error=ReadTimeout('Pattern not detected: secret')))
     assert err.kind == link.TIMEOUT and 'secret' not in str(err)
 
 
-def test_cable_unplugged_mid_login():
-    err, _ = failure(transcript='R1', error=serial.SerialException('ClearCommError failed'))
+def test_cable_unplugged_during_session_preparation(port):
+    err, _ = failure(port, fake_session(error=serial.SerialException('ClearCommError failed')))
     assert err.kind == link.PORT_UNAVAILABLE
 
 
-def test_unknown_error_does_not_leak_its_text():
-    err, s = failure(error=RuntimeError(f'boom {LOGIN_PW}'), password=LOGIN_PW)
+def test_unknown_error_does_not_leak_its_text(port):
+    s = fake_session(error=RuntimeError(f'boom {LOGIN_PW}'), password=LOGIN_PW)
+    err, s = failure(port, s)
     assert err.kind == link.OTHER and 'RuntimeError' in str(err)
     assert LOGIN_PW not in everything_shown(s, err)
 
 
-def test_command_timeout_closes_the_session():
+def test_command_timeout_closes_the_session(port):
     from netmiko.exceptions import ReadTimeout
     s = fake_session(command_error=ReadTimeout('Pattern not detected'))
-    s.connect()
+    s.connect(confirm_idle=True)
     with pytest.raises(ConsoleError) as err:
         s.send_show('show version')
     assert err.value.kind == link.TIMEOUT
-    assert FakeConn.made[0].closed and not s.is_active()
+    assert not port.instances[0].is_open and not s.is_active()
 
 
-def test_log_callback_errors_are_ignored():
+def test_log_callback_errors_are_ignored(port):
     def bad_log(kind, text):
         raise RuntimeError('log broke')
-    s = ConsoleSession('COM4', connect_handler=lambda **p: FakeConn(**p), log=bad_log, timeout=5)
-    s.connect()
+    s = ConsoleSession('COM4', connect_handler=lambda **p: FakeConn(**p), log=bad_log,
+                       timeout=5, listen_seconds=0.1, listen_quiet=0.05)
+    s.connect(confirm_idle=True)
     s.disconnect()
 
 
@@ -566,7 +593,9 @@ def test_bad_port_name(name, monkeypatch):
         ConsoleSession(name)
 
 
-def test_netmiko_setup_dialog_notice_is_documented():
-    assert '"no"' in link.NETMIKO_SETUP_DIALOG_NOTICE
-    assert 'never answers "yes"' in link.NETMIKO_SETUP_DIALOG_NOTICE
-    assert 'Netmiko answers "no"' in link.__doc__
+def test_setup_dialog_policy_is_documented():
+    # phase 5.1.6 (updated deliberately): "no" only after the operator approves it
+    assert '"no" only after you approve it' in link.SETUP_DIALOG_NOTICE
+    assert 'never answers "yes"' in link.SETUP_DIALOG_NOTICE
+    assert link.NETMIKO_SETUP_DIALOG_NOTICE == link.SETUP_DIALOG_NOTICE
+    assert 'answers "no" only when the operator approved it' in link.__doc__

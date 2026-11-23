@@ -67,10 +67,22 @@ QUIRKS = {
     'delete_fails': '"delete" of a flash file fails (cleanup failure)',
     'reboot_during_restore': 'the device reloads during configure replace: running = startup, '
                              'the pending rollback is lost, sessions are cut',
+    # restore engine (Phase 4F)
+    'replace_prompts': 'configure replace asks a question even with "force" (an unexpected '
+                       'prompt); only "y" would go on',
+    'confirm_ignored': 'configure confirm answers nothing but the rollback timer stays '
+                       'pending (a confirmation failure)',
+    # saving to startup (Phase 4H)
+    'save_fails': '"write memory" prints an NVRAM error and saves nothing',
+    'save_prompts': '"write memory" asks "Overwrite the previous NVRAM configuration?'
+                    '[confirm]" (as IOS does after an image change); Enter or y saves',
+    'drop_during_save': '"write memory" saves, then the connection is cut before its output',
+    'startup_mismatch': 'after "write memory" the startup configuration has one extra line, '
+                        'so it no longer matches the running configuration',
 }
 # Device attributes that make up the running configuration (configure replace, rollback
 # and reload swap these; ports, cables, keys, quirks and flash are physical and stay).
-CONFIG_ATTRS = ('hostname', 'enable_secret', 'vlans', 'interfaces', 'routes', 'default_gateway',
+CONFIG_ATTRS = ('hostname', 'enable_secret', 'enable_configured','vlans', 'interfaces', 'routes', 'default_gateway',
                 'dhcp_excluded', 'pools', 'name_servers', 'ntp_servers', 'global_lines', 'lines',
                 'archive')
 SYSLOG_LINES = ('*Nov 21 10:15:42.123: %LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed '
@@ -165,7 +177,14 @@ class Device:
         self.host = spec['host']
         self.hostname = spec.get('hostname', spec['name'])
         self.model = spec.get('model', f'NetCommand mock {self.kind}')
-        self.enable_secret = spec.get('enable_secret') or spec['password']
+        # Two separate facts (phase 5.1.3, M3):
+        #   enable_configured  False ONLY for a factory device (spec "no_enable_secret"):
+        #                      `enable` on its console needs no password
+        #   enable_secret      the password `enable` accepts; None = not known (for example
+        #                      a replayed hash that cannot be reversed): `enable` is refused
+        self.enable_configured = not spec.get('no_enable_secret')
+        self.enable_secret = (spec.get('enable_secret') or spec['password']) \
+            if self.enable_configured else None
         self.start_privileged = bool(spec.get('start_privileged', self.kind == 'switch'))
         self.trunk_encapsulation = spec.get('trunk_encapsulation', 'required' if self.kind == 'switch'
                                             else 'unsupported')   # required | unsupported
@@ -234,6 +253,15 @@ class Device:
             'write_memory': bool(archive.get('write_memory')),
             'time_period': archive.get('time_period')}
         self.management_ip = spec.get('management_ip')  # SIMULATED address NetCommand uses
+        # restore preflight (Phase 4E), both optional and absent from the default lab:
+        # "serial": a synthetic chassis serial (or a list, to simulate an ambiguous device),
+        # shown as "Processor board ID" in show version; "inventory": the entries of
+        # "show inventory" (the command exists only when this key is given).
+        serial = spec.get('serial')
+        self.serials = [] if serial is None else ([serial] if isinstance(serial, str)
+                                                  else list(serial))
+        self.inventory = None if spec.get('inventory') is None else \
+            [dict(item) for item in spec['inventory']]
         self.flash = restore_sim.Flash.for_device(self, spec)
         self.archive_copies = []                         # flash names, oldest first
         self.archive_next = 1
@@ -411,6 +439,7 @@ class Device:
 
     # ---------------------------------------------------------------- show commands
     def show_version(self):
+        serials = ''.join(f'Processor board ID {s}\n' for s in self.serials)
         if self.ssh_profile in ('enabled', 'disabled', 'unsupported'):
             software, image, hardware = _PROFILES[self.kind][
                 'plain' if self.ssh_profile == 'unsupported' else 'crypto']
@@ -418,14 +447,23 @@ class Device:
                     f'{software}\n\n'
                     f'{self.hostname} uptime is 1 hour, 2 minutes\n'
                     f'System image file is "{image}"\n\n'
-                    f'{hardware}\n'
+                    f'{hardware}\n{serials}'
                     f'Configuration register is 0x2102')
         return (f'NetCommand Mock Lab - simulated {self.kind} (not Cisco software)\n'
                 f'Mock software, Version 15.2(mock), RELEASE SOFTWARE\n\n'
                 f'{self.hostname} uptime is 1 hour, 2 minutes\n'
                 f'System image file is "mock:netcommand-lab.bin"\n\n'
-                f'{self.model} with 262144K bytes of memory.\n'
+                f'{self.model} with 262144K bytes of memory.\n{serials}'
                 f'Configuration register is 0x2102')
+
+    def show_inventory(self):
+        """IOS-style "show inventory" from the spec's synthetic "inventory" entries."""
+        rows = []
+        for item in self.inventory or []:
+            rows += [f'NAME: "{item.get("name", "")}", DESCR: "{item.get("descr", "")}"',
+                     f'PID: {item.get("pid", ""):<18}, VID: {item.get("vid", "V01")} , '
+                     f'SN: {item.get("sn", "")}', '']
+        return '\n'.join(rows).rstrip('\n')
 
     # ---------------------------------------------------------------- SSH-related shows
     def domain_name(self):

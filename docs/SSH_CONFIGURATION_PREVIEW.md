@@ -7,10 +7,11 @@ commands, in order, with a plain explanation of each.
 
 > **Preview only — no configuration commands have been sent to the device.**
 
-This version only plans. The planner (`console/plan.py`) has no access to the console
-session, the page has no Apply, Execute or Save button, and the command box is
-read-only. Sending the commands (and saving with `write memory`) is left for a later
-phase, after the preview has been checked on real hardware.
+The preview only plans: the planner (`console/plan.py`) has no access to the console
+session, and the command box is read-only. Sending an approved plan is the separate
+**Apply** section (phase 5.1.2, see *Applying the plan* below): one step at a time,
+each verified with `show` commands. Nothing is ever saved (`write memory` is not part of
+NetCommand's SSH setup).
 
 ## Using it
 
@@ -20,9 +21,13 @@ phase, after the preview has been checked on real hardware.
      `Switch` (IOS will not create RSA keys with the factory name).
    * *Domain name*: for example `lab.local`.
    * *New SSH username* and the *password* (twice): 8–64 characters, no accents, no `?`
-     (IOS treats `?` as a help request), no space at the start or end. These are
+     (IOS treats `?` as a help request), **no whitespace at all** (spaces, tabs, line
+     breaks), and nothing shaped like a stored Cisco hash (`$1$...`, `$9$...`). In
+     `username X secret <password>` IOS reads a leading `5 ` or `7 ` as the secret's type,
+     so a password such as `5 $1$...` would be stored as an unknown hash and lock the
+     account; a space could also cut the password short (phase 5.1.3). These are
      NetCommand's own rules; they have **not** been checked against the limits of a real
-     IOS release (maximum secret length, spaces inside a secret), which may be stricter.
+     IOS release (maximum secret length), which may be stricter.
    * *RSA key size*: only sizes offered for the detected software (classic IOS: 1024 or
      2048; IOS-XE: 2048 or 4096; default 2048).
 3. Click **Preview SSH Configuration**, or **Detect Again and Preview** to read the device
@@ -151,10 +156,9 @@ first and then builds the plan from that fresh result; if that detection does no
 ## Steps, dependencies and checks (phase 5.1)
 
 Every proposed command is also described as a **step** (`console/steps.py`; on the page:
-*Show steps, dependencies and checks*). This is a model for a possible later execution
-phase. **NetCommand still cannot execute configuration commands**: there is no runner,
-the console session has no method that sends configuration, and the page has no Apply,
-Execute or Save button. The steps are definitions; nothing runs them.
+*Show steps, dependencies and checks*). The steps are definitions; `console/steps.py`
+itself runs nothing. Apply (`console/apply.py`, below) runs exactly these steps, in this
+order, with these dependencies and checks.
 
 Each step has:
 
@@ -230,11 +234,124 @@ results and plans are marked SIMULATED):
 
 (SIM5–SIM7 simulate connection problems; see `docs/INITIAL_SETUP.md`.)
 
-Edge cases for future console configuration work (slow, failing or incomplete RSA key
+Edge cases for console configuration work (slow, failing or incomplete RSA key
 generation, replace and key-size questions, prompt changes, SSH version mismatches,
-log lines in the output, timeouts, a boot-loader prompt, a lost connection; SIM18–SIM37)
-are described in `mock-lab/README.md`. They exist for automated tests and are not in the
-normal `--mock-console` port list.
+log lines in the output, timeouts, a boot-loader prompt, a lost connection; SIM18–SIM37;
+enable with and without a password, SIM38–SIM39) are described in `mock-lab/README.md`.
+They exist for automated tests and are not in the normal `--mock-console` port list.
+
+## Applying the plan (phase 5.1.2)
+
+Section **5 Apply SSH Configuration** of the Initial Setup page sends a previewed plan
+to the device through the console (`console/apply.py`). Approved decisions: B1 (enable
+without a password), D1 (unexpected questions are never answered), D2 (no management IP
+and no network SSH login yet), D3 (nothing is saved).
+
+**Before anything is sent** (any problem: nothing at all is sent, not even a `show`):
+
+* the preview is current: not made from an earlier detection or an ended session, and
+  its values were not edited afterwards;
+* you typed the confirmation exactly: `APPLY SSH <hostname>` (the detected hostname);
+* every disruptive step (one that can cut off current users, such as removing Telnet or
+  renaming while SSH runs) has its own approval tick;
+* the new account's password is typed again, twice (it was discarded after the preview);
+* every plan line passes the configuration guard (below).
+
+Then, read-only on the device: `show privilege` must say 15, and a fresh detection must
+give exactly the same plan (same lines, steps, approvals, item states and AAA settings).
+If the device changed, nothing is sent.
+
+**Each step**, in order:
+
+1. Every step it requires must be VERIFIED.
+2. `configure terminal`; the reply must end at `<hostname>(config)#`.
+3. Only that step's line (for VTY steps, the `line vty ...` mode line first, expecting
+   `(config-line)#`). The reply is inspected: a known failure reply (`% Invalid ...`,
+   `%Error ...`, `% Please create ...`) makes the step FAILED.
+4. `end`, sent only when the prompt is the expected one. After `hostname X` the expected
+   prompt is the new name; if the device shows the old one once, the prompt is read again
+   with an empty line (never in reply to a question).
+
+   A reply carrying a known IOS failure message is checked **before** the prompt (phase
+   5.1.3): a rejected `hostname` or `line vty` line leaves the old prompt, and the step is
+   **FAILED** (not UNCERTAIN). `end` is then sent only if the prompt is exactly the one
+   before or after that line.
+5. The step's read-only checks. Only they can make it VERIFIED: an accepted command proves
+   nothing.
+
+The first step that is not VERIFIED stops the run. Steps that depend on it (directly or
+through others) are **BLOCKED**; the others are **NOT RUN**. Steps already VERIFIED stay
+in effect in the running configuration.
+
+**Stops, never answered (D1).** A question (`[yes/no]`, `[confirm]`, `How many bits in the
+modulus [512]:`...), a password prompt, a boot-loader prompt, a reply that never ends in a
+prompt (timeout), or a lost connection stops everything at once. Nothing is typed in
+reply (no `no`, no Enter): the console port is closed and the result says what the device
+asked and what to do at the console. Partial output from a timeout is never used.
+
+**Output that arrives in between (phase 5.1.5).** Before anything is written to the
+console - each configuration line, `end`, `enable`, and every command Netmiko sends with
+its own Enter (finding the prompt, `show` commands, learning a new prompt, logging out) -
+NetCommand reads what arrived unread and checks it. Nothing, system log lines
+(`%SYS-5-CONFIG_I ...`) or a prompt are fine. A question, confirmation, password or
+boot-loader prompt, or anything unrecognised stops everything: not one byte is written,
+so the next command can never become an answer; the port is closed and the step is
+UNCERTAIN. Disconnect logs out with `exit` only when nothing unsafe is waiting.
+
+**The first byte of Connect (phase 5.1.6).** Netmiko's serial login writes an Enter before
+it reads anything, so it is no longer used. NetCommand opens the port itself, listens
+without writing, and decides: a visible normal prompt is verified; a silent console needs
+the operator's explicit confirmation; "Press RETURN to get started" and the initial
+configuration dialog need an explicitly approved startup action; everything else is refused
+with the port closed and no byte written. The same open port is handed to Netmiko (never
+reopened), NetCommand logs in itself, and the unread-output check runs before every write of
+the login and the session preparation. See `docs/INITIAL_SETUP.md`, section 1.
+
+**If the console is not back at a verified `<hostname>#` prompt** when the run ends (an
+unexpected prompt, a rejection that left it elsewhere, or an internal error), the console
+port is closed at once **without typing anything**: no Enter, no `end`, no `exit` (Netmiko's
+graceful logout is not used). The result says so, and the page goes to its error state, so
+Detect cannot run against an unknown prompt. Resolve the console by hand, then connect
+again.
+
+**Afterwards** (when the console is back at the `#` prompt): the AAA invariant check
+(AAA must be exactly as detected; a difference is reported first, in capitals) and a
+complete read-only re-detection, which the page then shows.
+
+**The configuration guard** (`console.link.check_config_line`, in the real and the
+simulated session): one printable line; no `|`, `<`, `>` or `?` (placeholders like
+`<SSH_PASSWORD>` excepted); never `write`, `copy`, `reload`, `erase`, `delete`, `format`,
+`boot`, `do`, `configure`, `end`, `exit`, `no`, `aaa`, `enable`, `default`, `crypto key
+zeroize` and similar; and only lines of the approved plan (`allow_config`). The read-only
+`send_show` guard is unchanged.
+
+**The password** is substituted into the `username` line only when that line is written
+to the port, and masked (`********`) in the device's echo before anything stores, logs or
+shows it. The configuration exchanges read and write the serial port directly, so the
+password never reaches Netmiko's debug logging or session log. The result, the progress
+messages, the operations console and the page show `<SSH_PASSWORD>` only. The Apply
+password fields are emptied the moment Apply is clicked. (Python may keep the typed text
+in memory until it is garbage-collected; nothing references it after the run.)
+
+**Stop after the current step** sets a flag that the run reads between steps: a command
+exchange is never interrupted.
+
+**Closing NetCommand during Apply** (phase 5.1.3): the window's X, Sign out, an ended session
+and the demo-mode close all check `gui/apply_guard.py` (after the restore guard, which is
+unchanged). While an Apply runs, NetCommand does not close: it shows why, asks the run to
+stop after its current step (and to skip the final re-detection), the worker closes the
+console port without typing anything, and then the close or sign-out that was asked for is
+carried out. The Tk thread only polls (`after`), and the worker never waits for it. Closing the page during Apply does the same; the worker
+closes the console once its step has finished.
+
+**Not done here:** saving (`write memory` / `copy running-config startup-config`, D3);
+configuring a management IP address; logging in over the network with SSH (D2). The
+result says *Nothing was saved*; reloading the device without saving discards the changes.
+
+**Results:** each step VERIFIED, FAILED, UNCERTAIN, BLOCKED or NOT RUN, with its reasons,
+the lines sent (with `<SSH_PASSWORD>`), the device's reply (masked) and its check output;
+the overall outcome (*success*, *failed*, *uncertain*, *cancelled*, or *refused* when
+nothing was sent); and the manual recovery actions.
 
 ## Limitations and what is untested
 
@@ -256,3 +373,7 @@ normal `--mock-console` port list.
   IOS limits.
 * AAA servers (TACACS+/RADIUS) are not checked; the plan only shows the method lists.
 * The preview does not set a management IP address, default gateway or SSH timeouts.
+* **Apply has not been run on physical hardware.** It was tested with the mock lab's
+  simulated consoles and with the real Netmiko serial driver over a fake port. The prompt
+  forms, question wording, key generation time (180 s allowed) and failure replies of a
+  real IOS release must be confirmed on the router before relying on it.

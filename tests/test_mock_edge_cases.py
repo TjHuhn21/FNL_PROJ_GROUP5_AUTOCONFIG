@@ -99,7 +99,10 @@ def test_unknown_quirks_are_refused():
     assert set(QUIRKS) >= {'rsa_slow', 'syslog', 'legacy_ssh_only'}
 
 
-@pytest.mark.parametrize('port', list(EDGE_SCENARIOS))
+# phase 5.1.6: SIM40-SIM46 describe the console BEFORE connecting (silent, startup prompts,
+# unsafe states); they are covered by tests/test_console_preflight.py, not by detection
+@pytest.mark.parametrize('port', [p for p, s in EDGE_SCENARIOS.items()
+                                  if s['preflight'] == 'prompt'])
 def test_every_edge_scenario_is_simulated_deterministic_and_fast(port):
     started = time.monotonic()
     r, _ = detected(port)

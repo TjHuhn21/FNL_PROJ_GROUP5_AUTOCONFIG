@@ -247,6 +247,11 @@ class Session:
             w.end(1)
             if privileged:
                 return Reply()
+            if not self.dev.enable_configured:           # none configured: straight in
+                self.mode = 'exec'
+                return Reply()
+            # configured but not known (enable_secret None, e.g. a replayed hash): the
+            # password is asked for and no answer can match
             self.pending = self._enable_password
             return Reply('Password: ', echo_next=False, raw=True)
         if cmd == 'disable':
@@ -284,8 +289,7 @@ class Session:
             if w.has(1):
                 w.kw(1, ['memory'])
                 w.end(2)
-            self.dev.save()
-            return Reply('Building configuration...\n[OK]')
+            return restore_sim.write_memory(self)
         if cmd == 'copy':
             src = w.kw(1, ['running-config', 'startup-config'])
             dst = w.kw(2, ['running-config', 'startup-config'])
@@ -321,10 +325,15 @@ class Session:
                 options += ['crypto']
             if self.dev.kind == 'switch':
                 options += ['vlan']
+            if self.dev.inventory is not None:          # only when the spec gives one
+                options += ['inventory']
         what = w.kw(1, options)
         d = self.dev
         if what == 'version':
             out = d.show_version()
+        elif what == 'inventory':
+            w.end(2)
+            out = d.show_inventory()
         elif what == 'privilege':
             out = f"Current privilege level is {15 if privileged else 1}"
         elif what == 'clock':
@@ -525,10 +534,12 @@ class Session:
             hashed = _prehashed(secret.split())
             if hashed:                                    # 'enable secret 5 <hash>' (a replay)
                 d.enable_secret = _secret_for_hash(d, hashed[1])
+                d.enable_configured = True                # an enable secret now exists
                 self._set_global(f'enable {kind} {hashed[0]} {hashed[1]}', f'enable {kind}')
                 return Reply()
             secret = secret.split()[-1]
             d.enable_secret = secret
+            d.enable_configured = True
             self._set_global(f'enable {kind} 5 $1$mock${_scramble(secret)}', f'enable {kind}')
         else:                                             # username NAME [privilege N] secret X
             name = w.word(1)

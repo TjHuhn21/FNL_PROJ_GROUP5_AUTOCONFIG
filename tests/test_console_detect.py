@@ -748,14 +748,16 @@ def test_end_to_end_real_netmiko_on_a_fake_serial_port(monkeypatch):
     from test_console_link import FakeSerial
 
     FakeSerial.instances, FakeSerial.open_error, FakeSerial.block = [], None, False
+    FakeSerial.on_open = ''
     FakeSerial.device = MockLabConsole(mock_spec('router', 'disabled', privileged=False))
     monkeypatch.setattr(serial, 'Serial', FakeSerial)
     monkeypatch.setattr(list_ports, 'comports',
                         lambda: [SimpleNamespace(device='COM4', description='USB Serial',
                                                  hwid='USB VID:PID=067B:2303')])
-    session = link.ConsoleSession('COM4', enable_password='Lab-pass-1', timeout=20)
+    session = link.ConsoleSession('COM4', enable_password='Lab-pass-1', timeout=20,
+                                  listen_seconds=0.1, listen_quiet=0.05)
     try:
-        session.connect()
+        session.connect(confirm_idle=True)      # phase 5.1.6: an idle console, operator-confirmed
         before = FakeSerial.device.device.running_config()
         r = detect_device(session, elevate=True)
     finally:

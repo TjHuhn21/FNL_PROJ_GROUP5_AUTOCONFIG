@@ -35,6 +35,8 @@ class DevicesTab(ttk.Frame):
         # Backup & Restore catalogue (Phase 4B). Only for roles with the Configure
         # permission (set_backups_allowed); disabled until the main window allows it.
         self.backups_allowed, self.on_backup_selected = False, None
+        self.on_restore_finished = None                     # Restore window results (4G)
+        self.on_save_finished = None                        # Save to Startup results (4H)
         self.backups_btn = ttk.Button(top, text='Backups...', command=self.open_backups)
         self.backups_btn.pack(side='right', padx=(0, 12))
         self.backups_btn.state(['disabled'])
@@ -147,8 +149,41 @@ class DevicesTab(ttk.Frame):
         from gui.backup_catalogue_window import BackupCatalogueWindow
         device = backup_catalogue.Device(ip=d['ip'], hostname=d.get('name'),
                                          device_id=d.get('id'))
-        self.backups_window = BackupCatalogueWindow(self, device, self.backups_allowed,
-                                                    on_select=self.on_backup_selected)
+        self.backups_window = BackupCatalogueWindow(
+            self, device, self.backups_allowed, on_select=self.on_backup_selected,
+            on_restore=lambda selection: self.open_restore(selection, d))
+
+    def open_restore(self, selection, d):
+        """The Restore window (Phase 4G) for a backup selected in the catalogue. Opening it
+        connects to nothing; the login is read (or asked for) when the checks start."""
+        if not self.backups_allowed:
+            return
+        import backup_catalogue
+        from gui.restore_window import RestoreWindow
+        device = backup_catalogue.Device(ip=d['ip'], hostname=d.get('name'),
+                                         device_id=d.get('id'))
+        self.restore_window = RestoreWindow(self, selection, device, self.backups_allowed,
+                                            lambda: self._restore_login(d),
+                                            on_finished=self.on_restore_finished)
+        self.restore_window.on_save_finished = self.on_save_finished
+
+    def _restore_login(self, d):
+        """{'host', 'username', 'password'} from the saved login, else asked for (not
+        saved); None when the user cancels."""
+        from gui.components import login_dialog
+        from security import CredentialError
+        reason = 'missing'
+        try:
+            user, password = self.store.get_credentials(d['id'])
+        except CredentialError:
+            user, password, reason = None, None, 'unreadable'
+        if user:
+            return {'host': d['ip'], 'username': user, 'password': password}
+        answer = login_dialog.ask_device_login(self, [d], reason=reason)
+        if not answer:
+            return None
+        return {'host': d['ip'], 'username': answer['username'],
+                'password': answer['password']}
 
     def add(self):
         if not self.read_only and database_ready(self):

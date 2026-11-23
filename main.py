@@ -113,17 +113,51 @@ def window_title(demo, startup_problem, access, mock_lab=''):
             + (f'  [{mock_lab}]' if mock_lab else ''))
 
 
+APPLY_POLL_MS = 200          # how often a postponed close checks whether an SSH Apply ended
+
+
 def run_workbench(store, demo, startup_problem, access=None, client=None, session=None,
                   make_root=None):
     """Open the workbench. Returns SIGNED_OUT (show the sign-in window again) or CLOSED.
     make_root: the window factory (tests only; default customtkinter.CTk)."""
     from gui.main_window import build_main_window, mock_lab_label
+    from gui import apply_guard, restore_window
     import customtkinter as ctk
     root = (make_root or ctk.CTk)()          # a Tk window with the dark title bar and scaling support
     root.title(window_title(demo, startup_problem, access, mock_lab_label()))
     fit_to_screen(root)
-    outcome = {'value': CLOSED, 'done': False}
+    outcome = {'value': CLOSED, 'done': False, 'deferred': None, 'after_apply': None,
+               'apply_wait': False}
     account = None
+    # Every normal way out of the workbench checks restore_window.block_shutdown first: while
+    # a restore (safety backup, replacement or rollback verification) runs, NetCommand stays
+    # open and the worker is left alone. There is deliberately no force-quit.
+    # Then gui.apply_guard (phase 5.1.3, H1): while an SSH setup is being applied through the
+    # console, the close or sign-out is postponed. The run is asked to stop after its current
+    # step (an exchange is never cut off); its worker closes the console port and ends its
+    # protection; wait_for_apply (Tk's after(), never blocking) then carries out the request.
+
+    def apply_blocks(then, verb):
+        """True while an SSH Apply runs: `then` (the close or sign-out) is carried out once
+        it has stopped. The latest request wins."""
+        if not apply_guard.block_shutdown(root, verb):
+            return False
+        outcome['after_apply'] = then
+        if not outcome['apply_wait']:
+            outcome['apply_wait'] = True
+            root.after(APPLY_POLL_MS, wait_for_apply)
+        return True
+
+    def wait_for_apply():
+        if outcome['done']:
+            return
+        if apply_guard.active():
+            root.after(APPLY_POLL_MS, wait_for_apply)
+            return
+        outcome['apply_wait'] = False
+        then, outcome['after_apply'] = outcome['after_apply'], None
+        if then is not None:
+            then()                               # checks every guard again
     if session is not None:
         from gui.session_watch import ENDED_MESSAGES, SessionWatcher, SignedInContext
 
@@ -137,13 +171,48 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
             root.destroy()
 
         def sign_out():
+            if restore_window.block_shutdown(root) or apply_blocks(sign_out, 'sign out'):
+                return
             end_server_session(client, session)
             finish(SIGNED_OUT)
 
         def session_ended(reason):
-            finish(SIGNED_OUT, ENDED_MESSAGES.get(reason, ENDED_MESSAGES['ended']))
+            message = ENDED_MESSAGES.get(reason, ENDED_MESSAGES['ended'])
+            if outcome['done'] or outcome['deferred']:
+                return
+            if restore_window.restore_activity():
+                # The session is over (its token is already cleared), but a restore is
+                # running: hide the workbench, let the restore finish and show its result,
+                # and sign out once its window is closed.
+                apply_guard.request_shutdown()       # an SSH Apply stops after its step too
+                outcome['deferred'] = message
+                root.withdraw()
+                messagebox.showwarning('Signed out after the restore', (
+                    f'{message}\n\nA restore is still running. NetCommand stays open until '
+                    f'it has finished and its result can be verified. The workbench is hidden; '
+                    f'NetCommand signs out when you close the Restore window.'), parent=root)
+                wait_for_restore()
+                return
+            if apply_guard.active():
+                # an SSH setup is being applied: let its current step finish, then sign out
+                outcome['deferred'] = message
+                ports = apply_guard.request_shutdown()
+                messagebox.showwarning('Signed out after the current SSH step', (
+                    f'{message}\n\n' + apply_guard.shutdown_message(ports, 'sign out')),
+                    parent=root)
+                wait_for_restore()
+                return
+            finish(SIGNED_OUT, message)
+
+        def wait_for_restore():
+            if restore_window.restore_activity() or apply_guard.active():
+                root.after(500, wait_for_restore)
+                return
+            finish(SIGNED_OUT)
 
         def close_window():
+            if restore_window.block_shutdown(root) or apply_blocks(close_window, 'close'):
+                return
             end_server_session(client, session)
             finish(CLOSED)
 
@@ -153,6 +222,14 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
     if session is not None:
         refs['session_watcher'] = SessionWatcher(root, client, session, session_ended)
         root.protocol('WM_DELETE_WINDOW', close_window)
+    else:                                                # demo / sample mode: no session
+
+        def close_demo():
+            if restore_window.block_shutdown(root) or apply_blocks(close_demo, 'close'):
+                return
+            root.destroy()
+        root.protocol('WM_DELETE_WINDOW', close_demo)
+    refs['close_window'] = root.protocol('WM_DELETE_WINDOW')     # (tests: the X button)
     if not demo:                                         # sample mode never encrypts anything
         import security
         problem = security.check_key()
@@ -170,6 +247,7 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
                              on_error=refs['db_status'].post)
         root.bind('<Destroy>', lambda e: stop.set() if e.widget is root else None, add='+')
     root.mainloop()
+    restore_window.workbench_closed()
     return outcome['value']
 
 

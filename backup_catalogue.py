@@ -293,6 +293,9 @@ class Match:
     hardware_match: bool = False
     identity_recorded: bool = False
     requires_legacy_confirmation: bool = True
+    # A pending restore candidate: the recorded IP differs and the serial and platform it
+    # records can only be compared with the device live (restore preflight). Never a match.
+    live_identity_required: bool = False
 
     @property
     def summary(self):
@@ -300,6 +303,8 @@ class Match:
             return self.block_reason
         if self.hardware_match:
             return 'Serial match'
+        if self.live_identity_required:
+            return 'Candidate: live identity check required (IP differs)'
         if not self.identity_recorded:
             return 'Identity not recorded'
         return 'Hardware identity not confirmed'
@@ -376,6 +381,16 @@ def match(header, device):
                           'recorded): a restore needs the legacy-backup confirmation')
     if m.hardware_match and not m.blocked:
         m.requires_legacy_confirmation = False
+    elif ip_differs and not m.blocked and _known(serial) and _known(platform) and \
+            not _known(dev_serial):
+        # Pending restore candidate (the device was readdressed): the backup records a
+        # serial AND a platform, which only the restore preflight can compare with the
+        # live device. It is never a match here; the preflight blocks unless both match.
+        m.live_identity_required = True
+        m.requires_legacy_confirmation = False       # the live check replaces it
+        m.warnings.append('Pending restore candidate: the IP address differs, so the restore '
+                          'preflight must read the device\'s serial number and platform and '
+                          'find both equal to the backup before anything else happens')
     elif ip_differs:
         # Approved rule: without a serial match, the IP address must match.
         block('The IP address differs and the hardware identity cannot be confirmed by '
@@ -403,6 +418,7 @@ class Selection:
     requires_legacy_confirmation: bool
     warnings: tuple
     selected_utc: str
+    live_identity_required: bool = False      # a pending candidate (see Match)
 
 
 def select(entry, verification, device, can_select):
@@ -423,4 +439,5 @@ def select(entry, verification, device, can_select):
     return Selection(entry.path, entry.file_sha256, h['key_id'], h['plaintext_sha256'],
                      h['created_utc'], device.device_id, device.ip, device.hostname or '',
                      m.hardware_match, m.requires_legacy_confirmation, tuple(m.warnings),
-                     datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+                     datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                     m.live_identity_required)

@@ -49,7 +49,10 @@ Besides these, the console session itself (phase 1) sends `terminal width 511` a
 `terminal length 0`, which are session display settings and not configuration. With
 `elevate=True`, detection first sends `enable` (with the session's enable password) when
 the prompt ends in `>`. Privileged EXEC is not a configuration change. The default is
-`elevate=False`: detection runs at whatever level the session already has.
+`elevate=False`: detection runs at whatever level the session already has. A session
+opened with `enable_without_password=True` (phase 5.1.2, B1: a factory device with no
+enable password) sends a bare `enable` and accepts the `#` prompt; if the device asks for
+a password, it is never answered: the port is closed and detection reports it.
 
 Values that could not be read stay `None` (or `unknown`). Nothing is guessed. Lines that
 could contain a password or secret (the `username` and `line vty` output) are masked

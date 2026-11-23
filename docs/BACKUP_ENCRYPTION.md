@@ -247,7 +247,7 @@ can reach "Serial match" yet (a live read-only identity check belongs to the res
 |---|---|
 | Serial | both known and equal: "Serial match"; both known and different: **Identity mismatch, selection blocked**; otherwise unknown (never a match) |
 | Platform | both known and equal: "Platform match"; both known and different: **Platform mismatch, blocked** (same vendor is not enough) |
-| IP address | different: a visible warning; **without a serial match, a different IP blocks selection** (the approved legacy rule) |
+| IP address | different: a visible warning; **without a serial match, a different IP blocks selection** (the approved legacy rule), except for a **pending restore candidate** (below) |
 | Hostname | different: a warning; a hostname never proves the hardware |
 | No identity fields | "Identity not recorded": never a hardware match |
 
@@ -259,6 +259,249 @@ its authenticated header) with no blocking mismatch, and only for the Configure 
 A backup whose hardware identity is not confirmed by serial can be selected for inspection
 but is marked as needing the separate **legacy-backup confirmation** (matching IP and the
 typed device name) in the future restore workflow; it is never called restore-ready.
+
+**Pending restore candidates (changed IP).** A device that was readdressed keeps its
+serial number, but the device records do not store one, so the catalogue cannot confirm
+the hardware. A verified backup whose recorded IP differs from the device's can still be
+selected when its authenticated header records **both a real serial number and a real
+platform** and nothing known about the device contradicts them. It is shown as
+"Candidate: live identity check required (IP differs)" and "PENDING RESTORE CANDIDATE, NOT
+a verified match", never as a match or restore-ready (`Selection.live_identity_required`).
+Selecting it contacts no device and writes nothing. Backups without a serial or platform
+(including all backups made before identity was recorded) keep the old rule: a different
+IP blocks selection. Serial and platform mismatches block exactly as before.
+
+## Restore preflight (Phase 4E)
+
+`restore_preflight.py`, tested by `tests/test_restore_preflight.py` (Mock Lab only). There
+is still **no restore**: no transfer, no `configure replace`, no rollback timer, no save, no
+window. The preflight has two stages, and the user decides between them.
+
+**Stage 1 - `run_checks(selection, creds)`, read-only.**
+
+1. *The selected backup again, offline:* the file still exists, is not a link, has the
+   SHA-256 recorded at selection (so its authenticated header, including the identity, is
+   unchanged); AES-GCM tag, key id, decrypted SHA-256 and size; Apply's configuration
+   check; key id, configuration SHA-256 and creation time equal to the selection. The
+   decrypted configuration stays in memory; only facts derived from it are kept.
+   A selection made for another device address is refused before connecting.
+2. *SSH:* one session through Apply's connection code (strict algorithms). SSH protocol 2
+   is confirmed from the transport (a device that also accepts SSH-1, banner `SSH-1.99`,
+   is a warning); `show privilege` must report level 15.
+3. *Live identity:* `show version`, `show inventory` (when the device knows it) and the
+   running configuration. **Serial rules:** every `Processor board ID` and every
+   **chassis** serial of `show inventory` is read (module serials are ignored); two
+   different values in either source, a disagreement between them, an unreadable value or
+   no value at all **blocks**. A chassis is an inventory entry whose name or description
+   says "chassis", or a bare stack number ("1", "2"). The platform from `show version` is
+   cross-checked with the chassis PID.
+4. *Matching:* the Phase 4B rules (`backup_catalogue.match`) with the live serial and
+   platform: serial or platform mismatch blocks; hostname difference warns; a different IP
+   warns with a serial match and blocks without one; a backup without identity is never a
+   hardware match and needs the legacy confirmation. **A backup recorded for another IP
+   (including every pending candidate) is blocked unless the live serial AND the live
+   platform both match it**; `create_safety_backup` checks this again before connecting.
+5. *Capabilities (nothing is configured):* no timed rollback already pending
+   (`show archive config rollback timer`); an archive path configured (`show archive`,
+   running configuration); `configure replace` supported (probe: the incomplete command
+   `configure replace`, which IOS answers with `% Incomplete command.` and cannot execute);
+   Tcl (enter `tclsh` and `tclquit` at once, writing nothing) or SCP **already** enabled
+   (`ip scp server enable` in the configuration; never enabled by NetCommand); free space
+   on `flash:` for the file, an archive copy and 64 KiB; a free temporary name
+   `flash:nc-restore-<16 hex>.cfg` (`dir`). No safe transfer or rollback method blocks.
+6. *Management access in the backup:* the management address (the address NetCommand uses,
+   or `management_ip` for NAT/lab setups) on an interface that is not shut down (removed
+   or shut while the device has it now blocks; not on the device at all warns); SSH allowed
+   on a VTY line (none blocks; no `transport input` line warns); `login local` without any
+   local user blocks; the session's account missing, not privilege 15 without an enable
+   secret, AAA, `access-class` or a mixed login method warn.
+
+The session is closed before the result is returned. The result has a status per check
+and overall - **PASS**, **WARNING**, **BLOCKED** (a safety rule forbids the restore) or
+**FAILED** (something could not be done or checked) - the live identity, the backup's
+details (never its content), the capabilities, the chosen transfer method and temporary
+name, and the phrase the user must type: `RESTORE <ip>`, or `RESTORE LEGACY <ip>` when
+the hardware identity is not confirmed by serial.
+
+**Stage 2 - `create_safety_backup(result, typed, creds)`**, only for a PASS/WARNING result
+less than 10 minutes old, for the same device address, with the phrase typed exactly.
+Otherwise `ConfirmationRefused` is raised and nothing is done (no connection, no file).
+It re-verifies the selected backup, reconnects, re-checks privilege 15 and that the same
+chassis (serial and platform) answers, then writes an **encrypted** backup of the current
+running configuration with Apply's backup code, labelled `purpose: "pre-restore"` in the
+authenticated header and named `<ip>_pre-restore_<YYYYMMDD_HHMMSS>.ncbak`. The file is
+read back and decrypted in memory and must equal the configuration the device sent; any
+failure stops the workflow. **`cancel(result)`** ends it instead. The device is never
+changed by either stage.
+
+## Restore engine (Phase 4F)
+
+`restore_engine.restore(preflight_result, creds, timer_minutes=5)`, tested by
+`tests/test_restore_engine.py` against the Mock Lab only. No window, no save to the startup
+configuration, nothing enables SCP or configures the archive.
+
+**Before anything is sent** the preflight result must be the one stage 2 sealed (an HMAC
+with a key that exists only in the running program; any change, a cancel or a second use
+breaks it), for this device, at most 10 minutes after its safety backup, confirmed with the
+exact phrase; the timer must be 3-10 minutes (default 5). The selected backup is verified
+again (file SHA-256, AES-GCM, key id, plaintext SHA-256 and size, configuration check) and
+the safety backup is decrypted and checked (label, address, serial, platform, SHA-256).
+Both stay in memory.
+
+**Session A** (strict SSH, protocol 2, privilege 15, the preflight's serial and platform):
+no pending rollback, an archive path, the running configuration still equal to the safety
+backup, the temporary file absent, enough flash. Then the transfer from memory: Tcl through
+Netmiko's `InLineTransfer(source_config=...)` or, when `ip scp server enable` is already
+configured, `scp putfo` of an in-memory stream (also used when the text cannot go through
+Tcl: curly braces, a trailing backslash or non-ASCII). `verify /md5` must give the MD5 of
+exactly the bytes sent; otherwise the file is deleted and nothing is replaced.
+
+**`configure replace flash:<file> list force time <minutes>`**. A question (even with
+`force`) is never answered: the session is closed. Rejected lines, "Rollback aborted", an
+error line or no "Rollback Done" count as a failed (possibly partial) replacement.
+
+**Session B**, a new connection to the same address (same checks as A): the timer must be
+pending and the running configuration must equal the backup. Only then `configure
+confirm`; the timer must then read "No Rollback Confirmed Change pending" and the running
+configuration is compared once more.
+
+**Comparison rules (the approved Phase 4C design).** Both texts must end with a top-level
+`end` line (only blank lines may follow it). Then:
+
+* CRLF and CR line ends become LF; trailing whitespace is removed from every line;
+* the header block before the first configuration line is skipped: its blank lines and
+  `Building configuration...`, `Current configuration : N bytes`, `Using N out of M bytes`
+  (IOS prints a blank line between the first two);
+* the recognised timestamp lines are skipped: `! Last configuration change at ...`,
+  `! NVRAM config last updated at ...`, `! No configuration change since last restart`;
+* generated top-level `ntp clock-period <number>` lines are skipped;
+* standalone `!` separator lines (only `!`, at any indentation) are skipped.
+
+Every other line is compared exactly and in order: other comment lines, blank lines after
+the header (for example inside a banner), indentation and everything up to the final `end`.
+Blank lines are skipped only in the header block because IOS's own header contains one;
+inside the configuration they can be meaningful (banners), so they count. Reports give only
+the number of differing lines and the first line number, never configuration text.
+
+**Rollback.** On any failure after the replacement: `configure revert now` on a session to
+the verified device, then a new session must show the safety backup's configuration and no
+pending timer. If that cannot be verified while the timer may still run, the engine waits
+for the timer (plus 30 s) and checks again. It is never reported as rolled back without that
+check. A device that answers with another serial is never sent anything.
+
+**Cleanup.** Only `flash:<temporary file>` is deleted (`delete /force`), then `dir` must not
+find it. Archive copies and other files are never touched.
+
+**Results:** SUCCESS (restored, both comparisons equal, confirmed, timer cancelled, file
+removed), PARTIAL (all of that but the file could not be removed), FAILED (the device is
+verified to be in its original configuration, or nothing was sent), UNKNOWN (anything else;
+`manual_actions` says what to do). The result lists the device, backup and safety backup
+files, transfer method, comparison, timer state, rollback attempt and verification, and
+the cleanup.
+
+**Sessions are always closed by closing the SSH transport.** Netmiko's `disconnect()` sends
+a newline, which answers an IOS `[confirm]` question with yes. While a Netmiko call runs, a
+watchdog detaches the channel as soon as the transport dies (Netmiko would otherwise wait
+its whole read timeout on a closed channel).
+
+## Restore window (Phase 4G)
+
+**Devices page -> Backups... -> select a backup -> Select for restore -> Restore...**
+(Configure permission only; viewers cannot open the catalogue, and the window itself refuses
+every action without the permission). `gui/restore_window.py` only calls the Phase 4E and
+4F functions; every check, the typed confirmation, the seal, the single use and the
+rollback stay in `restore_preflight.py` and `restore_engine.py`. The window sends nothing
+to a device itself.
+
+1. **Opening** the window connects to nothing and writes nothing. It shows the target
+   device and the selected backup (file, folder, creation time, key id, configuration
+   SHA-256, verification status) and, for a changed-IP candidate or a legacy backup, what
+   that means.
+2. **Run Checks** reads (or asks for) the SSH login and runs the read-only preflight on a
+   worker thread. Every check is listed with PASS / WARNING / BLOCKED / FAILED and its
+   explanation, plus the live identity, the transfer method and, if the restore may go on,
+   the exact phrase to type (`RESTORE <ip>`, or `RESTORE LEGACY <ip>`).
+3. **Create safety backup and restore** is enabled only for a passing preflight and the
+   exact phrase; a final question repeats the device, serial, platform and backup. The
+   rollback timer is 3-10 minutes (default 5). Then, on worker threads: the encrypted
+   safety backup, and only if it was made and verified, the restore engine.
+4. **Progress**: the current stage, the safety-backup path, the rollback timer and the
+   engine's log (commands only, never configuration text). **Result**: SUCCESS / FAILED /
+   PARTIAL / UNKNOWN with an explanation, both backup paths, the timer state and every
+   required manual action (a warning box for anything but SUCCESS).
+
+**Cancelling and closing.** Before the engine starts, Cancel or closing the window ends the
+workflow: a running check finishes in the background and changes nothing; a safety backup
+being made is completed and the preflight is then cancelled, so no restore can start (the
+encrypted safety backup is kept). **Once the engine runs, the window cannot be closed or
+cancelled** and nothing is interrupted: the engine always finishes its confirmation or
+rollback and the result is shown. Worker results are collected from the application's main
+window, so they are handled (and the device released) even after the Restore window was
+closed; the Restore window is not a child of the catalogue, so closing the catalogue never
+closes it. **Only one check or restore runs per device at a time.** The startup
+configuration is never saved.
+
+**NetCommand cannot be closed while a restore runs.** From the moment the safety backup
+starts until the restore engine has returned its result, every normal way out of the
+workbench is refused with an explanation: the title-bar X (signed in and in sample/demo
+mode) and **Sign out**. There is no force-quit. If the **session ends** meanwhile (idle
+time-out, time limit, signed out elsewhere, account disabled, role changed), the workbench
+is hidden at once, the restore goes on, its result is shown, and NetCommand signs out when
+the Restore window is closed. Read-only checks do not hold NetCommand open (ending them
+changes nothing). The protection is held until the result has been handled on the window's
+thread (recorded in the Restore window, the device released, and any result or recovery
+message box dismissed), and released then whatever the outcome (SUCCESS, FAILED, PARTIAL,
+UNKNOWN, or an unexpected error, including one in the result handling itself). Ending the process from outside (Task Manager,
+Ctrl+C in the console, a Windows shutdown) cannot be prevented; the device's rollback timer
+then returns it to its previous configuration, but NetCommand cannot verify or report it.
+
+## Save to Startup (Phase 4H)
+
+A restore never saves. **Save to Startup...** in the Restore window (Configure permission)
+is enabled only for a verified **SUCCESS** of that window's own restore: the result sealed
+by the engine in this NetCommand session, the configuration verified and confirmed, the
+rollback timer verified cancelled, for this device, not saved before. The logic is in
+`startup_save.py` (it reuses the restore engine's verified-session, prompt and close
+helpers); the window only runs it on worker threads.
+
+**Checks (read-only).** A verified session (SSH 2, privilege 15, the restore's serial and
+platform); no pending rollback timer; the running configuration valid and still exactly
+the restored one (the engine records a digest of the compared lines when it verifies the
+restore; the approved comparison rules decide); the startup configuration valid; the
+keyring usable. Then the user types **`SAVE STARTUP <ip>`** (not the restore phrase) and
+answers a final question naming the device, serial, platform, restored backup, the
+encrypted backup to be made, and that the startup configuration is overwritten and used
+after a reload.
+
+**Save (one protected worker).** A new verified session repeats the checks and requires
+the startup configuration seen by the checks; the current startup configuration
+(`show startup-config`) is saved **encrypted** as `<ip>_pre-save-startup_<time>.ncbak`
+(`purpose: pre-save-startup`, `source: show startup-config`, the device identity), read
+back, decrypted in memory and compared byte for byte; any failure saves nothing. Then
+**`write memory`**. (`copy running-config startup-config` is not used: IOS always asks for
+the destination file name, which would need an answer.) A question from `write memory` is
+never answered (the session is closed; Netmiko's disconnect is never used). Its text is
+never trusted: a NEW verified session reads both configurations again.
+
+**Results.** SUCCESS: the command completed and the startup configuration now equals the
+running configuration, which is still the restored one. FAILED: nothing was sent, or the
+startup configuration is verified unchanged. UNKNOWN: anything else, including a save that
+was interrupted (connection lost, unanswered question) even if the startup configuration
+then looks right, a mismatch after the save, or a device that cannot be verified; the
+actions name the pre-save-startup backup and say not to reload until resolved. The backup
+is kept in every case. Nothing else is changed and the device is never reloaded. While the
+save runs NetCommand cannot be closed (the restore workflow's protection and device claim),
+and an ended session waits for it and its result.
+
+**Not yet established on real hardware:** the wording of `configure replace` with no file,
+of `show archive config rollback timer` and of `show inventory` on the lab's Cisco 1900
+router; and for the restore engine the output of `configure replace ... list force time N`
+("Rollback Done", rejected-command wording), `verify /md5`, `configure confirm`, whether a
+Cisco 1900 generates other lines besides `ntp clock-period` that would make the strict
+comparison fail, and the Tcl transfer speed and size limits. For Save to Startup: the exact `write memory`
+output ("[OK]"), whether the Cisco 1900 asks the NVRAM-overwrite question (after an IOS
+image change) or any other question, and the `show startup-config` header lines. These must
+be checked there before NetCommand restores or saves on a real device.
 
 ## Limitations of memory protection
 

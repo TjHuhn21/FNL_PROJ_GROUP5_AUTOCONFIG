@@ -5,8 +5,8 @@
     plan = build_plan(result, request)       # a ConfigPlan; nothing is sent anywhere
     plan.lines()                             # the proposed commands, in order
 
-This module only PLANS. It sends nothing to a device, has no access to a console
-session, and there is no "apply" here.
+This module only PLANS. It sends nothing to a device and has no access to a console
+session. Applying an approved plan is console.apply (phase 5.1.2).
 
 Passwords: validate_request() checks the password and then drops it. The SetupRequest
 and the ConfigPlan only know WHETHER a password was given; every proposed command shows
@@ -60,6 +60,8 @@ _USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9._-]{0,31}$')
 _DOMAIN = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
                      r'(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$')
 PASSWORD_MIN, PASSWORD_MAX = 8, 64
+# an IOS-style stored hash: $1$ (MD5, type 5), $8$ (PBKDF2), $9$ (scrypt), $14$ ...
+HASH_LIKE = re.compile(r'^\$\d+\$')
 
 
 # ---------------------------------------------------------------- input
@@ -79,19 +81,29 @@ def key_sizes(result):
 
 
 def check_password(password, confirm):
-    """None, or a message (never containing the password)."""
+    """None, or a message (never containing the password).
+
+    Phase 5.1.3 (M2): no whitespace at all. In `username X secret <password>` IOS reads a
+    leading "0 ", "5 ", "7 ", "8 " or "9 " as the secret's TYPE, so a password such as
+    "5 $1$..." or "7 0822..." would be stored as an existing hash (an unknown password),
+    and a space could also cut the password short. Without whitespace that cannot happen.
+    Values that look like an IOS hash ("$1$...", "$8$...", "$9$...") are refused as well."""
     if not password:
         return 'Enter a password for the new SSH account.'
     if password != confirm:
         return 'The two passwords do not match.'
     if not PASSWORD_MIN <= len(password) <= PASSWORD_MAX:
         return f'The password must be {PASSWORD_MIN} to {PASSWORD_MAX} characters long.'
-    if any(not (32 <= ord(c) <= 126) for c in password):
-        return 'Use only letters, numbers, spaces and common symbols (no accents or tabs).'
-    if password != password.strip():
-        return 'The password must not start or end with a space.'
+    if any(c.isspace() for c in password):
+        return ('The password must not contain spaces, tabs or line breaks (Cisco IOS could '
+                'read part of it as a hash type, or cut it short).')
+    if any(not (33 <= ord(c) <= 126) for c in password):
+        return 'Use only letters, numbers and common symbols (no accents).'
     if '?' in password:
         return 'The password must not contain "?" (Cisco IOS treats it as a help request).'
+    if HASH_LIKE.match(password):
+        return ('The password must not look like a stored Cisco hash (such as "$1$..." or '
+                '"$9$..."); choose another one.')
     return None
 
 
@@ -167,6 +179,7 @@ class ConfigPlan:
     ssh_status: SshCapability = SshCapability.UNKNOWN
     simulated: bool = False
     detected_at: object = None
+    detection_id: str = None       # the detection this plan was made from (unique)
     created_at: object = None
     items: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
@@ -174,7 +187,7 @@ class ConfigPlan:
     notice: str = PREVIEW_NOTICE
     # console.steps: one PlanStep per command (plus read-only check steps), in order, with
     # dependencies and verification definitions; invariants = settings that must not change.
-    # Definitions only: nothing in this version runs them.
+    # console.apply runs them (phase 5.1.2); this module never does.
     steps: list = field(default_factory=list)
     invariants: list = field(default_factory=list)
 
@@ -265,6 +278,7 @@ def build_plan(result, request=None):
     plan = ConfigPlan(available=True, reason='', hostname=result.device.hostname,
                       software=result.device.software, ssh_status=result.ssh.status,
                       simulated=result.simulated, detected_at=result.detected_at,
+                      detection_id=getattr(result, 'detection_id', None),
                       created_at=datetime.now())
     ctx = _Context(result, request)
     plan.items = [ctx.hostname(), ctx.domain(), ctx.user(), ctx.rsa(), ctx.ssh_version(),
@@ -282,7 +296,7 @@ def build_plan(result, request=None):
                 item.explanation = 'Not available: the software appears not to support SSH.'
     else:
         plan.reason = ('Commands are proposed only for what is missing. Review every line; '
-                       'nothing is sent in this version.')
+                       'nothing is sent unless you apply it (section 5), step by step.')
     if plan.simulated:
         plan.warnings.append('SIMULATED device: this plan was made for the NetCommand mock '
                              'lab, not for physical hardware.')
@@ -843,7 +857,9 @@ def plan_is_stale(plan, result, live):
     """Why a plan can no longer be trusted, or None."""
     if plan is None:
         return None
-    if result is None or plan.detected_at != result.detected_at:
+    # the unique detection id decides; the timestamp must ALSO match (never weaker than before)
+    if (result is None or plan.detected_at != result.detected_at
+            or plan.detection_id != getattr(result, 'detection_id', None)):
         return 'The device was detected again after this preview was made.'
     if not live:
         return 'The console session that this preview is based on has ended.'

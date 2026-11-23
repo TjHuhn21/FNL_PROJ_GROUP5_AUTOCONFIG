@@ -217,6 +217,8 @@ _HOSTNAME_LINE = re.compile(r'^hostname[ \t]+\S', re.MULTILINE)
 # An IPv4 address or host name: no path separators, and no ':' (on Windows it would open
 # an alternate data stream instead of a normal file).
 _SAFE_HOST = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}')
+# A backup purpose label (e.g. "pre-restore"): also part of the file name.
+_PURPOSE = re.compile(r'[a-z][a-z0-9-]{0,31}')
 MAX_SAME_SECOND_BACKUPS = 1000
 
 
@@ -315,8 +317,13 @@ def _place(temp, final):
         os.unlink(temp)
 
 
-def _save_backup(host, text, backup_dir=None, backup_key=None, identity=None):
-    """Encrypt the configuration and write it as <host>_<YYYYMMDD_HHMMSS>[_N].ncbak.
+SOURCES = ('show running-config', 'show startup-config')
+
+
+def _save_backup(host, text, backup_dir=None, backup_key=None, identity=None, purpose=None,
+                 source='show running-config'):
+    """Encrypt the configuration and write it as <host>_<YYYYMMDD_HHMMSS>[_N].ncbak
+    (<host>_<purpose>_<YYYYMMDD_HHMMSS>[_N].ncbak when a purpose is given).
     Returns (path, SHA-256 of the configuration, key id).
 
     The configuration is encrypted IN MEMORY (backup_crypto, AES-256-GCM, the active
@@ -328,10 +335,20 @@ def _save_backup(host, text, backup_dir=None, backup_key=None, identity=None):
 
     identity: {'serial', 'platform', 'hostname', 'ios_version'} (parse_identity), stored in
     the authenticated header; a value that is not a plain token is stored as unavailable
-    (None). Without it (None), no identity fields are recorded."""
+    (None). Without it (None), no identity fields are recorded.
+
+    purpose: an optional label stored in the authenticated header and the file name (the
+    restore preflight uses "pre-restore"). Apply does not pass one.
+
+    source: the command the text came from (one of SOURCES; the startup save of Phase 4H
+    backs up "show startup-config"). Recorded in the authenticated header."""
     import backup_crypto
     if not _SAFE_HOST.fullmatch(str(host or '')):     # it becomes part of a file name
         raise BackupError('Backup refused: the device address cannot be used in a file name')
+    if purpose is not None and not _PURPOSE.fullmatch(str(purpose)):
+        raise BackupError('Backup refused: the backup purpose label is not valid')
+    if source not in SOURCES:
+        raise BackupError('Backup refused: the backup source is not valid')
     problem = check_backup(text)
     if problem:
         raise BackupError(f'Backup of {host} refused: {problem}')
@@ -341,7 +358,9 @@ def _save_backup(host, text, backup_dir=None, backup_key=None, identity=None):
         raise BackupError(f'Backup of {host} refused: the configuration contains characters '
                           f'that cannot be stored') from None
     backup_key = backup_key or load_backup_key()        # BackupKeyUnavailable
-    metadata = {'host': host, 'source': 'show running-config', 'privilege': REQUIRED_PRIVILEGE}
+    metadata = {'host': host, 'source': source, 'privilege': REQUIRED_PRIVILEGE}
+    if purpose is not None:
+        metadata['purpose'] = purpose
     if identity is not None:
         for name in backup_crypto.IDENTITY_FIELDS:
             value = identity.get(name)
@@ -378,9 +397,9 @@ def _save_backup(host, text, backup_dir=None, backup_key=None, identity=None):
                               f'the configuration the device sent')
         sha = header['plaintext_sha256']
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base = f'{host}_{purpose}_{stamp}' if purpose else f'{host}_{stamp}'
         for n in range(1, MAX_SAME_SECOND_BACKUPS + 1):
-            path = os.path.join(folder, f'{host}_{stamp}' + (f'_{n}' if n > 1 else '') +
-                                BACKUP_SUFFIX)
+            path = os.path.join(folder, base + (f'_{n}' if n > 1 else '') + BACKUP_SUFFIX)
             try:
                 _place(temp, path)
             except FileExistsError:

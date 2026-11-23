@@ -16,10 +16,10 @@ This module is a model only. It describes, for every command console.plan propos
 
 plus `invariants`: settings that must stay exactly as detected (AAA).
 
-The evaluators below are PURE functions over text they are given: they classify output
-that a future phase might obtain. Nothing here opens a session, sends a command, or
-answers a prompt; there is no runner. A step is never VERIFIED because its command was
-accepted: only its verification output can make it VERIFIED.
+The evaluators below are PURE functions over text they are given. Nothing here opens a
+session, sends a command, or answers a prompt: the runner is console.apply (phase
+5.1.2), which uses these definitions as they are. A step is never VERIFIED because its
+command was accepted: only its verification output can make it VERIFIED.
 
     VERIFIED   the read-only checks show the intended state
     FAILED     the checks show a different state (or the reply was a known failure)
@@ -39,7 +39,7 @@ NOT_RUN = 'not verified yet'
 # usual "% Invalid input" family). Collected from IOS messages; to be confirmed on hardware.
 COMMON_FAILURE_REPLIES = ('% Invalid', '% Incomplete', '% Ambiguous', '% Unknown command',
                           '% Unrecognized', '% Bad ', '% Error', '%Error', '% Cannot',
-                          'Command rejected', '% Please define')
+                          'Command rejected', '% Please define', '% Please create')
 GENERAL_UNCERTAIN = (
     'the reply to the command could not be read completely (timeout)',
     'the console session ended or was cancelled before the checks ran',
