@@ -22,6 +22,7 @@ from datetime import datetime
 from tkinter import ttk
 
 from gui import theme
+from gui.timefmt import format_time
 
 BG = theme.TERMINAL_BG          # dark green-black terminal background
 COLORS = dict(theme.TERMINAL_COLORS)   # all at least 7:1 against BG (see gui/theme.py)
@@ -72,13 +73,13 @@ class SshConsole(tk.Frame):
 
     def start_run(self, device, ip, count):
         """A heading that separates one Apply from the next."""
-        stamp = datetime.now().strftime('%H:%M:%S')
+        stamp = format_time(datetime.now(), seconds=True)
         self.post('start', f'===== {stamp}  {device} ({ip})  {count} command'
                            f'{"" if count == 1 else "s"} =====', device)
 
     def start_batch(self, names):
         """A heading for one Apply that configures several devices."""
-        stamp = datetime.now().strftime('%H:%M:%S')
+        stamp = format_time(datetime.now(), seconds=True)
         self.post('start', f'===== {stamp}  {len(names)} devices, one after the other: '
                            f'{", ".join(names)} =====')
 

@@ -4,14 +4,17 @@ from tkinter import ttk, messagebox
 import device_types
 import validation
 from gui import theme
+from gui.components.dialogs import place_window
+from gui.components.tables import setup_table
+from gui.components.wrap_frame import WrapFrame
 from gui.db_status import database_ready, report_error
 from gui.event_log import log_event
 from store_errors import DATABASE_ERRORS, DeletedDeviceExists, DuplicateDeviceName, outcome_text
 
 PER_PAGE = 15
-# widths for the larger table text (theme.TABLE_SIZE)
-COLUMNS = [('name', 'Name', 180), ('ip', 'IP', 150), ('type', 'Type', 210),
-           ('status', 'Status', 85), ('managed', 'Managed', 100)]
+# (key, title, relative width): gui/components/tables.setup_table aligns and fits them
+COLUMNS = [('name', 'Name', 230), ('ip', 'IP', 140), ('type', 'Type', 190),
+           ('status', 'Status', 80), ('managed', 'Managed', 85)]
 SORTABLE = {'name', 'ip', 'type', 'status'}
 TYPE_COLUMN = '#3'                    # the Type column, as Treeview.identify_column names it
 MANUAL_MARK = '⚠'                     # before a type that differs from the scan's detection
@@ -23,34 +26,34 @@ class DevicesTab(ttk.Frame):
         self.store, self.on_change = store, on_change
         self.page, self.sort_by = 1, 'name'
 
-        top = ttk.Frame(self); top.pack(fill='x')
-        ttk.Label(top, text='Search:').pack(side='left')
+        # the search on the left, the buttons on the right; on a narrow window the buttons
+        # wrap onto a second row instead of being cut off
+        top = WrapFrame(self, background=theme.BG); top.pack(fill='x')
+        top.add(ttk.Label(top, text='Search:'), padx=(0, 0))
         self.search = tk.StringVar()
         entry = ttk.Entry(top, textvariable=self.search, width=30)
-        entry.pack(side='left', padx=theme.PAD)
+        top.add(entry, padx=theme.PAD)
         entry.bind('<KeyRelease>', lambda e: self.go_first())
         self.read_only = False
         self.add_btn = ttk.Button(top, text='Add', command=self.add)
-        self.add_btn.pack(side='right')
         self.delete_btn = ttk.Button(top, text='Delete', command=self.delete)
-        self.delete_btn.pack(side='right', padx=4)
         self.edit_btn = ttk.Button(top, text='Edit', command=self.edit)
-        self.edit_btn.pack(side='right')
         # Backup & Restore catalogue (Phase 4B). Only for roles with the Configure
         # permission (set_backups_allowed); disabled until the main window allows it.
         self.backups_allowed, self.on_backup_selected = False, None
         self.on_restore_finished = None                     # Restore window results (4G)
         self.on_save_finished = None                        # Save to Startup results (4H)
         self.backups_btn = ttk.Button(top, text='Backups...', command=self.open_backups)
-        self.backups_btn.pack(side='right', padx=(0, 12))
         self.backups_btn.state(['disabled'])
+        top.add(self.backups_btn, padx=(0, 12), push_right=True)
+        top.add(self.edit_btn, padx=(0, 0))
+        top.add(self.delete_btn, padx=4)
+        top.add(self.add_btn, padx=(0, 0))
 
         self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS],
                                  show='headings', selectmode='browse', style='Data.Treeview')
-        for key, title, width in COLUMNS:
-            cmd = (lambda k=key: self.sort(k)) if key in SORTABLE else ''
-            self.tree.heading(key, text=title, command=cmd)
-            self.tree.column(key, width=width, anchor='w')
+        setup_table(self.tree, COLUMNS, no_tooltip=('type',),      # Type has its own tooltip
+                    commands={k: (lambda k=k: self.sort(k)) for k in SORTABLE})
         for status, color in theme.STATUS_COLORS.items():
             self.tree.tag_configure(status, background=color)
         self.tree.pack(fill='both', expand=True, pady=theme.PAD)
@@ -332,6 +335,7 @@ class DeviceDialog(tk.Toplevel):
         ttk.Button(btns, text='Cancel', command=self.destroy).pack(side='right')
         ttk.Button(btns, text='Save', style='Accent.TButton',
                    command=self.save).pack(side='right', padx=4)
+        place_window(self, parent)                  # sized for its content, centered
         self.transient(parent.winfo_toplevel())
         self.grab_set()
 
@@ -471,6 +475,7 @@ def ask_type_change(parent, title, text):
                command=lambda: choose(True)).pack(side='right', padx=4)
     win.protocol('WM_DELETE_WINDOW', lambda: choose(False))
     win.bind('<Escape>', lambda e: choose(False))
+    place_window(win, parent)
     win.transient(parent.winfo_toplevel())
     win.grab_set()
     win.wait_window()
@@ -519,6 +524,7 @@ class RestoreDialog(tk.Toplevel):
         ttk.Button(btns, text=f"Restore {d['name']}", style='Accent.TButton',
                    command=self.confirm).pack(side='right', padx=4)
         self.protocol('WM_DELETE_WINDOW', self.cancel)
+        place_window(self, parent)
         self.transient(parent.winfo_toplevel())
         self.grab_set()
 

@@ -74,6 +74,14 @@ def fresh_console_history(monkeypatch):
 def private_layout_file(tmp_path, monkeypatch):
     path = tmp_path / 'topology_layout.json'
     monkeypatch.setenv('NETCOMMAND_LAYOUT_FILE', str(path))
+    # the remembered window size and place (gui/window_state.py): never the user's own
+    monkeypatch.setenv('NETCOMMAND_WINDOW_FILE', str(tmp_path / 'window.json'))
+    monkeypatch.delenv('NETCOMMAND_UI_TEXT_SIZE', raising=False)
+    try:                                    # layout settings kept between starts: none
+        from gui import window_state
+        monkeypatch.setattr(window_state, '_settings', {})
+    except Exception:
+        pass
     return path
 
 

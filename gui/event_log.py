@@ -30,9 +30,10 @@ the app cannot change or delete; the Logs page shows it). Lines from before (the
 the sign-in) are saved then too. Nothing is lost while the database is unavailable: saving
 is retried. Clearing the Console never touches the saved history.
 
-The running app (main.py) calls keep_history(): from then on every line since the app
-started is kept, and a Console that opens later is first given that whole history with
-the original times. Error and warning dialogs are logged too (install_dialog_logging).
+The running app (main.py) calls keep_history(): from then on every line is kept, and a
+Console that opens later is first given that history with the original times. At each
+sign-out main.py calls clear_history(): the next person's Console starts fresh (their own
+sign-in onwards). Everyone's lines stay in the saved history (the Logs page, by role). Error and warning dialogs are logged too (install_dialog_logging).
 """
 import re
 import threading
@@ -148,6 +149,19 @@ def keep_history():
         _keeping[0] = True
 
 
+def clear_history():
+    """At sign-out: forget the lines kept for later Consoles, so the next person who signs
+    in on this computer starts with an empty Console (plus what is logged from then on,
+    such as the sign-in itself). Nothing saved is touched; lines not saved yet stay queued."""
+    with _lock:
+        for r in _history:
+            if _store[0] is not None and not _saving['off'] and not r.get('queued'):
+                r['queued'] = True
+                _pending.append(r)                    # never lost by being forgotten here
+        _history.clear()
+        _recent.clear()
+
+
 def attach(sink):
     """Start sending lines to sink; it is first given the history kept so far (only when
     keep_history() was called: the running app, never tests)."""
@@ -202,7 +216,8 @@ def _queue_for_saving(record):
     if _store[0] is None or _saving['off']:
         return
     with _lock:
-        _pending.append(record)
+        record['queued'] = True                 # never queued a second time (set_store,
+        _pending.append(record)                 # clear_history)
         del _pending[:-MAX_PENDING]
     _wake.set()
 

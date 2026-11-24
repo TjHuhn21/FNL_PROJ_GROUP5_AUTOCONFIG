@@ -6,11 +6,13 @@ from tkinter import ttk, messagebox
 
 import validation
 from gui import theme
+from gui.components.dialogs import place_window
 from gui.db_status import database_ready, report_error
 from gui.device_login_guard import (SUCCESS, DeviceLoginGuard, outcome_of_scan_error,
                                     warning_text)
 from gui.event_log import log_event
 from store_errors import DatabaseUnavailable, DuplicateDeviceName
+from gui.components.tables import setup_table
 
 SAMPLE_BLOCKED = ('These are sample devices. They can only be approved in sample mode '
                   '(python main.py --demo). Untick Demo mode and scan the real network '
@@ -101,9 +103,7 @@ class ScanTab(ttk.Frame):
                 ('managed', 'Managed', 100), ('source', 'Source', 160)]
         self.tree = ttk.Treeview(self, columns=[c[0] for c in cols], show='headings',
                                  selectmode='extended', style='Data.Treeview')
-        for key, title, width in cols:
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor='w')
+        setup_table(self.tree, cols)
 
         # The button bar is packed at the bottom BEFORE the table, so a short window
         # shrinks the table instead of squeezing the Approve button out of sight.
@@ -431,6 +431,7 @@ class ScanRestoreDialog(tk.Toplevel):
         ttk.Button(btns, text='Continue', style='Accent.TButton',
                    command=self.confirm).pack(side='right', padx=4)
         self.protocol('WM_DELETE_WINDOW', self.cancel)
+        place_window(self, parent)
         self.transient(parent.winfo_toplevel())
         self.grab_set()
 

@@ -10,7 +10,7 @@ import pytest
 tk = pytest.importorskip('tkinter')
 from tkinter import messagebox, simpledialog  # noqa: E402
 
-from gui_helpers import new_root, pump  # noqa: E402
+from gui_helpers import new_root, pump, wide_window  # noqa: E402
 
 PASSWORD = 'Top$ecret99'
 DEVICES = [
@@ -379,6 +379,7 @@ def app(monkeypatch):
 
 def test_inspector_is_hidden_on_configure_and_can_be_toggled(app):
     root, r, store = app
+    wide_window(root, r)                  # a narrow window hides the inspector by itself
     assert r['inspector_shown']()
     r['show_page']('configure'); root.update()
     assert not r['inspector_shown']() and len(r['panels']['upper'].panes()) == 1

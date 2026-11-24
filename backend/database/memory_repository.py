@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from backend.auth import device_lockout as DL
 from backend.database import auth_records as R
 from backend.database.auth_repository import (ADMIN_EXISTS, LAST_ADMIN, LIST_USER_FIELDS,
-                                              TOKEN_IN_USE, USER_NOT_FOUND)
+                                              TOKEN_IN_USE, USER_NOT_FOUND, approval_detail)
 from backend.database.errors import (AdminExists, DuplicateEmail, InvalidValue, LastActiveAdmin,
                                      ResendTooSoon)
 
@@ -156,8 +156,7 @@ class InMemoryAuthRepository:
             if not u or u['status'] != 'pending_approval' or u['email_verified_at'] is None:
                 return False
             record = R.audit_values('user.approved', 'success', target_type='user',
-                                    target_id=user_id, detail=f'role {role}' if role else None,
-                                    **audit)
+                                    target_id=user_id, detail=approval_detail(role), **audit)
             now = self.clock()
             u.update(status='active', approved_by=approved_by, approved_at=now,
                      role=role or u['role'], updated_at=now)

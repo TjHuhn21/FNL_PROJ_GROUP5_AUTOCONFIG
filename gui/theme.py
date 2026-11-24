@@ -110,17 +110,79 @@ CONSOLE_HEIGHT = 170
 CONSOLE_HEIGHT_COMPACT = 110    # on Configure, which has its own SSH session console
 
 
+# The DESIGN sizes (at 100 % and UI_TEXT_SIZE 'normal'). The names above are recomputed
+# from these by _scale_sizes() (gui/ui_scale.py) every time apply() runs.
+_BASE = {'FONT': 10, 'FONT_SMALL': 9, 'FONT_TITLE': 13, 'FONT_BRAND': 11, 'FONT_RAIL': 8,
+         'FONT_MONO': 9, 'FONT_FORM': 11, 'CODE_SIZE': 11, 'SESSION_SIZE': 10,
+         'TABLE_SIZE': 11, 'TABLE_HEADING_SIZE': 10, 'CONSOLE_SIZE': 11,
+         'CONSOLE_TAB_SIZE': 11}
+_BASE_PX = {'PAD': 8, 'RAIL_WIDTH': 64, 'INSPECTOR_WIDTH': 300, 'CONSOLE_HEIGHT': 170,
+            'CONSOLE_HEIGHT_COMPACT': 110}
+
+
+def font(size=10, weight='normal', family=None):
+    """A font of the app's family at a DESIGN size (scaled by gui/ui_scale.py)."""
+    from gui import ui_scale
+    scaled = ui_scale.font_size(size, minimum=1 if size < ui_scale.MIN_SMALL else None)
+    family = family or FONT_FAMILY
+    return (family, scaled, weight) if weight != 'normal' else (family, scaled)
+
+
 def mono(size=9, weight='normal'):
-    """The monospace font (for IPs, ports, timestamps, commands)."""
-    return (MONO_FAMILY, size, weight) if weight != 'normal' else (MONO_FAMILY, size)
+    """The monospace font (for IPs, ports, timestamps, commands), at a DESIGN size."""
+    return font(size, weight, family=MONO_FAMILY)
+
+
+def _scale_sizes(root):
+    """Recompute every font and pixel size from the design sizes (ui_scale)."""
+    from gui import ui_scale
+    global FONT, FONT_SMALL, FONT_BOLD, FONT_TITLE, FONT_BRAND, FONT_RAIL, FONT_MONO
+    global FONT_MONO_BOLD, FONT_FORM, FONT_FORM_BOLD, CODE_SIZE, SESSION_SIZE, TABLE_SIZE
+    global TABLE_ROW_HEIGHT, TABLE_HEADING_SIZE, CONSOLE_SIZE, CONSOLE_TAB_SIZE, PAD
+    global RAIL_WIDTH, INSPECTOR_WIDTH, CONSOLE_HEIGHT, CONSOLE_HEIGHT_COMPACT
+    ui_scale.measure(root)
+    size = ui_scale.font_size
+    body = size(_BASE['FONT'], ui_scale.MIN_BODY)
+    FONT, FONT_BOLD = (FONT_FAMILY, body), (FONT_FAMILY, body, 'bold')
+    FONT_SMALL = (FONT_FAMILY, size(_BASE['FONT_SMALL']))
+    FONT_TITLE = (FONT_FAMILY, size(_BASE['FONT_TITLE']), 'bold')
+    FONT_BRAND = (FONT_FAMILY, size(_BASE['FONT_BRAND']), 'bold')
+    FONT_RAIL = (FONT_FAMILY, size(_BASE['FONT_RAIL'], minimum=8))
+    mono_size = size(_BASE['FONT_MONO'])
+    FONT_MONO, FONT_MONO_BOLD = (MONO_FAMILY, mono_size), (MONO_FAMILY, mono_size, 'bold')
+    form = size(_BASE['FONT_FORM'], ui_scale.MIN_BODY)
+    FONT_FORM, FONT_FORM_BOLD = (FONT_FAMILY, form), (FONT_FAMILY, form, 'bold')
+    CODE_SIZE = size(_BASE['CODE_SIZE'], ui_scale.MIN_BODY)
+    SESSION_SIZE = size(_BASE['SESSION_SIZE'], ui_scale.MIN_BODY)
+    TABLE_SIZE = size(_BASE['TABLE_SIZE'], ui_scale.MIN_BODY)
+    TABLE_HEADING_SIZE = size(_BASE['TABLE_HEADING_SIZE'], ui_scale.MIN_BODY)
+    CONSOLE_SIZE = size(_BASE['CONSOLE_SIZE'], ui_scale.MIN_BODY)
+    CONSOLE_TAB_SIZE = size(_BASE['CONSOLE_TAB_SIZE'], ui_scale.MIN_BODY)
+    try:                                        # a row fits its font exactly
+        line = tkfont.Font(root=root, family=FONT_FAMILY, size=TABLE_SIZE).metrics('linespace')
+    except Exception:
+        line = int(TABLE_SIZE * 1.6)
+    TABLE_ROW_HEIGHT = ui_scale.row_height(line)
+    space = ui_scale.space
+    PAD = space(_BASE_PX['PAD'])
+    # CustomTkinter widgets (the rail) apply the display scaling THEMSELVES: their sizes get
+    # only the text-size factor, never the DPI (that would scale them twice)
+    RAIL_WIDTH = int(round(_BASE_PX['RAIL_WIDTH'] * ui_scale.factor()))
+    INSPECTOR_WIDTH = space(_BASE_PX['INSPECTOR_WIDTH'])
+    CONSOLE_HEIGHT = space(_BASE_PX['CONSOLE_HEIGHT'])
+    CONSOLE_HEIGHT_COMPACT = space(_BASE_PX['CONSOLE_HEIGHT_COMPACT'])
+    for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont',
+                 'TkTooltipFont', 'TkCaptionFont'):        # widgets without their own font
+        try:
+            tkfont.nametofont(name, root=root).configure(family=FONT_FAMILY, size=body)
+        except Exception:
+            pass
 
 
 def _pick_mono(root):
-    global MONO_FAMILY, FONT_MONO, FONT_MONO_BOLD
+    global MONO_FAMILY
     installed = set(tkfont.families(root))
     MONO_FAMILY = next((f for f in MONO_CANDIDATES if f in installed), 'Courier')
-    FONT_MONO = (MONO_FAMILY, 9)
-    FONT_MONO_BOLD = (MONO_FAMILY, 9, 'bold')
 
 
 def apply(root):
@@ -132,7 +194,58 @@ def apply(root):
     else:
         root.configure(background=APP_BG)
     _pick_mono(root)
+    _scale_sizes(root)                     # every font and size from gui/ui_scale.py
+    _styles(root)
 
+
+def window_dpi(root):
+    """The DPI of the monitor the window is on (Windows 10+), or None."""
+    try:
+        import ctypes
+        dpi = ctypes.windll.user32.GetDpiForWindow(root.winfo_id())
+        return float(dpi) if dpi else None
+    except Exception:
+        return None
+
+
+def watch_dpi(root, delay_ms=400):
+    """Moved to a monitor with another DPI (or the scaling was changed): recompute the
+    sizes and the ttk styles, then send <<DpiChanged>>. Checked after the window moves or
+    is resized, debounced so dragging stays smooth."""
+    from gui import ui_scale
+    job = {'id': None}
+
+    def check():
+        job['id'] = None
+        dpi = window_dpi(root)
+        if dpi and ui_scale.rescale(dpi):
+            try:
+                root.tk.call('tk', 'scaling', dpi / 72.0)    # points -> pixels on this monitor
+                _scale_sizes(root)
+                _styles(root)
+                root.event_generate('<<DpiChanged>>')
+            except Exception:
+                pass
+
+    def moved(event):
+        if event.widget is not root:
+            return
+        if job['id'] is not None:
+            try:
+                root.after_cancel(job['id'])
+            except Exception:
+                pass
+        try:
+            job['id'] = root.after(delay_ms, check)
+        except Exception:
+            job['id'] = None
+    root.bind('<Configure>', moved, add='+')
+
+
+def _styles(root):
+    """The ttk styles, from the current (scaled) sizes. Run again after a DPI change."""
+    from gui import ui_scale
+    sp = ui_scale.space
     style = ttk.Style(root)
     if 'clam' in style.theme_names():
         style.theme_use('clam')
@@ -158,7 +271,7 @@ def apply(root):
 
     # Secondary buttons: white with a visible 1 px border; beige when hovered
     style.configure('TButton', background=CARD, foreground=TEXT, bordercolor=BORDER_STRONG,
-                    lightcolor=CARD, darkcolor=CARD, padding=(10, 3), relief='solid',
+                    lightcolor=CARD, darkcolor=CARD, padding=(sp(10), sp(3)), relief='solid',
                     borderwidth=1)
     style.map('TButton', background=[('disabled', SURFACE_2), ('pressed', ACCENT_SOFT),
                                      ('active', SURFACE_2)],
@@ -176,7 +289,7 @@ def apply(root):
     # Accent.TButton, so colors and states stay the same)
     style.configure('Form.TLabel', font=FONT_FORM)
     style.configure('Form.TCheckbutton', font=FONT_FORM)
-    style.configure('Large.Accent.TButton', font=FONT_FORM_BOLD, padding=(16, 5))
+    style.configure('Large.Accent.TButton', font=FONT_FORM_BOLD, padding=(sp(16), sp(5)))
 
     style.configure('TEntry', fieldbackground=CARD, foreground=TEXT, insertcolor=TEXT,
                     bordercolor=BORDER_STRONG, lightcolor=CARD, darkcolor=CARD)
@@ -205,30 +318,34 @@ def apply(root):
 
     # Dense, ruled tables (the "ledger" look): white rows, beige monospace headings,
     # dark green selection with white text
+    # a heading's text starts where its cells' text starts (a cell's text sits 4 px in;
+    # the heading's border takes 2 of them), so left-aligned headers line up with values
+    HEADING_INSET = sp(2)
     style.configure('Treeview', background=CARD, fieldbackground=CARD, foreground=TEXT,
-                    bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD, rowheight=24)
+                    bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD, rowheight=TABLE_ROW_HEIGHT,
+                    font=(FONT_FAMILY, TABLE_SIZE))
     style.map('Treeview', background=[('selected', ACCENT)], foreground=[('selected', WHITE)])
     style.configure('Treeview.Heading', font=FONT_MONO_BOLD, background=SURFACE_2,
                     foreground=TEXT, bordercolor=BORDER, lightcolor=SURFACE_2,
-                    darkcolor=SURFACE_2, relief='flat', padding=(6, 4))
+                    darkcolor=SURFACE_2, relief='flat', padding=(HEADING_INSET, sp(4)))
     style.map('Treeview.Heading', background=[('active', BORDER)])
     # Larger tables (inherit the ledger look above; only size and row height change)
     style.configure('Data.Treeview', font=(FONT_FAMILY, TABLE_SIZE), rowheight=TABLE_ROW_HEIGHT)
     style.configure('Data.Treeview.Heading', font=(MONO_FAMILY, TABLE_HEADING_SIZE, 'bold'),
-                    padding=(6, 5))
+                    padding=(HEADING_INSET, sp(5)))
 
     style.configure('TNotebook', background=BG, bordercolor=BORDER, tabmargins=(0, 2, 0, 0))
     style.configure('TNotebook.Tab', background=SURFACE_2, foreground=TEXT_SOFT,
                     bordercolor=BORDER, lightcolor=SURFACE_2, darkcolor=SURFACE_2,
-                    padding=(12, 4))
+                    padding=(sp(12), sp(4)))
     style.map('TNotebook.Tab', background=[('selected', CARD), ('active', BORDER)],
               foreground=[('selected', ACCENT)])
     # The bottom operations console: slightly larger tab labels and buttons
     style.configure('Console.TNotebook', background=BG, bordercolor=BORDER,
                     tabmargins=(0, 2, 0, 0))
     style.configure('Console.TNotebook.Tab', font=(FONT_FAMILY, CONSOLE_TAB_SIZE),
-                    padding=(14, 5))
-    style.configure('Console.TButton', font=(FONT_FAMILY, CONSOLE_TAB_SIZE), padding=(12, 3))
+                    padding=(sp(14), sp(5)))
+    style.configure('Console.TButton', font=(FONT_FAMILY, CONSOLE_TAB_SIZE), padding=(sp(12), sp(3)))
 
     style.configure('TScrollbar', background=SURFACE_2, troughcolor=CREAM,
                     bordercolor=CREAM, arrowcolor=ACCENT,
@@ -242,7 +359,7 @@ def apply(root):
 
     # Resizable workbench panels: a visible but quiet divider to drag
     style.configure('Workbench.TPanedwindow', background=BORDER)
-    style.configure('Sash', sashthickness=5, gripcount=0, background=SURFACE_2,
+    style.configure('Sash', sashthickness=sp(5), gripcount=0, background=SURFACE_2,
                     lightcolor=BORDER, bordercolor=BORDER)
 
     root.option_add('*Text.background', CARD)

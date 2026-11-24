@@ -321,10 +321,12 @@ def add_console_events(rows):
             _console.append(dict(r, id=len(_console) + 1))
 
 
-def _console_rows(search='', tag='', user='', category='', device=''):
+def _console_rows(search='', tag='', user='', category='', device='', users=None):
     s = (search or '').lower()
     out = []
     for r in _console:
+        if users is not None and r.get('user_label') not in set(users):
+            continue
         text = ' '.join(str(r.get(k) or '') for k in
                         ('message', 'result', 'device', 'device_ip', 'user_label')).lower()
         if s and s not in text:
@@ -338,13 +340,13 @@ def _console_rows(search='', tag='', user='', category='', device=''):
     return out
 
 
-def count_console_events(search='', tag='', user='', category='', device=''):
-    return len(_console_rows(search, tag, user, category, device))
+def count_console_events(search='', tag='', user='', category='', device='', users=None):
+    return len(_console_rows(search, tag, user, category, device, users))
 
 
 def get_console_events(search='', page=1, per_page=15, tag='', user='', category='',
-                       device=''):
-    rows = list(reversed(_console_rows(search, tag, user, category, device)))
+                       device='', users=None):
+    rows = list(reversed(_console_rows(search, tag, user, category, device, users)))
     start = (max(page, 1) - 1) * per_page
     return [dict(r) for r in rows[start:start + per_page]]
 

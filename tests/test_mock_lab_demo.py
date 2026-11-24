@@ -121,7 +121,8 @@ def test_both_modes_give_initial_setup_the_simulated_ports(launcher, argv, monke
     backend = main.console_backend(seen['argv'])
     assert isinstance(backend, MockConsoleBackend) and backend.simulated
     names = [p.device for p in backend.discover_ports().ports]
-    assert names == [f'SIM{n}' for n in range(1, 18)] == list(SCENARIOS)
+    # SIM1-SIM17, then the brand-new switch and router (SIM47, SIM48)
+    assert names == [f'SIM{n}' for n in range(1, 18)] + ['SIM47', 'SIM48'] == list(SCENARIOS)
     assert all('SIMULATED' in p.description for p in backend.discover_ports().ports)
 
 

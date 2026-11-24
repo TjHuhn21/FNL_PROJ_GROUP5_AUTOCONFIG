@@ -461,6 +461,16 @@ class AuthApiClient:
         _, p = self._request('POST', f'/admin/users/{int(user_id)}/disable', token=token)
         return self._dict(p, 'status')
 
+    def enable_user(self, token, user_id):
+        """disabled -> active (admins only, checked by the server)."""
+        _, p = self._request('POST', f'/admin/users/{int(user_id)}/enable', token=token)
+        return self._dict(p, 'status')
+
+    def reopen_user(self, token, user_id):
+        """rejected -> pending_approval (admins only, checked by the server)."""
+        _, p = self._request('POST', f'/admin/users/{int(user_id)}/reopen', token=token)
+        return self._dict(p, 'status')
+
     def unlock_user(self, token, user_id):
         """Clear another account's failed-device-login lock (admins only, checked by the
         server). {'user_id', 'cleared': 'temporary' | 'permanent' | None}."""

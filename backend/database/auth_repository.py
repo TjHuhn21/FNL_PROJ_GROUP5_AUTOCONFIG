@@ -65,7 +65,13 @@ _SECURITY_LOCKED = (f'EXISTS (SELECT 1 FROM security_device_login_state st WHERE
 
 USER_NOT_FOUND = 'The user does not exist.'
 TOKEN_IN_USE = 'This session token hash is already in use.'
-LAST_ADMIN = 'This change would leave no active admin. Nothing was changed.'
+LAST_ADMIN = 'There must be at least one active admin. Nothing was changed.'
+
+
+def approval_detail(role):
+    """The audit detail of an approval: the account had no role before it."""
+    return (f'role — -> {role}; status pending_approval -> active' if role else
+            'status pending_approval -> active')
 ADMIN_EXISTS = 'An active administrator already exists. Nothing was created.'
 SETUP_BUSY = ('Another first-administrator setup is running on this database. Nothing was '
               'created; try again in a moment.')
@@ -257,7 +263,7 @@ class AuthRepository:
             if changed:
                 self._insert_audit(cur, 'user.approved', 'success', target_type='user',
                                    target_id=str(user_id),
-                                   detail=f'role {role}' if role else None, **audit)
+                                   detail=approval_detail(role), **audit)
             return changed
         return self._tx(work)
 

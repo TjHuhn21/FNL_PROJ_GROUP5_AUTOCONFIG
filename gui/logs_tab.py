@@ -7,6 +7,11 @@
 
 Nothing here can change or delete an entry (the activity history is append-only in the
 database as well).
+
+Who sees what: an admin sees everyone's activity; an operator or viewer sees only their
+own lines and the automatic 'system' ones. This is enforced by the app (its queries are
+limited), not by the database: the desktop reads the history with the app's shared
+database account.
 """
 import tkinter as tk
 from tkinter import ttk
@@ -14,8 +19,9 @@ from tkinter import ttk
 from gui import theme
 from gui.db_status import report_error
 from gui.event_log import log_event
-from gui.timefmt import format_date_time
+from gui.timefmt import format_date_time, format_datetime
 from store_errors import DATABASE_ERRORS
+from gui.components.tables import setup_table
 
 PER_PAGE = 15
 CONFIG_LOG, ACTIVITY = 'Configuration log', 'Activity history'
@@ -31,9 +37,13 @@ ALL_USERS = 'All users'
 
 
 class LogsTab(ttk.Frame):
-    def __init__(self, parent, store):
+    def __init__(self, parent, store, scope_users=None):
+        """scope_users: None (an admin, or nobody signed in) shows everyone's activity;
+        otherwise a function returning the users whose lines may be shown (a non-admin:
+        their own masked e-mail and 'system'). Every activity query is limited to them."""
         super().__init__(parent, padding=theme.PAD)
         self.store, self.page = store, 1
+        self.scope_users = scope_users
         self.rows_by_iid = {}
         top = ttk.Frame(self); top.pack(fill='x')
         ttk.Label(top, text='Show:', style='Form.TLabel').pack(side='left')
@@ -80,9 +90,7 @@ class LogsTab(ttk.Frame):
     def _table(self, columns):
         tree = ttk.Treeview(self.tables, columns=[c[0] for c in columns], show='headings',
                             style='Data.Treeview')
-        for key, title, width in columns:
-            tree.heading(key, text=title)
-            tree.column(key, width=width, anchor='w')
+        setup_table(tree, columns)
         tree.tag_configure('failed', background=theme.SEVERITY_COLORS['high'])
         tree.tag_configure('error', background=theme.SEVERITY_COLORS['high'])
         tree.tag_configure('warn', background=theme.SEVERITY_COLORS.get('medium', theme.CARD))
@@ -109,12 +117,22 @@ class LogsTab(ttk.Frame):
             self.tree.pack(fill='both', expand=True)
         self.go_first()
 
+    def _allowed(self):
+        """The users this person may see, or None (everyone)."""
+        return list(self.scope_users()) if self.scope_users else None
+
     def _load_users(self):
-        try:
-            users = self.store.console_event_users()
-        except Exception:
-            users = []
+        allowed = self._allowed()
+        if allowed is not None:                       # only their own lines and 'system'
+            users = allowed
+        else:
+            try:
+                users = self.store.console_event_users()
+            except Exception:
+                users = []
         self.user_box.configure(values=[ALL_USERS] + list(users))
+        if self.user.get() != ALL_USERS and self.user.get() not in users:
+            self.user.set(ALL_USERS)
 
     def refresh_clicked(self):
         """The Refresh button: reload, and say so in the Console."""
@@ -136,15 +154,20 @@ class LogsTab(ttk.Frame):
         text = self.search.get().strip()
         status = '' if self.status.get() == 'all' else self.status.get()
         user = '' if self.user.get() == ALL_USERS else self.user.get()
+        allowed = self._allowed()
+        if allowed is not None and user and user not in allowed:
+            user = ''                                 # never another person's lines
+        scope = {} if allowed is None else {'users': allowed}
         try:
             if self.activity:
-                total = self.store.count_console_events(text, status, user)
+                total = self.store.count_console_events(text, status, user, **scope)
             else:
                 total = self.store.count_logs(text, status)
             pages = max(1, -(-total // PER_PAGE))
             self.page = min(max(self.page, 1), pages)
             if self.activity:
-                rows = self.store.get_console_events(text, self.page, PER_PAGE, status, user)
+                rows = self.store.get_console_events(text, self.page, PER_PAGE, status, user,
+                                                     **scope)
             else:
                 rows = self.store.get_logs(text, self.page, PER_PAGE, status)
         except DATABASE_ERRORS as err:
@@ -168,7 +191,7 @@ class LogsTab(ttk.Frame):
             empty = 'No activity saved yet.'
         else:
             for r in rows:
-                when = r['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                when = format_datetime(r['created_at'], seconds=True)
                 self.tree.insert('', 'end', tags=(r['status'],),
                                  values=(when, r['device'], r['action'], r['status'],
                                          r['details']))

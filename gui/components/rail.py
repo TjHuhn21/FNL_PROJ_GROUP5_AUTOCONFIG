@@ -30,10 +30,49 @@ class RailItem(ctk.CTkFrame):
                                  text_color=theme.RAIL_TEXT, cursor='hand2')
         self.text.grid(row=1 if icon_font else 0, column=1, rowspan=1 if icon_font else 2,
                        pady=(0, 7) if icon_font else 14)
+        self.compact, self._tip = False, None
+        self._text_grid = self.text.grid_info()
         for widget in self._parts():
             widget.bind('<Button-1>', lambda _e: self._on_click(self.key))
             widget.bind('<Enter>', lambda _e: self._set_hover(True))
             widget.bind('<Leave>', self._maybe_leave)
+
+    def set_compact(self, on):
+        """Icons only (small windows): the label is hidden and shown as a tooltip instead.
+        Without an icon font the label always stays (it is all there is)."""
+        on = bool(on) and self.icon is not None
+        if on == self.compact:
+            return
+        self.compact = on
+        if on:
+            self.text.grid_remove()
+            self.icon.grid_configure(pady=(9, 9))
+            self.configure(height=40)
+        else:
+            self.text.grid(**{k: v for k, v in self._text_grid.items() if k != 'in'})
+            self.icon.grid_configure(pady=(8, 0))
+            self.configure(height=54)
+
+    def _show_tip(self):
+        self._hide_tip()
+        if not self.compact:
+            return
+        import tkinter as tk
+        self._tip = tk.Toplevel(self)
+        self._tip.wm_overrideredirect(True)
+        x = self.winfo_rootx() + self.winfo_width() + 4
+        y = self.winfo_rooty() + self.winfo_height() // 4
+        self._tip.wm_geometry(f'+{x}+{y}')
+        tk.Label(self._tip, text=self.label_text, font=theme.FONT_SMALL, background=theme.CARD,
+                 foreground=theme.TEXT, relief='solid', borderwidth=1, padx=6, pady=3).pack()
+
+    def _hide_tip(self):
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
 
     def _parts(self):
         return [w for w in (self, self.marker, self.icon, self.text) if w is not None]
@@ -51,6 +90,10 @@ class RailItem(ctk.CTkFrame):
     def _set_hover(self, on):
         self._hover = on
         self._paint()
+        if on:
+            self._show_tip()
+        else:
+            self._hide_tip()
 
     def set_active(self, on):
         self._active = on
@@ -85,3 +128,17 @@ class Rail(ctk.CTkFrame):
         self.active = key
         for item_key, item in self.items.items():
             item.set_active(item_key == key)
+
+    def set_compact(self, on):
+        """Icons only, labels as tooltips (small windows: COMPACT_BELOW_HEIGHT)."""
+        for item in self.items.values():
+            item.set_compact(on)
+
+    @property
+    def compact(self):
+        return any(item.compact for item in self.items.values())
+
+
+# the rail shows icons only when the window is shorter than this (logical pixels): ten
+# items with labels need about 560 px
+COMPACT_BELOW_HEIGHT = 720

@@ -9,6 +9,7 @@ import customtkinter as ctk
 
 from gui import theme
 from gui.db_status import report_error
+from gui.timefmt import format_datetime
 from store_errors import DATABASE_ERRORS
 
 
@@ -95,7 +96,7 @@ class Inspector(ctk.CTkFrame):
         self.device = None
         self.selection = ('details', title)
         body = self._new_body()
-        ctk.CTkLabel(body, text=title, font=(theme.FONT_FAMILY, 16, 'bold'), anchor='w',
+        ctk.CTkLabel(body, text=title, font=theme.font(16, 'bold'), anchor='w',
                      text_color=theme.TEXT).grid(row=0, column=0, columnspan=2, sticky='ew',
                                                  pady=(4, 0))
         self._status(body, status, 1)
@@ -108,7 +109,7 @@ class Inspector(ctk.CTkFrame):
         self.device = None
         self.selection = ('link', (a, b))
         body = self._new_body()
-        ctk.CTkLabel(body, text='Link', font=(theme.FONT_FAMILY, 16, 'bold'), anchor='w',
+        ctk.CTkLabel(body, text='Link', font=theme.font(16, 'bold'), anchor='w',
                      text_color=theme.TEXT).grid(row=0, column=0, columnspan=2, sticky='ew',
                                                  pady=(4, 0))
         ctk.CTkLabel(body, text=f'{a}  ↔  {b}', font=theme.mono(10), anchor='w',
@@ -165,14 +166,14 @@ class Inspector(ctk.CTkFrame):
                          anchor='w', text_color=theme.TEXT_MUTED).grid(row=0, column=0,
                                                                         columnspan=2, sticky='ew')
             return None
-        ctk.CTkLabel(body, text=d['name'], font=(theme.FONT_FAMILY, 16, 'bold'), anchor='w',
+        ctk.CTkLabel(body, text=d['name'], font=theme.font(16, 'bold'), anchor='w',
                      text_color=theme.TEXT).grid(row=0, column=0, columnspan=2, sticky='ew',
                                                  pady=(4, 0))
         self._status(body, d['status'], 1)
         rows = [('IP address', d['ip'], True), ('Type', d['type'], False),
                 ('Managed', 'yes (NetCommand can log in)' if d['managed'] else 'no', False)]
         if d.get('created_at'):
-            rows.append(('Registered', d['created_at'].strftime('%Y-%m-%d %H:%M'), True))
+            rows.append(('Registered', format_datetime(d['created_at']), True))
         rows += list(extra_rows)
         self._rows(body, rows, 2)
 

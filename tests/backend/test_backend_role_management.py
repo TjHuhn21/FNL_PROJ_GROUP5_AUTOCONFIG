@@ -129,11 +129,33 @@ def test_same_role_is_no_change(world):
     assert world.repo.list_audit(action='user.role_changed') == []
 
 
-def test_pending_accounts_can_be_given_a_role_too(world):
+def test_a_pending_account_gets_its_role_only_when_approved(world):
+    """Changed deliberately: a role on a pending account skipped the approval step."""
     token, _ = admin_and_target(world)
-    pending = world.user('pending@example.com', status='pending_approval')
-    assert world.svc.change_role(token, pending, 'operator')['role'] == 'operator'
-    assert world.repo.get_user(pending)['status'] == 'pending_approval'
+    pending = world.user('pending@example.com', role='admin', status='pending_approval')
+    with pytest.raises(InvalidRequest, match='no role yet'):
+        world.svc.change_role(token, pending, 'operator')
+    denied = world.repo.list_audit(action='user.role_changed')[0]
+    assert denied['outcome'] == 'denied'
+    listed = {u['id']: u for u in world.svc.list_accounts(token)}
+    assert listed[pending]['role'] is None                  # an old stored role is not shown
+    assert world.svc.approve_account(token, pending) is True       # default: viewer
+    assert world.repo.get_user(pending)['role'] == 'viewer'        # the stale admin is gone
+    approved = world.repo.list_audit(action='user.approved')[0]
+    assert approved['detail'] == 'role — -> viewer; status pending_approval -> active'
+
+
+def test_enable_and_reopen_follow_the_status_rules(world):
+    token, target = admin_and_target(world)
+    world.svc.disable_account(token, target)
+    assert world.svc.enable_account(token, target) is True
+    assert world.repo.get_user(target)['status'] == 'active'
+    assert world.svc.enable_account(token, target) is False        # not disabled any more
+    rejected = world.user('r@example.com', status='pending_approval')
+    world.svc.reject_account(token, rejected)
+    assert world.svc.reopen_account(token, rejected) is True
+    assert world.repo.get_user(rejected)['status'] == 'pending_approval'
+    assert {u['id']: u for u in world.svc.list_accounts(token)}[rejected]['role'] is None
 
 
 # ================================================================ sessions
@@ -232,7 +254,7 @@ def test_the_last_active_admin_cannot_be_demoted(world):
         world.repo.get_user = real_get_user
         return real_get_user(user_id)
     world.repo.get_user = get_user_while_b_acts
-    with pytest.raises(InvalidRequest, match='no active admin'):
+    with pytest.raises(InvalidRequest, match='There must be at least one active admin'):
         world.svc.change_role(a_token, b, 'viewer')
     assert world.repo.get_user(b)['role'] == 'admin'                     # B is still admin
     denied = world.repo.list_audit(action='user.role_changed')[0]

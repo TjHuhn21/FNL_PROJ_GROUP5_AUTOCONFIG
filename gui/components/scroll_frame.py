@@ -15,6 +15,7 @@ from tkinter import ttk
 from gui import theme
 
 WHEEL_STEP = 120          # one notch of a classic Windows mouse wheel (event.delta)
+SCROLL_HYSTERESIS = 24    # pixels: a shown scroll bar goes away only with this much room
 
 
 def bind_wheel(widget, lines_per_notch=1):
@@ -59,8 +60,13 @@ def auto_scrollbar(parent, widget, row=0, column=1):
 
 
 class ScrollFrame(ttk.Frame):
-    def __init__(self, parent, background=None):
+    """fill_height=True (a whole page): the content is stretched to the visible height
+    when it fits (so tables in it can grow), and scrolls when the window is shorter than
+    the content needs."""
+
+    def __init__(self, parent, background=None, fill_height=False):
         super().__init__(parent)
+        self.fill_height = fill_height
         self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0,
                                 background=background or theme.BG)
         self.bar = ttk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
@@ -68,21 +74,58 @@ class ScrollFrame(ttk.Frame):
         self.canvas.pack(side='left', fill='both', expand=True)
         self.inner = ttk.Frame(self.canvas)
         self._window = self.canvas.create_window(0, 0, window=self.inner, anchor='nw')
-        self.inner.bind('<Configure>', lambda e: self._update())
-        self.canvas.bind('<Configure>', lambda e: self._update())
+        # many <Configure> events arrive while a window edge is dragged: handled once, when
+        # Tk is idle, and only when a size really changed (no repeated work, no flicker)
+        self._pending, self._last = None, None
+        self.inner.bind('<Configure>', lambda e: self._update_later())
+        self.canvas.bind('<Configure>', lambda e: self._update_later())
         # one application-wide wheel handler that only acts when the pointer is over
         # this frame (Enter/Leave would fire every time the pointer crosses a child)
         self.canvas.bind_all('<MouseWheel>', self._scroll, add='+')
         self.bar_shown = False
 
+    def _watch_children(self):
+        """fill_height: the content frame keeps the view's height even when what is in it
+        gets shorter (so it sends no <Configure>); its direct children do change size."""
+        watched = getattr(self, '_watched', set())
+        self._watched = watched
+        for child in self.inner.winfo_children():
+            if str(child) not in watched:
+                watched.add(str(child))
+                child.bind('<Configure>', lambda e: self._update_later(), add='+')
+
+    def _update_later(self):
+        if self._pending is None:
+            try:
+                self._pending = self.after_idle(self._update)
+            except tk.TclError:
+                self._pending = None
+
     def _update(self):
-        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        need = self.inner.winfo_reqheight()
+        self._pending = None
+        try:
+            width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+            need = self.inner.winfo_reqheight()
+        except tk.TclError:
+            return
+        if self.fill_height:
+            self._watch_children()
+        if (width, height, need) == self._last:
+            return
+        self._last = (width, height, need)
         # the content always gets exactly the visible width (wider content would be cut off
         # at the right edge, since there is no horizontal scroll bar)
         self.canvas.itemconfigure(self._window, width=width)
+        if self.fill_height:
+            self.canvas.itemconfigure(self._window, height=max(need, height))
         self.canvas.configure(scrollregion=(0, 0, width, max(need, height)))
-        overflow = need > height + 1 and height > 1
+        # The bar appears when the content is taller than the view, and goes away only when
+        # it fits with some room to spare: showing the bar narrows the content (which can
+        # make it shorter), so without this margin it could flicker on and off.
+        if self.bar_shown:
+            overflow = need > height - SCROLL_HYSTERESIS and height > 1
+        else:
+            overflow = need > height + 1 and height > 1
         if overflow and not self.bar_shown:
             self.bar.pack(side='right', fill='y', before=self.canvas)
             self.bar_shown = True

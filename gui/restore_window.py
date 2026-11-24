@@ -33,6 +33,9 @@ from tkinter import messagebox, ttk
 import restore_engine as E
 import restore_preflight as R
 from gui import background, theme
+from gui.components.dialogs import place_window
+from gui.components.tables import setup_table
+from gui.timefmt import format_timestamp_text
 
 IDLE, CHECKING, SAFETY, RESTORING, DONE = 'idle', 'checking', 'safety backup', 'restoring', \
     'done'
@@ -210,7 +213,7 @@ class RestoreWindow(tk.Toplevel):
         self.bind('<Destroy>', self._destroyed, add='+')
         self.title(f'{TITLE} - {device.hostname or device.ip} ({device.ip})')
         self.configure(background=theme.SURFACE)
-        self.geometry('1000x760')
+        place_window(self, parent, size=(1000, 760))      # scaled, on screen, centered
         self.protocol('WM_DELETE_WINDOW', self.close)
         self._build()
         self._show_selection()
@@ -232,10 +235,8 @@ class RestoreWindow(tk.Toplevel):
 
         self.tree = ttk.Treeview(self, columns=('status', 'check', 'text'), show='headings',
                                  height=10, style='Data.Treeview')
-        for key, title, width in (('status', 'Result', 80), ('check', 'Check', 190),
-                                  ('text', 'Explanation', 700)):
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor='w', stretch=key == 'text')
+        setup_table(self.tree, [('status', 'Result', 80), ('check', 'Check', 190, 'w'),
+                                ('text', 'Explanation', 700)])
         self.tree.pack(fill='both', expand=True, padx=pad)
         self.summary_label = ttk.Label(self, text='', justify='left', wraplength=950)
         self.summary_label.pack(fill='x', padx=pad, pady=(4, 0))
@@ -297,7 +298,8 @@ class RestoreWindow(tk.Toplevel):
         folder, name = os.path.split(s.path)
         self.backup_label.config(text=(
             f'Backup: {name}  in {folder}\n'
-            f'Created {s.created_utc}, key_id={s.key_id}, configuration SHA-256 '
+            f'Created {format_timestamp_text(s.created_utc)}, key_id={s.key_id}, configuration '
+            f'SHA-256 '
             f'{s.plaintext_sha256}\n'
             f'Verification: verified when it was selected (AES-GCM, SHA-256, size, '
             f'configuration check); Run Checks verifies it again before anything else.'))

@@ -143,9 +143,11 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
     from gui.main_window import build_main_window, mock_lab_label
     from gui import apply_guard, restore_window
     import customtkinter as ctk
+    from gui import window_state
     root = (make_root or ctk.CTk)()          # a Tk window with the dark title bar and scaling support
     root.title(window_title(demo, startup_problem, access, mock_lab_label()))
-    fit_to_screen(root)
+    window_state.place(root)                 # the remembered size and place, or a good first one
+    window_state.remember(root)
     outcome = {'value': CLOSED, 'done': False, 'deferred': None, 'after_apply': None,
                'apply_wait': False}
     account = None
@@ -246,6 +248,8 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
     refs = build_main_window(root, store, demo, startup_problem=startup_problem,
                              access=access, account=account, console_backend=console_backend(),
                              dev_lock_reset=dev_lock_reset)
+    from gui import theme as _theme
+    _theme.watch_dpi(root)                   # another monitor / scaling: sizes follow
     if session is not None:
         refs['session_watcher'] = SessionWatcher(root, client, session, session_ended)
         root.protocol('WM_DELETE_WINDOW', close_window)
@@ -282,6 +286,8 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
 
 
 def main():
+    from gui import ui_scale
+    ui_scale.enable_dpi_awareness()          # before any window: sharp text at 125 % / 150 %
     keep_history()                           # the Console shows everything since app start
     log_event('app', 'NetCommand started.')
     if '--demo' in sys.argv:                 # DEMO MODE: only ever by asking for it
@@ -323,6 +329,9 @@ def main():
         finally:
             event_log.set_user(None)
             event_log.save_now()             # nothing logged is lost on sign-out or close
+            # The next person's Console starts fresh: this user's lines leave memory (they
+            # stay saved; the Logs page shows them to whoever may see them).
+            event_log.clear_history()
         if ended != SIGNED_OUT:
             return
 

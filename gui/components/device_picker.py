@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from gui import theme
+from gui.components.tables import setup_table
 
 ON, OFF = '☑', '☐'
 FILTERS = {'All types': None, 'Switches': 'switch', 'Routers': 'router'}
@@ -52,12 +53,8 @@ class DevicePicker(ttk.Frame):
         self.tree = ttk.Treeview(holder, columns=('check', 'name', 'ip', 'type'),
                                  show='headings', height=8, selectmode='browse',
                                  style='Data.Treeview')
-        for key, title, width, stretch in (('check', '', 30, False), ('name', 'Device', 96, True),
-                                           ('ip', 'IP address', 118, True),
-                                           ('type', 'Type', 66, False)):
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, minwidth=width if not stretch else 60,
-                             stretch=stretch, anchor='center' if key == 'check' else 'w')
+        setup_table(self.tree, [('check', '', 30, 'center'), ('name', 'Device', 100),
+                                ('ip', 'IP address', 118), ('type', 'Type', 66)])
         ys = ttk.Scrollbar(holder, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=ys.set)
         self.tree.grid(row=0, column=0, sticky='nsew')

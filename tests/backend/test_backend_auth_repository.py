@@ -166,8 +166,8 @@ def test_verification_then_approval_is_audited(repo):
     u = repo.get_user(uid)
     assert (u['status'], u['role'], u['approved_by']) == ('active', 'operator', boss)
     (row,) = repo.list_audit(action='user.approved')
-    assert (row['actor_user_id'], row['target_id'], row['detail']) == (boss, str(uid),
-                                                                       'role operator')
+    assert (row['actor_user_id'], row['target_id'], row['detail']) == (
+        boss, str(uid), 'role — -> operator; status pending_approval -> active')
 
 
 def test_only_another_active_admin_can_approve(repo):

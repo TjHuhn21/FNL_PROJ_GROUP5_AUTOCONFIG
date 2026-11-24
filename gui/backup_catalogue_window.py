@@ -12,6 +12,9 @@ from tkinter import messagebox, ttk
 
 import backup_catalogue as B
 from gui import background, theme
+from gui.components.dialogs import place_window
+from gui.timefmt import format_timestamp_text
+from gui.components.tables import setup_table
 
 COLUMNS = [('created', 'Created (UTC)', 150), ('host', 'Device IP', 100),
            ('hostname', 'Hostname', 110), ('platform', 'Platform', 110),
@@ -36,7 +39,7 @@ class BackupCatalogueWindow(tk.Toplevel):
         self.entries, self.verifications, self.busy = {}, {}, False
         self.title(f'Backups - {device.hostname or device.ip} ({device.ip})')
         self.configure(background=theme.SURFACE)
-        self.geometry('1180x620')
+        place_window(self, parent, size=(1180, 620))      # scaled, on screen, centered
 
         top = ttk.Frame(self, padding=theme.PAD)
         top.pack(fill='x')
@@ -49,9 +52,7 @@ class BackupCatalogueWindow(tk.Toplevel):
 
         self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS], show='headings',
                                  selectmode='browse', style='Data.Treeview', height=12)
-        for key, title, width in COLUMNS:
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor='w')
+        setup_table(self.tree, COLUMNS)
         self.tree.pack(fill='both', expand=True, padx=theme.PAD)
         self.tree.bind('<<TreeviewSelect>>', lambda e: self.show_details())
 
@@ -109,8 +110,10 @@ class BackupCatalogueWindow(tk.Toplevel):
             match_text = m.summary if m else ''
             if m and not e.trusted:
                 match_text += ' (unverified)'
+            # shown in local 12-hour time; the order above uses the stored UTC value
             self.tree.insert('', 'end', iid=e.path, values=(
-                e.field('created_utc') or '', e.field('host') or '', ident['hostname'],
+                format_timestamp_text(e.field('created_utc')), e.field('host') or '',
+                ident['hostname'],
                 ident['platform'], ident['serial'], ident['ios_version'], e.field('key_id') or '',
                 e.field('source') or '', e.size, short(e.field('plaintext_sha256')),
                 e.status + (' (duplicate copy)' if e.duplicate_of else ''), match_text))
@@ -142,7 +145,8 @@ class BackupCatalogueWindow(tk.Toplevel):
             lines.append(f'Duplicate copy of: {e.duplicate_of}')
         if e.header:
             lines += [f"Device IP {e.field('host') or 'not recorded'}, created "
-                      f"{e.field('created_utc')}, source {e.field('source') or 'not recorded'}, "
+                      f"{format_timestamp_text(e.field('created_utc'))}, source "
+                      f"{e.field('source') or 'not recorded'}, "
                       f"key {e.field('key_id')}",
                       f"Configuration SHA-256: {e.field('plaintext_sha256')} "
                       f"({e.field('plaintext_size')} bytes)",

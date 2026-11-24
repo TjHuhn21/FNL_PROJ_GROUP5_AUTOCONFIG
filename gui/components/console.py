@@ -34,6 +34,7 @@ from tkinter import ttk
 
 from gui import event_log, theme
 from gui.db_status import report_error
+from gui.components.wrap_frame import WrapFrame
 from gui.timefmt import format_date_time, now_text
 
 LEVEL_COLORS = {'info': None, 'ok': theme.SUCCESS, 'warn': theme.WARNING, 'error': theme.DANGER}
@@ -164,14 +165,15 @@ class OperationsConsole(tk.Frame):
         """All | Successful | Failed | Warnings | Changes (several may be chosen), then
         Category, Device, User, Search, Show commands and Reset filters. Filters only
         change what is shown: nothing is ever deleted."""
-        bar = tk.Frame(parent, background=theme.SURFACE)
+        # wraps onto a second line on a narrow window instead of cutting controls off
+        bar = WrapFrame(parent, background=theme.SURFACE)
         self.selected_tags = set()                       # empty: All
         self.tag_buttons = {}
         for key, label in [('all', 'All')] + [(t, FILTER_LABELS[t]) for t in FILTER_TAGS]:
             b = tk.Button(bar, text=label, font=theme.FONT_SMALL, relief='flat', borderwidth=1,
                           padx=8, pady=1, cursor='hand2',
                           command=lambda k=key: self.toggle_filter(k))
-            b.pack(side='left', padx=(0, 3))
+            bar.add(b, padx=(0, 3))
             self.tag_buttons[key] = b
         self.category = tk.StringVar(value=ALL_CATEGORIES)
         self.device = tk.StringVar(value=ALL_DEVICES)
@@ -185,18 +187,20 @@ class OperationsConsole(tk.Frame):
                 ('user', self.user, [ALL_USERS], 22)):
             box = ttk.Combobox(bar, textvariable=var, values=values, width=width,
                                state='readonly', font=theme.FONT_SMALL)
-            box.pack(side='left', padx=(8 if key == 'category' else 3, 0))
+            bar.add(box, padx=(8 if key == 'category' else 3, 0))
             box.bind('<<ComboboxSelected>>', lambda e: self.apply_filters())
             self.boxes[key] = box
-        tk.Label(bar, text='Search:', font=theme.FONT_SMALL, background=theme.SURFACE,
-                 foreground=theme.TEXT_MUTED).pack(side='left', padx=(8, 2))
-        entry = ttk.Entry(bar, textvariable=self.search, width=16, font=theme.FONT_SMALL)
+        find = tk.Frame(bar, background=theme.SURFACE)      # 'Search:' and its box stay together
+        tk.Label(find, text='Search:', font=theme.FONT_SMALL, background=theme.SURFACE,
+                 foreground=theme.TEXT_MUTED).pack(side='left', padx=(0, 2))
+        entry = ttk.Entry(find, textvariable=self.search, width=16, font=theme.FONT_SMALL)
         entry.pack(side='left')
+        bar.add(find, padx=(8, 0))
         entry.bind('<KeyRelease>', lambda e: self.apply_filters())
-        ttk.Checkbutton(bar, text='Show commands', variable=self.show_commands,
-                        command=self.apply_filters).pack(side='left', padx=(8, 0))
-        ttk.Button(bar, text='Reset filters', command=self.reset_filters,
-                   style='Console.TButton').pack(side='left', padx=(8, 0))
+        bar.add(ttk.Checkbutton(bar, text='Show commands', variable=self.show_commands,
+                                command=self.apply_filters), padx=(8, 0))
+        bar.add(ttk.Button(bar, text='Reset filters', command=self.reset_filters,
+                           style='Console.TButton'), padx=(8, 0))
         self._paint_buttons()
         return bar
 

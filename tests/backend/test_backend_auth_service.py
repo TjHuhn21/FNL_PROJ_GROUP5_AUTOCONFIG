@@ -494,8 +494,12 @@ def test_reject_and_last_admin_protection(env):
     target = env.user('p@example.com', status='pending_approval')
     assert env.svc.reject_account(admin.token, target) is True
     assert env.repo.get_user(target)['status'] == 'rejected'
-    with pytest.raises(InvalidRequest, match='no active admin'):
-        env.svc.disable_account(admin.token, admin_id)
+    with pytest.raises(InvalidRequest, match='your own account'):
+        env.svc.disable_account(admin.token, admin_id)     # never oneself
+    assert env.repo.get_user(admin_id)['status'] == 'active'
+    # the last active admin cannot be disabled by anyone: the repository refuses it
+    with pytest.raises(Exception, match='at least one active admin'):
+        env.repo.set_status(admin_id, 'disabled', actor_user_id=None)
 
 
 # ================================================================ secrets

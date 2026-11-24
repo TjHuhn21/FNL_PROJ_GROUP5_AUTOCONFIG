@@ -254,6 +254,11 @@ def test_viewer_is_read_only(root, backend, monkeypatch):
     refs['show_page']('devices')
     assert refs['current_page']() == 'devices'                      # viewing is allowed
     assert 'Viewer' in refs['user_label'].cget('text')
+    # the signed-in e-mail is shown masked; the session keeps the full one for the server
+    from gui.auth_window import mask_email
+    shown = refs['user_label'].cget('text')
+    assert shown == f'{mask_email(session.email)} · Viewer'
+    assert session.email not in shown and session.email == 'viewer@example.com'
 
 
 def test_operator_can_scan_and_configure_but_not_manage_accounts(root, backend, monkeypatch):

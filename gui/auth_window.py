@@ -166,7 +166,7 @@ class SignInWindow(ttk.Frame):
     def _field(self, frame, label, var, secret=False):
         self._label(frame, label)
         entry = ttk.Entry(frame, textvariable=var, width=40, show='*' if secret else '',
-                          font=(theme.FONT_FAMILY, 11))
+                          font=theme.font(11))
         entry.pack(fill='x', pady=(0, 10), ipady=3)
         return entry
 

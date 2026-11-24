@@ -20,6 +20,7 @@ from tkinter import messagebox, ttk
 
 from gui import theme
 from gui.components.field_check import CheckedEntry
+from gui.components.tables import setup_table
 
 
 class ListEditor(ttk.Frame):
@@ -66,9 +67,7 @@ class ListEditor(ttk.Frame):
         self._update_add()
         self.tree = ttk.Treeview(self, columns=[c[0] for c in columns], show='headings',
                                  height=height)
-        for key, heading, width in columns:
-            self.tree.heading(key, text=heading)
-            self.tree.column(key, width=width, minwidth=min(width, 60), anchor='w')
+        setup_table(self.tree, columns)
         self.tree.pack(fill='x', pady=(8, 4))
 
     def values(self):

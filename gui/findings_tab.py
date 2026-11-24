@@ -19,8 +19,10 @@ from tkinter import ttk, messagebox
 from gui import theme
 from gui.db_status import database_ready, report_error
 from gui.event_log import log_event
+from gui.timefmt import format_datetime
 from review.rules import POINTS, review_network
 from store_errors import outcome_text
+from gui.components.tables import setup_table
 
 EMPTY_MESSAGE = ('No registered devices yet, so there is nothing to review. '
                  'Run a scan and approve devices first.')
@@ -92,9 +94,7 @@ class FindingsTab(ttk.Frame):
                 ('rule', 'Rule', 170), ('message', 'Message', 520)]
         self.tree = ttk.Treeview(self, columns=[c[0] for c in cols], show='headings',
                                  selectmode='browse')
-        for key, title, width in cols:
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor='w')
+        setup_table(self.tree, cols)
         for sev, color in theme.SEVERITY_COLORS.items():
             self.tree.tag_configure(sev, background=color)
         self.tree.pack(fill='both', expand=True, pady=theme.PAD)
@@ -288,7 +288,7 @@ class FindingsTab(ttk.Frame):
             self.note.config(text=NO_STORED_MESSAGE, style='TLabel', foreground=theme.TEXT_SOFT)
             return
         score = max(0, 100 - sum(POINTS[f['severity']] for f in found))
-        when = snapshot['saved_at'].strftime('%Y-%m-%d %H:%M') if snapshot['saved_at'] else '?'
+        when = format_datetime(snapshot['saved_at']) if snapshot['saved_at'] else '?'
         gone = sorted({f['device'] for f in found if f.get('device_deleted')})
         self.score.config(text=f'Health score: {score} / 100   ({len(found)} findings)   '
                                f'STORED REVIEW')

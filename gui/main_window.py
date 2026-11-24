@@ -22,12 +22,13 @@ from tkinter import ttk
 import customtkinter as ctk
 
 import services
-from gui import theme
+from gui import theme, ui_scale, window_state
+from gui.auth_window import mask_email
 from gui.event_log import event_word, install_dialog_logging, log_event
 from gui.components.command_strip import CommandStrip
 from gui.components.console import OperationsConsole
 from gui.components.inspector import Inspector
-from gui.components.rail import Rail
+from gui.components.rail import COMPACT_BELOW_HEIGHT, Rail
 from gui.configure_tab import ConfigureTab
 from gui.db_status import DatabaseStatus, report_error
 from gui.device_login_guard import DeviceLoginGuard
@@ -47,6 +48,14 @@ PAGES = [('dashboard', 'Overview'), ('scan', 'Scan'), ('devices', 'Devices'),
          ('topology', 'Topology'), ('findings', 'Findings'), ('configure', 'Configure'),
          ('setup', 'Setup'), ('logs', 'Logs')]
 FIRST_PAGE = 'dashboard'
+# Layout by window size (logical pixels: after Windows scaling)
+INSPECTOR_AUTO_HIDE_BELOW = 1400   # narrower: the inspector hides itself ('Show inspector')
+CONSOLE_SHARE = 0.25               # the bottom panel's first height: a quarter of the window
+CONSOLE_SHARE_COMPACT = 0.18       # on Configure, which has its own SSH session
+CONSOLE_MIN_HEIGHT = 90            # design pixels: never smaller than this
+CONSOLE_MAX_SHARE = 0.65           # nor taller than this share of the window
+LAYOUT_HYSTERESIS = 60             # logical pixels between switching a layout off and on again
+RESIZE_SETTLE_MS = 250             # layout changes wait until the window edge stops moving
 
 # Set to 1 only by the mock lab launcher (mock-lab/run_netcommand.py). DISPLAY ONLY: it adds
 # this label to the title and the status bar and changes nothing else.
@@ -137,7 +146,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         who = ctk.CTkFrame(header, fg_color=theme.SURFACE, corner_radius=0)
         who.grid(row=0, column=4, padx=(0, 10))
         refs['user_label'] = ctk.CTkLabel(
-            who, text=f'{account.session.email} · {access.title}', font=theme.mono(9),
+            # shown masked; the full address stays in the session for the server calls
+            who, text=f'{mask_email(account.session.email)} · {access.title}', font=theme.mono(9),
             text_color=theme.TEXT_SOFT)
         refs['user_label'].pack(side='left', padx=(0, 8))
         refs['sign_out_button'] = ctk.CTkButton(
@@ -334,7 +344,14 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     refs['findings'] = FindingsTab(host, store, lambda: services.collect_review_inputs(store, demo_store),
                                    send_to_configure, sample_store=demo_store)
     refs['findings'].on_saved = overview_stale
-    refs['logs'] = LogsTab(host, store)
+    # Activity history: admins see everyone's; other roles only their own lines and the
+    # automatic ('system') ones. (Enforced by this app: see the Logs page notes.)
+    if access is not None and not access.demo and not access.can(MANAGE_ACCOUNTS):
+        from gui import event_log as _ev
+        scope = lambda: (_ev.current_user(), _ev.SYSTEM)       # noqa: E731
+    else:
+        scope = None
+    refs['logs'] = LogsTab(host, store, scope_users=scope)
     if allowed('setup'):                    # not even built for roles that may not use it
         refs['setup'] = SetupTab(host, log=log_event, backend=console_backend)
     refs['dashboard'] = OverviewPage(
@@ -453,15 +470,16 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     refs['inspector_toggle'] = ctk.CTkButton(
         status, text='Hide inspector', font=theme.mono(8), height=20, width=110,
         corner_radius=3, fg_color=theme.SURFACE_2, hover_color=theme.BORDER,
-        text_color=theme.TEXT_SOFT, command=lambda: set_inspector(not inspector_shown(),
-                                                                   remember=True))
+        text_color=theme.TEXT_SOFT, command=lambda: toggle_inspector())
     refs['inspector_toggle'].pack(side='right', padx=(0, 4))
 
     # ---------------------------------------------------------------- collapsible inspector
     # Each page remembers whether it shows the inspector; Configure starts without it
     # (it needs the width). Selecting something to inspect always brings it back.
     inspector_pref = {'configure': False, 'setup': False}
-    console_size = {}                          # page -> console height (pixels) chosen there
+    # page -> console height (pixels) chosen there; kept between starts (window_state)
+    console_size = dict(window_state.get_setting('console_heights', {}) or {})
+    state['narrow'] = state['forced'] = False      # narrow window: inspector auto-hidden
 
     def inspector_shown():
         return str(refs['inspector']) in [str(p) for p in upper.panes()]
@@ -473,7 +491,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         if visible and not inspector_shown():
             upper.add(refs['inspector'], weight=0)
             root.update_idletasks()
-            width, wanted = upper.winfo_width(), int(theme.INSPECTOR_WIDTH * _scaling(root))
+            width, wanted = upper.winfo_width(), theme.INSPECTOR_WIDTH   # already scaled
             if width > 2 * wanted:
                 upper.sashpos(0, width - wanted)
         elif not visible and inspector_shown():
@@ -485,19 +503,88 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     refs['set_inspector'] = set_inspector
     refs['inspector_shown'] = inspector_shown
 
+    def console_limits(height):
+        """(minimum, maximum) height of the bottom panel for a window area this tall."""
+        low = ui_scale.space(CONSOLE_MIN_HEIGHT)
+        return low, max(low, int(height * CONSOLE_MAX_SHARE))
+
     def remember_console(page):
         height = outer.winfo_height()
         if page and height > 200:
             console_size[page] = height - outer.sashpos(0)
+            window_state.put_setting('console_heights', dict(console_size))
 
     def restore_console(page):
+        """The bottom panel's height for this page: the one chosen there (also in an
+        earlier session), else CONSOLE_SHARE of the window; never below the minimum."""
         height = outer.winfo_height()
         if height <= 200:
             return                                 # not laid out yet: place_dividers does it
-        s = _scaling(root)
-        default = theme.CONSOLE_HEIGHT_COMPACT if page == 'configure' else theme.CONSOLE_HEIGHT
-        wanted = console_size.get(page, int(default * s))
-        outer.sashpos(0, max(int(height * 0.35), height - wanted))
+        share = CONSOLE_SHARE_COMPACT if page == 'configure' else CONSOLE_SHARE
+        low, high = console_limits(height)
+        wanted = min(high, max(low, console_size.get(page, int(height * share))))
+        outer.sashpos(0, height - wanted)
+
+    def divider_released(_event=None):
+        """After dragging the bottom panel's divider: keep it within its limits, and
+        remember the size for this page."""
+        height = outer.winfo_height()
+        if height <= 200:
+            return
+        low, high = console_limits(height)
+        console = height - outer.sashpos(0)
+        if not low <= console <= high:
+            outer.sashpos(0, height - min(high, max(low, console)))
+        remember_console(state['current'])
+    outer.bind('<ButtonRelease-1>', divider_released, add='+')
+
+    def adapt_layout():
+        """The window changed size: hide the inspector on a narrow window (the 'Show
+        inspector' button still brings it back), and show the rail as icons only on a
+        short one. Debounced, so dragging the window edge stays smooth."""
+        state['adapt_job'] = None
+        if 'nav' not in refs:
+            return
+        try:
+            width, height = root.winfo_width(), root.winfo_height()
+        except tk.TclError:
+            return
+        if width <= 1:
+            return
+        scale = ui_scale.dpi_scale()
+        # a margin (LAYOUT_HYSTERESIS) between hiding and showing again, so dragging the edge
+        # near the limit does not make the inspector or the rail labels flicker
+        if state['narrow']:
+            narrow = width / scale < INSPECTOR_AUTO_HIDE_BELOW + LAYOUT_HYSTERESIS
+        else:
+            narrow = width / scale < INSPECTOR_AUTO_HIDE_BELOW
+        if narrow != state['narrow']:
+            state['narrow'], state['forced'] = narrow, False
+            if narrow:
+                set_inspector(False)
+            elif state['current']:
+                set_inspector(inspector_pref.get(state['current'], True))
+        limit = COMPACT_BELOW_HEIGHT + (LAYOUT_HYSTERESIS if refs['nav'].compact else 0)
+        refs['nav'].set_compact(height / scale < limit)
+
+    def window_resized(event):
+        if event.widget is not root:
+            return
+        job = state.get('adapt_job')
+        if job is not None:
+            try:
+                root.after_cancel(job)
+            except tk.TclError:
+                pass
+        state['adapt_job'] = root.after(RESIZE_SETTLE_MS, adapt_layout)   # once dragging pauses
+    root.bind('<Configure>', window_resized, add='+')
+    refs['adapt_layout'] = adapt_layout
+
+    def toggle_inspector():
+        show = not inspector_shown()
+        if show and state['narrow']:
+            state['forced'] = True                 # asked for on a narrow window: keep it
+        set_inspector(show, remember=True)
 
     def update_status():
         try:
@@ -538,7 +625,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         refs[key].grid(row=0, column=0, sticky='nsew')
         refs['nav'].set_active(key)
         state['current'] = key
-        set_inspector(inspector_pref.get(key, True))
+        set_inspector(inspector_pref.get(key, True) and (not state['narrow'] or state['forced']))
         restore_console(key)
         if key in on_show:
             on_show[key]()
@@ -553,11 +640,10 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     def place_dividers():
         """Start with the inspector and console at their default sizes."""
         root.update_idletasks()
-        s = _scaling(root)
         width, height = upper.winfo_width(), outer.winfo_height()
-        if inspector_shown() and width > 2 * theme.INSPECTOR_WIDTH * s:
-            upper.sashpos(0, int(width - theme.INSPECTOR_WIDTH * s))
-        if height > 2 * theme.CONSOLE_HEIGHT * s:
+        if inspector_shown() and width > 2 * theme.INSPECTOR_WIDTH:
+            upper.sashpos(0, int(width - theme.INSPECTOR_WIDTH))
+        if height > 2 * theme.CONSOLE_HEIGHT:
             restore_console(state['current'])
 
     if demo_store:
@@ -568,8 +654,10 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     if access is not None and access.demo:
         log_event('app', 'DEMO MODE: started with --demo, so nobody is signed in.', 'warn')
     elif account is not None:
-        log_event('app', f'Sign-in SUCCESSFUL: {account.session.email} ({access.title}).', 'ok')
+        log_event('app', f'Sign-in SUCCESSFUL: {mask_email(account.session.email)} '
+                         f'({access.title}).', 'ok')
     log_event('app', 'NetCommand workbench started.')
     show_page(FIRST_PAGE)
     root.after(50, place_dividers)
+    root.after(80, adapt_layout)
     return refs

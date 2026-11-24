@@ -149,6 +149,8 @@ def test_every_page_has_an_icon():
 # ---------------------------------------------------------------- resizable panels
 def test_workbench_panels_can_be_resized(app):
     root, r = app
+    from gui_helpers import wide_window
+    wide_window(root, r)                  # a narrow window hides the inspector by itself
     upper, outer = r['panels']['upper'], r['panels']['outer']
     assert len(upper.panes()) == 2 and len(outer.panes()) == 2   # page|inspector over console
     root.update()

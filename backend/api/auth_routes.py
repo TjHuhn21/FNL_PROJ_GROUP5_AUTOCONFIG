@@ -378,6 +378,27 @@ def disable_user(request: Request, user_id: int = UserId, token: str = Depends(b
                         headers={'Cache-Control': 'no-store'})
 
 
+@admin.post('/users/{user_id}/enable')
+def enable_user(request: Request, user_id: int = UserId, token: str = Depends(bearer_token),
+                _admin=Depends(require_admin), service=Depends(get_auth_service)):
+    """disabled -> active (admins only; never one's own account). It keeps its role."""
+    if not guarded(service.enable_account, token, user_id, **client_context(request)):
+        return _no_change('The account is not disabled.')
+    return JSONResponse({'user_id': user_id, 'status': 'active'},
+                        headers={'Cache-Control': 'no-store'})
+
+
+@admin.post('/users/{user_id}/reopen')
+def reopen_user(request: Request, user_id: int = UserId, token: str = Depends(bearer_token),
+                _admin=Depends(require_admin), service=Depends(get_auth_service)):
+    """rejected -> pending_approval (admins only): it waits for approval again, with no
+    role until then. Nothing is deleted."""
+    if not guarded(service.reopen_account, token, user_id, **client_context(request)):
+        return _no_change('The account is not rejected.')
+    return JSONResponse({'user_id': user_id, 'status': 'pending_approval'},
+                        headers={'Cache-Control': 'no-store'})
+
+
 @admin.post('/users/{user_id}/unlock')
 def unlock_user(request: Request, user_id: int = UserId, token: str = Depends(bearer_token),
                 _admin=Depends(require_admin), service=Depends(get_auth_service)):

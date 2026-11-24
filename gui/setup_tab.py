@@ -55,6 +55,8 @@ from console.ports import discover_ports
 import validators
 from gui import background, theme
 from gui.components.scroll_frame import ScrollFrame, bind_wheel
+from gui.timefmt import format_time
+from gui.components.tables import setup_table
 
 # ---------------------------------------------------------------- page states
 DISCONNECTED, DISCOVERING_PORTS, CONNECTING = 'disconnected', 'discovering_ports', 'connecting'
@@ -257,7 +259,7 @@ class SetupTab(ttk.Frame):
     # ================================================================ layout
     def _heading(self, parent, text):
         ttk.Separator(parent).pack(fill='x', pady=(theme.PAD * 2, theme.PAD))
-        label = ttk.Label(parent, text=text, font=(theme.FONT_FAMILY, 12, 'bold'))
+        label = ttk.Label(parent, text=text, font=theme.font(12, 'bold'))
         label.pack(anchor='w', pady=(0, theme.PAD))
         return label
 
@@ -324,7 +326,7 @@ class SetupTab(ttk.Frame):
         self.connect_btn.pack(side='left')
         self.disconnect_btn = ttk.Button(bar, text='Disconnect', command=self.disconnect)
         self.disconnect_btn.pack(side='left', padx=theme.PAD)
-        self.status_dot = tk.Label(bar, text='●', font=(theme.FONT_FAMILY, 14),
+        self.status_dot = tk.Label(bar, text='●', font=theme.font(14),
                                    background=theme.BG)
         self.status_dot.pack(side='left', padx=(theme.PAD * 2, 4))
         self.status_label = ttk.Label(bar, text='', style='Form.TLabel')
@@ -762,7 +764,7 @@ class SetupTab(ttk.Frame):
                 self.preview_error.configure(text=NO_NEW_PREVIEW)
             self._refresh_staleness()
         self.progress_label.configure(text=f'Detection finished at '
-                                           f'{self.result_time:%H:%M:%S}. ' +
+                                           f'{format_time(self.result_time, True)}. ' +
                                            ('' if result.complete else 'Some commands were not '
                                                                        'run.'))
         self._log(f'Detection finished: SSH {SSH_TEXT[result.ssh.status][0].lower()}'
@@ -864,7 +866,7 @@ class SetupTab(ttk.Frame):
         self._refresh_staleness()
         label = self.result_widgets.get('live')
         if label is not None:
-            when = f'{self.result_time:%H:%M:%S}' if self.result_time else 'earlier'
+            when = format_time(self.result_time, True) if self.result_time else 'earlier'
             label.configure(text=f'EARLIER RESULT: read at {when} during a console session that '
                                  f'has ended. It is not live information.',
                             background=theme.WARNING_SOFT, foreground=theme.WARNING)
@@ -875,13 +877,12 @@ class SetupTab(ttk.Frame):
         w = self.result_widgets = {}
         parent = self.results
         if result.simulated:
-            w['simulated'] = tk.Label(parent, text=SIMULATED_BANNER, font=(theme.FONT_FAMILY, 13,
-                                                                           'bold'),
+            w['simulated'] = tk.Label(parent, text=SIMULATED_BANNER, font=theme.font(13, 'bold'),
                                       background=theme.DANGER_SOFT, foreground=theme.DANGER,
                                       padx=12, pady=6, anchor='w')
             w['simulated'].pack(fill='x', pady=(0, 4))
         w['live'] = tk.Label(parent, text=f'Live result from the connected device (read at '
-                                          f'{self.result_time:%H:%M:%S}).'
+                                          f'{format_time(self.result_time, True)}).'
                              if self.result_time else 'Live result.',
                              background=theme.ACCENT_SOFT, foreground=theme.ACCENT,
                              font=theme.FONT, padx=10, pady=4, anchor='w')
@@ -909,7 +910,7 @@ class SetupTab(ttk.Frame):
         ssh_box.pack(fill='x', pady=(theme.PAD, 0))
         ttk.Label(ssh_box, text='SSH Status', font=theme.FONT_FORM_BOLD).pack(anchor='w')
         w['ssh_badge'] = tk.Label(ssh_box, text=f'{title}   ({s.status.name})',
-                                  font=(theme.FONT_FAMILY, 12, 'bold'), background=soft,
+                                  font=theme.font(12, 'bold'), background=soft,
                                   foreground=color, padx=12, pady=5, anchor='w')
         w['ssh_badge'].pack(fill='x', pady=(4, 2))
         w['ssh_sentence'] = ttk.Label(ssh_box, text=sentence, style='Form.TLabel')
@@ -979,9 +980,7 @@ class SetupTab(ttk.Frame):
                 ('protocol', 'Protocol', 90), ('note', '', 200)]
         tree = ttk.Treeview(holder, columns=[c[0] for c in cols], show='headings',
                             height=min(len(result.interfaces), 8), style='Data.Treeview')
-        for key, title, width in cols:
-            tree.heading(key, text=title)
-            tree.column(key, width=width, anchor='w')
+        setup_table(tree, cols)
         for i in result.interfaces:
             tree.insert('', 'end', values=(i.name, i.ip or 'none', i.status, i.protocol,
                                            'likely management interface'
@@ -1189,10 +1188,10 @@ class SetupTab(ttk.Frame):
         if plan.simulated:
             w['first'] = w['simulated'] = tk.Label(
                 box, text=SIMULATED_BANNER + ' — this plan is for a simulated device.',
-                font=(theme.FONT_FAMILY, 12, 'bold'), background=theme.DANGER_SOFT,
+                font=theme.font(12, 'bold'), background=theme.DANGER_SOFT,
                 foreground=theme.DANGER, padx=12, pady=5, anchor='w')
             w['simulated'].pack(fill='x', pady=(0, 4))
-        when = f'{plan.detected_at:%H:%M:%S}' if plan.detected_at else 'unknown time'
+        when = format_time(plan.detected_at, True) if plan.detected_at else 'unknown time'
         made = tk.Label(box, text=f'Based on the detection at {when}. {PREVIEW_NOTICE}',
                         background=theme.ACCENT_SOFT, foreground=theme.ACCENT, font=theme.FONT,
                         padx=10, pady=4, anchor='w')
@@ -1210,9 +1209,7 @@ class SetupTab(ttk.Frame):
                 ('plan', 'What happens', 520)]
         tree = ttk.Treeview(holder, columns=[c[0] for c in cols], show='headings',
                             height=len(plan.items), style='Data.Treeview')
-        for key, title, width in cols:
-            tree.heading(key, text=title)
-            tree.column(key, width=width, anchor='w', stretch=key == 'plan')
+        setup_table(tree, cols)
         colors = {'configured': theme.SUCCESS_SOFT, 'missing': theme.SURFACE, 'unknown': theme.SURFACE_2,
                   'needs_attention': theme.WARNING_SOFT, 'conflict': theme.DANGER_SOFT,
                   'unsupported': theme.DANGER_SOFT}
@@ -1374,9 +1371,7 @@ class SetupTab(ttk.Frame):
         cols = [('step', 'Step', 300), ('status', 'Status', 130), ('details', 'Details', 600)]
         self.apply_tree = ttk.Treeview(holder, columns=[c[0] for c in cols], show='headings',
                                        height=4, style='Data.Treeview')
-        for key, title, width in cols:
-            self.apply_tree.heading(key, text=title)
-            self.apply_tree.column(key, width=width, anchor='w', stretch=key == 'details')
+        setup_table(self.apply_tree, cols)
         for status, color in APPLY_COLORS.items():
             self.apply_tree.tag_configure(status, background=color)
         self.apply_tree.grid(row=0, column=0, sticky='ew')

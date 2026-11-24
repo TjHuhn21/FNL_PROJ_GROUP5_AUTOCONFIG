@@ -41,6 +41,7 @@ from config import commands_router, commands_switch
 from config import connect, multi
 from config.interfaces import parse_ports, port_count
 from gui import theme
+from gui.components.tables import setup_table
 from gui.db_status import database_ready, report_error
 from gui.device_login_guard import SUCCESS, DeviceLoginGuard, outcome_of_apply, warning_text
 from gui.components.device_picker import DevicePicker, plural
@@ -119,6 +120,9 @@ class _DeviceBox:
 
     def event_generate(self, *args, **kwargs):
         self.tab._show_forms_for_device()
+
+
+CONFIGURE_NARROW_BELOW = 1150       # logical pixels: the device list gets a bigger share
 
 
 def _default_route_problem(text):
@@ -213,22 +217,37 @@ class ConfigureTab(ttk.Frame):
         self.session.pack(fill='both', expand=True)
         self._placed = False
         self.bind('<Configure>', self._place_dividers, add='+')
+        self.columns.bind('<ButtonRelease-1>', self._dividers_dragged, add='+')
         self.refresh_devices()
 
     def _place_dividers(self, event=None):
-        """Sensible starting sizes, once the page has its real size."""
-        if self._placed:
-            return
+        """The three columns (devices | settings | preview and SSH session) keep their
+        proportions when the window is resized: the starting ones, or the ones the user
+        dragged. On a narrow window the device list gets a bigger share (names and IP
+        addresses stay readable) until the user drags a divider."""
+        from gui import ui_scale
         width, height = self.columns.winfo_width(), self.right.winfo_height()
         if width < 500 or height < 200:
             return
-        self._placed = True
-        # Room for the larger device-list text: on narrow windows the device list gets a
-        # bigger share, so device names and IP addresses are not cut off.
-        first, second = (0.25, 0.56) if width >= 1100 else (0.30, 0.61)
-        self.columns.sashpos(0, int(width * first))
-        self.columns.sashpos(1, int(width * second))
-        self.right.sashpos(0, int(height * 0.5))
+        if not self._placed:
+            self._placed = True
+            self.right.sashpos(0, int(height * 0.5))
+        if width == getattr(self, '_placed_width', None):
+            return
+        self._placed_width = width
+        fractions = getattr(self, '_column_fractions', None)
+        if fractions is None:                          # not dragged: the defaults
+            narrow = width / ui_scale.dpi_scale() < CONFIGURE_NARROW_BELOW
+            fractions = (0.30, 0.61) if narrow else (0.25, 0.56)
+        self.columns.sashpos(0, int(width * fractions[0]))
+        self.columns.sashpos(1, int(width * fractions[1]))
+
+    def _dividers_dragged(self, _event=None):
+        """Remember the proportions the user chose (kept when the window is resized)."""
+        width = self.columns.winfo_width()
+        if width > 500:
+            self._column_fractions = (self.columns.sashpos(0) / width,
+                                      self.columns.sashpos(1) / width)
 
     # ------------------------------------------------------------ switch forms
     def _build_switch_forms(self, parent):
@@ -251,7 +270,7 @@ class ConfigureTab(ttk.Frame):
               'check': lambda t: V.check_vlan_id(t, 'native VLAN')},
              {'key': 'encapsulation', 'label': 'encapsulation dot1q', 'kind': 'check',
               'default': 1}],
-            [('ports', 'Ports', 110), ('allowed', 'Allowed', 90), ('native', 'Native', 60)],
+            [('ports', 'Ports', 180), ('allowed', 'Allowed', 150), ('native', 'Native', 60)],
             self._validate_trunk,
             note=PORT_HINT + '.  Allowed VLANs: for example 10,20,30-40 (empty = all).  '
                  'Untick dot1q on switches that only do 802.1Q (they reject the command).')
@@ -269,7 +288,7 @@ class ConfigureTab(ttk.Frame):
              {'key': 'violation', 'label': 'On violation', 'kind': 'combo',
               'values': ['shutdown', 'restrict', 'protect'], 'default': 'shutdown'},
              {'key': 'sticky', 'label': 'Learn MACs (sticky)', 'kind': 'check', 'default': 1}],
-            [('ports', 'Ports', 110), ('maximum', 'Max', 45), ('violation', 'Violation', 80),
+            [('ports', 'Ports', 200), ('maximum', 'Max', 50), ('violation', 'Violation', 80),
              ('sticky', 'Sticky', 55)],
             self._validate_port_security,
             note=PORT_HINT + '.  The ports are also set to access mode.')
@@ -307,9 +326,7 @@ class ConfigureTab(ttk.Frame):
         for e in (self.vid_entry, self.vname_entry):
             e.on_change = self._update_add_buttons
         self.vlan_tree = ttk.Treeview(box, columns=('id', 'name'), show='headings', height=4)
-        self.vlan_tree.heading('id', text='VLAN ID'); self.vlan_tree.heading('name', text='Name')
-        self.vlan_tree.column('id', width=80, minwidth=70, stretch=False)
-        self.vlan_tree.column('name', width=150, minwidth=80)
+        setup_table(self.vlan_tree, [('id', 'VLAN ID', 70), ('name', 'Name', 300)])
         self.vlan_tree.pack(fill='x', pady=(8, 4))
         ttk.Button(box, text='Remove selected VLAN', command=self.remove_vlan).pack(anchor='e')
 
@@ -337,9 +354,7 @@ class ConfigureTab(ttk.Frame):
         hint.pack(anchor='w', fill='x', pady=(4, 0))
         wrap_to_width(hint)
         self.port_tree = ttk.Treeview(box, columns=('port', 'vlan'), show='headings', height=3)
-        self.port_tree.heading('port', text='Ports'); self.port_tree.heading('vlan', text='VLAN')
-        self.port_tree.column('port', width=170, minwidth=100)
-        self.port_tree.column('vlan', width=70, minwidth=60, stretch=False)
+        setup_table(self.port_tree, [('port', 'Ports', 300), ('vlan', 'VLAN', 70)])
         self.port_tree.pack(fill='x', pady=(8, 4))
         ttk.Button(box, text='Remove selected ports', command=self.remove_port).pack(anchor='e')
 

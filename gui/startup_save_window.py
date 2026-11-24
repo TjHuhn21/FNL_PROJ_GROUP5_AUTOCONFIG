@@ -18,7 +18,9 @@ from tkinter import messagebox, ttk
 
 import startup_save as S
 from gui import restore_window as W
+from gui.components.tables import setup_table
 from gui import theme
+from gui.components.dialogs import place_window
 
 TITLE = 'Save to Startup'
 IDLE, CHECKING, SAVING, DONE = 'idle', 'checking', 'saving', 'done'
@@ -57,7 +59,7 @@ class StartupSaveWindow(tk.Toplevel):
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.title(f'{TITLE} - {device.hostname or device.ip} ({device.ip})')
         self.configure(background=theme.SURFACE)
-        self.geometry('920x660')
+        place_window(self, parent, size=(920, 660))       # scaled, on screen, centered
         self._build()
         self._update()
         self.after(100, self._drain)
@@ -79,10 +81,8 @@ class StartupSaveWindow(tk.Toplevel):
         )).pack(anchor='w')
         self.tree = ttk.Treeview(self, columns=('status', 'check', 'text'), show='headings',
                                  height=7, style='Data.Treeview')
-        for key, title, width in (('status', 'Result', 80), ('check', 'Check', 220),
-                                  ('text', 'Explanation', 600)):
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor='w', stretch=key == 'text')
+        setup_table(self.tree, [('status', 'Result', 80), ('check', 'Check', 220, 'w'),
+                                ('text', 'Explanation', 600)])
         self.tree.pack(fill='x', padx=pad)
         self.summary_label = ttk.Label(self, text='', justify='left', wraplength=880)
         self.summary_label.pack(fill='x', padx=pad, pady=(4, 0))

@@ -345,7 +345,9 @@ def test_admin_list_approve_reject_disable(api):
     assert api.post(f'/admin/users/{viewer_id}/disable', token=tokens['admin']).status_code == 409
     admin_id = api.repo.find_user_by_email('admin@example.com')['id']
     last = api.post(f'/admin/users/{admin_id}/disable', token=tokens['admin'])
-    assert last.status_code == 400 and 'no active admin' in last.json()['detail']
+    # an admin can never disable their own account (and here it is also the last admin)
+    assert last.status_code == 400 and 'your own account' in last.json()['detail']
+    assert api.repo.get_user(admin_id)['status'] == 'active'
 
 
 @pytest.mark.parametrize('path, body', [('/admin/users/0/approve', None),

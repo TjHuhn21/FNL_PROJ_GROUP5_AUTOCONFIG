@@ -68,6 +68,10 @@ from backend.mail.messages import NotEligibleForCode
 log = logging.getLogger('backend.auth')
 
 CODES_PER_HOUR = 5                  # codes per account and purpose in any hour
+# An account has a role only once approved (active) or disabled after that. Before (and
+# after a rejection) it has none: the role is chosen when the account is approved.
+ROLE_STATUSES = ('active', 'disabled')
+DEFAULT_APPROVAL_ROLE = 'viewer'
 
 
 @dataclass(frozen=True)
@@ -325,27 +329,84 @@ class AuthService:
         return self.authorize(token, ('admin',), action=action, **ctx)
 
     def list_accounts(self, token, status=None, limit=100, after_id=None):
+        """Accounts for an admin. An account that is not approved yet (or was rejected) has
+        NO role: its role is chosen when it is approved, so 'role' is None for it, whatever
+        an older version stored."""
         self._admin(token, {'client_ip': None, 'workstation_label': None},
                     'admin.list_accounts')
         try:
-            return self.repo.list_users(status=status, limit=limit, after_id=after_id)
+            rows = self.repo.list_users(status=status, limit=limit, after_id=after_id)
         except InvalidValue as err:
             raise InvalidRequest(str(err)) from None
+        for row in rows:
+            if row.get('status') not in ROLE_STATUSES:
+                row['role'] = None
+        return rows
+
+    def _refuse_self(self, admin, user_id, action, what, ctx):
+        """An administrator may not do `what` to their own account (audited)."""
+        try:
+            R.check_id(user_id, 'user_id')
+        except InvalidValue as err:
+            raise InvalidRequest(str(err)) from None
+        if user_id == admin.user_id:
+            self._audit(action, 'denied', actor_user_id=admin.user_id, target_id=user_id,
+                        detail=f'an administrator cannot {what} their own account', **ctx)
+            raise InvalidRequest(f'You cannot {what} your own account. Ask another '
+                                 f'administrator.')
 
     def approve_account(self, token, user_id, role=None, *, client_ip=None,
                         workstation_label=None):
+        """pending_approval -> active WITH the role chosen now (default viewer; any role an
+        older version stored is ignored). The account is then signed out everywhere (it has
+        no session yet; kept for safety), so it starts with exactly this role."""
         ctx = self._context(client_ip, workstation_label)
         admin = self._admin(token, ctx, 'user.approved')
+        role = role or DEFAULT_APPROVAL_ROLE
+        if role not in R.ROLES:
+            raise InvalidRequest(f'role must be one of: {", ".join(R.ROLES)}.')
+        self._refuse_self(admin, user_id, 'user.approved', 'approve', ctx)
         try:
-            return self.repo.approve_user(user_id, admin.user_id, role, **ctx)
+            approved = self.repo.approve_user(user_id, admin.user_id, role, **ctx)
         except InvalidValue as err:
             raise InvalidRequest(str(err)) from None
+        if approved:
+            ended = self.repo.revoke_user_sessions(user_id, 'role_changed')
+            if ended:
+                self._audit('auth.sessions_revoked', 'success', actor_user_id=admin.user_id,
+                            target_id=user_id, detail=f'approved; {ended} session(s) ended',
+                            **ctx)
+        return approved
 
     def reject_account(self, token, user_id, *, client_ip=None, workstation_label=None):
         ctx = self._context(client_ip, workstation_label)
         admin = self._admin(token, ctx, 'user.status_changed')
+        self._refuse_self(admin, user_id, 'user.status_changed', 'reject', ctx)
         try:
             return self.repo.set_status(user_id, 'rejected', expected_status='pending_approval',
+                                        actor_user_id=admin.user_id, **ctx)
+        except InvalidValue as err:
+            raise InvalidRequest(str(err)) from None
+
+    def enable_account(self, token, user_id, *, client_ip=None, workstation_label=None):
+        """disabled -> active (admin only, never one's own account). It keeps its role."""
+        ctx = self._context(client_ip, workstation_label)
+        admin = self._admin(token, ctx, 'user.status_changed')
+        self._refuse_self(admin, user_id, 'user.status_changed', 'enable', ctx)
+        try:
+            return self.repo.set_status(user_id, 'active', expected_status='disabled',
+                                        actor_user_id=admin.user_id, **ctx)
+        except InvalidValue as err:
+            raise InvalidRequest(str(err)) from None
+
+    def reopen_account(self, token, user_id, *, client_ip=None, workstation_label=None):
+        """rejected -> pending_approval (admin only): the account waits for approval again
+        and gets a role only when it is approved. Nothing is deleted (its history stays)."""
+        ctx = self._context(client_ip, workstation_label)
+        admin = self._admin(token, ctx, 'user.status_changed')
+        self._refuse_self(admin, user_id, 'user.status_changed', 're-open', ctx)
+        try:
+            return self.repo.set_status(user_id, 'pending_approval', expected_status='rejected',
                                         actor_user_id=admin.user_id, **ctx)
         except InvalidValue as err:
             raise InvalidRequest(str(err)) from None
@@ -382,6 +443,13 @@ class AuthService:
         target = self.repo.get_user(user_id)
         if target is None:
             raise InvalidRequest('The account does not exist.')
+        if target['status'] not in ROLE_STATUSES:
+            self._audit('user.role_changed', 'denied', actor_user_id=admin.user_id,
+                        target_id=user_id, detail=f"refused: the account is {target['status']}; "
+                                                  f'its role is chosen when it is approved',
+                        **ctx)
+            raise InvalidRequest('This account has no role yet: choose its role when you '
+                                 'approve it.')
         previous = target['role']
         try:
             changed = self.repo.set_role(user_id, role, actor_user_id=admin.user_id, **ctx)
@@ -402,6 +470,7 @@ class AuthService:
         """Disable the account, end all its sessions and cancel its open codes."""
         ctx = self._context(client_ip, workstation_label)
         admin = self._admin(token, ctx, 'user.status_changed')
+        self._refuse_self(admin, user_id, 'user.status_changed', 'disable', ctx)
         try:
             changed = self.repo.set_status(user_id, 'disabled', actor_user_id=admin.user_id,
                                            **ctx)

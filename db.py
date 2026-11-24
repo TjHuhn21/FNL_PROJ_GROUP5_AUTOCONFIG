@@ -630,8 +630,14 @@ def add_console_events(rows):
          [_console_row(r) for r in rows], many=True)
 
 
-def _console_filter(search='', tag='', user='', category='', device=''):
+def _console_filter(search='', tag='', user='', category='', device='', users=None):
+    """users: when given, only these users' lines (the Logs page for a non-admin: their
+    own lines and 'system')."""
     sql, params = 'FROM console_log WHERE 1 = 1', []
+    if users is not None:
+        users = [u for u in users if u] or ['']
+        sql += f" AND user_label IN ({', '.join(['%s'] * len(users))})"
+        params += list(users)
     if search:
         like = f'%{search}%'
         sql += (' AND (message LIKE %s OR result LIKE %s OR device LIKE %s OR device_ip LIKE %s'
@@ -647,15 +653,15 @@ def _console_filter(search='', tag='', user='', category='', device=''):
     return sql, params
 
 
-def count_console_events(search='', tag='', user='', category='', device=''):
-    sql, params = _console_filter(search, tag, user, category, device)
+def count_console_events(search='', tag='', user='', category='', device='', users=None):
+    sql, params = _console_filter(search, tag, user, category, device, users)
     return _run('SELECT COUNT(*) AS n ' + sql, params, 'one')['n']
 
 
 def get_console_events(search='', page=1, per_page=15, tag='', user='', category='',
-                       device=''):
+                       device='', users=None):
     """Newest first."""
-    sql, params = _console_filter(search, tag, user, category, device)
+    sql, params = _console_filter(search, tag, user, category, device, users)
     return _run('SELECT id, ' + ', '.join(CONSOLE_COLUMNS) + ' ' + sql +
                 ' ORDER BY id DESC LIMIT %s OFFSET %s',
                 params + [per_page, (max(page, 1) - 1) * per_page], 'all')

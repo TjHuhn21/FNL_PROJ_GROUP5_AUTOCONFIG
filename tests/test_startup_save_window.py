@@ -189,7 +189,9 @@ def test_opening_touches_nothing_and_checks_are_read_only(gui, monkeypatch):
     assert [r[0] for r in rows] == [S.PASS, S.WARNING, S.PASS]
     assert rows[0][1] == 'Verified restore' and rows[2][1] == 'No rollback timer'
     assert f'SAVE STARTUP {IP}' in win.phrase_label.cget('text')
-    assert 'SAVE TO STARTUP: CHECKS' in win.log_text.get('1.0', 'end')
+    # the log is written by the window's 100 ms drain timer: wait for it (it used to be
+    # read at once, which raced with that timer)
+    assert pump(gui.root, lambda: 'SAVE TO STARTUP: CHECKS' in win.log_text.get('1.0', 'end'))
     assert not W.busy(IP) and W.active_restores() == []
 
 

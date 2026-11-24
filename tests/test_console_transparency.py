@@ -353,6 +353,70 @@ def test_the_logs_page_shows_the_activity_history(console):
     assert page.total == 1
 
 
+def test_the_next_person_starts_with_a_fresh_console(monkeypatch):
+    """Sign-out clears the Console's memory: the next user sees their own session only.
+    Nothing saved is lost."""
+    from gui.components.console import OperationsConsole
+    from gui_helpers import new_root
+    db_fake.reset()
+    event_log.keep_history()
+    event_log.set_store(db_fake)
+    event_log.set_user(EMAIL)
+    log_event('accounts', 'Account ju*****f1@yahoo.com: role admin -> viewer', 'ok',
+              tags=['change'])
+    event_log.set_user(None)                       # signed out (main.py)
+    event_log.save_now()
+    event_log.clear_history()
+    log_event('app', 'Waiting for sign-in...')     # before the next sign-in: theirs
+    event_log.set_user('justine_f1@yahoo.com')
+    log_event('app', 'Sign-in SUCCESSFUL.', 'ok')
+    root = new_root()
+    try:
+        c = OperationsConsole(root, db_fake)       # the next user's workbench
+        c.flush()
+        assert [r['message'] for r in c.records] == ['Waiting for sign-in...',
+                                                     'Sign-in SUCCESSFUL.']
+        assert not any('role admin' in r['message'] for r in c.records)
+    finally:
+        root.destroy()
+    event_log.save_now()
+    assert db_fake.count_console_events(search='role admin -> viewer') == 1   # still saved
+
+
+def test_the_logs_page_shows_others_activity_only_to_admins(console):
+    root, c = console
+    from gui.logs_tab import ACTIVITY, ALL_USERS, LogsTab
+    event_log._store[0] = db_fake
+    for who in ('ad*****in@example.com', 'vi*****er@example.com', 'system'):
+        log_event('app', f'line of {who}', user=who)
+    event_log.save_now()
+
+    def page_for(scope):
+        p = LogsTab(root, db_fake, scope_users=scope)
+        p.view.set(ACTIVITY)
+        p.change_view()
+        return p
+    admin = page_for(None)
+    assert admin.total == 3
+    viewer = page_for(lambda: ('vi*****er@example.com', 'system'))
+    messages = {viewer.activity_tree.item(i)['values'][4]
+                for i in viewer.activity_tree.get_children()}
+    assert messages == {'line of vi*****er@example.com', 'line of system'}
+    assert list(viewer.user_box.cget('values')) == [ALL_USERS, 'vi*****er@example.com',
+                                                    'system']
+    viewer.user.set('ad*****in@example.com')       # even if set anyway: never shown
+    viewer.go_first()
+    assert viewer.total == 2
+
+
+def test_the_database_query_is_limited_to_the_allowed_users():
+    import db
+    sql, params = db._console_filter(users=('me', 'system'))
+    assert 'user_label IN (%s, %s)' in sql and params == ['me', 'system']
+    sql, params = db._console_filter()
+    assert 'user_label IN' not in sql
+
+
 def test_the_store_has_no_way_to_change_or_delete_history():
     import db
     for store in (db, db_fake):

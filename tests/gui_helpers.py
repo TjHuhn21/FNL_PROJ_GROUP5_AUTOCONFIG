@@ -23,6 +23,17 @@ def new_root(attempts=5):
             pytest.skip(f'cannot open a window: {text.splitlines()[0]}')
 
 
+def wide_window(root, refs, width=1600, height=900):
+    """Make the workbench a normal wide desktop window (a narrow one hides the inspector
+    by itself: gui/main_window.INSPECTOR_AUTO_HIDE_BELOW) and apply the layout now."""
+    from gui import ui_scale
+    root.geometry(f'{int(width * ui_scale.dpi_scale())}x{int(height * ui_scale.dpi_scale())}')
+    root.update()
+    if 'adapt_layout' in refs:
+        refs['adapt_layout']()
+    root.update()
+
+
 def pump(root, cond, timeout=10):
     """Let the window run until cond() is true (or the timeout passes)."""
     end = time.time() + timeout

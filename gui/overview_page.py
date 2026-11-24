@@ -26,19 +26,36 @@ they were current).
 """
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from collections import Counter
 from datetime import date, datetime
 from tkinter import ttk
 
 from gui import theme
-from gui.components.scroll_frame import auto_scrollbar, bind_wheel
+from gui.components.scroll_frame import ScrollFrame, auto_scrollbar, bind_wheel
 from gui.db_status import report_error
 from gui.event_log import log_event
-from gui.timefmt import format_time, now_text
+from gui.timefmt import format_datetime, format_time, now_text
 from store_errors import DATABASE_ERRORS
+from gui.components.tables import DATE_SAMPLE_SHORT, setup_table
 
 RECENT_HOURS = 24    # the configuration card and list show only this many past hours
-BIG_FONT = (theme.FONT_FAMILY, 22, 'bold')       # the cards' big numbers
+# the page's layout by its width (logical pixels): 4 cards per row from CARDS_4_FROM, 2 from
+# CARDS_2_FROM, else 1; the 3 recent lists side by side from LISTS_SIDE_BY_SIDE_FROM
+CARDS_4_FROM, CARDS_2_FROM, LISTS_SIDE_BY_SIDE_FROM = 900, 520, 860
+RESIZE_SETTLE_MS = 250          # cards and big numbers change once the window edge stops
+BIG_NUMBER_POINTS = 22                            # the cards' big numbers at ~1200 px wide
+BIG_NUMBER_RANGE = (16, 34)                       # never smaller / larger (points, scaled)
+
+
+def big_number_size(page_width):
+    """The big numbers' size for a page this wide: they grow and shrink with the window,
+    within BIG_NUMBER_RANGE (both scaled by gui/ui_scale.py like every other font)."""
+    from gui import ui_scale
+    low, high = (ui_scale.font_size(n) for n in BIG_NUMBER_RANGE)
+    wanted = ui_scale.font_size(BIG_NUMBER_POINTS) * max(page_width, 1) / (
+        1200 * ui_scale.dpi_scale())
+    return int(max(low, min(high, round(wanted))))
 UP_ARROW, DOWN_ARROW = '▲', '▼'
 FRESH_SECONDS = 15
 AUTO_SECONDS = 60
@@ -163,7 +180,7 @@ def _sortable(when):
 
 
 def when_text(when, today=None):
-    """'2:02 PM' for today, 'Nov 19 2:02 PM' for another day, '' when unknown."""
+    """'2:02 PM' for today, 'Nov 19, 2026 2:02 PM' for another day, '' when unknown."""
     if not when:
         return ''
     when = _sortable(when)
@@ -171,7 +188,7 @@ def when_text(when, today=None):
         return ''
     if when.date() == (today or date.today()):
         return format_time(when)
-    return f"{when:%b %d} {format_time(when)}"
+    return format_datetime(when)
 
 
 def _short(text, limit=70):
@@ -224,9 +241,19 @@ class OverviewPage(tk.Frame):
         self.data, self.loaded_at, self.stale, self.error = None, None, True, None
         self.db_down = False                     # a known outage: no automatic queries
         self._auto = None
+        # the cards' big numbers: ONE shared font that follows the page width (debounced)
+        self.big_font = tkfont.Font(root=self, family=theme.FONT_FAMILY,
+                                    size=big_number_size(1200), weight='bold')
+        self._big_job = None
+        self.bind('<Configure>', self._resized, add='+')
 
         # ---- header
-        head = tk.Frame(self, background=theme.SURFACE)
+        # the whole page scrolls when the window is shorter than it needs; when it fits,
+        # it fills the height (the recent lists grow)
+        self.scroll = ScrollFrame(self, background=theme.SURFACE, fill_height=True)
+        self.scroll.pack(fill='both', expand=True)
+        page = self.scroll.inner
+        head = tk.Frame(page, background=theme.SURFACE)
         head.pack(fill='x', padx=16, pady=(12, 4))
         titles = tk.Frame(head, background=theme.SURFACE)
         titles.pack(side='left')
@@ -242,11 +269,11 @@ class OverviewPage(tk.Frame):
                                 foreground=theme.TEXT_MUTED)
         self.updated.pack(side='right', padx=(0, 10))
 
-        self.banner = tk.Label(self, text='', background=theme.DANGER_SOFT, foreground=theme.DANGER,
+        self.banner = tk.Label(page, text='', background=theme.DANGER_SOFT, foreground=theme.DANGER,
                                font=theme.FONT, anchor='w', justify='left', padx=12, pady=6,
                                wraplength=900)
 
-        body = tk.Frame(self, background=theme.SURFACE)
+        body = tk.Frame(page, background=theme.SURFACE)
         body.pack(fill='both', expand=True, padx=16, pady=(6, 12))
         self.body = body
 
@@ -254,23 +281,21 @@ class OverviewPage(tk.Frame):
         cards = tk.Frame(body, background=theme.SURFACE)
         cards.pack(fill='x')
         self.cards = {}
-        for col, (key, title) in enumerate([('devices', 'DEVICES'), ('status', 'STATUS (LAST KNOWN)'),
-                                            ('findings', 'FINDINGS'),
-                                            ('changes', 'CONFIGURATION CHANGES')]):
-            cards.grid_columnconfigure(col, weight=1, uniform='card')
+        for key, title in [('devices', 'DEVICES'), ('status', 'STATUS (LAST KNOWN)'),
+                           ('findings', 'FINDINGS'), ('changes', 'CONFIGURATION CHANGES')]:
             self.cards[key] = self._card(cards, title)
-            self.cards[key]['frame'].grid(row=0, column=col, sticky='nsew',
-                                          padx=(0 if col == 0 else 6, 0))
+        self._cards_frame, self._card_columns = cards, None
+        self._place_cards(4)
         # the status card's big indicator: green '▲ 3' and red '▼ 2' side by side (one
         # label cannot have two colours), replacing the card's single value label
         status = self.cards['status']
         status['value'].destroy()
         big = tk.Frame(status['frame'], background=theme.CARD)
         big.pack(fill='x', before=status['detail'])
-        status['value'] = tk.Label(big, text='—', font=BIG_FONT, background=theme.CARD,
+        status['value'] = tk.Label(big, text='—', font=self.big_font, background=theme.CARD,
                                    foreground=theme.TEXT_MUTED, anchor='w')
         status['value'].pack(side='left')
-        status['down'] = tk.Label(big, text='', font=BIG_FONT, background=theme.CARD,
+        status['down'] = tk.Label(big, text='', font=self.big_font, background=theme.CARD,
                                   foreground=theme.DANGER, anchor='w')
         status['tooltip'] = Tooltip([big, status['value'], status['down']])
         # the status card's per-type rows (Routers 1 up · 0 down), filled by _show
@@ -290,12 +315,10 @@ class OverviewPage(tk.Frame):
                  ('status', 'RECENT STATUS CHANGES', [('when', 'When', 90), ('device', 'Device', 120),
                                                       ('change', 'Change', 110),
                                                       ('detail', 'Details', 160)])]
-        for col, (key, title, columns) in enumerate(specs):
-            lists.grid_columnconfigure(col, weight=1, uniform='list')
+        for key, title, columns in specs:
             self.lists[key] = self._list(lists, title, columns)
-            self.lists[key]['frame'].grid(row=0, column=col, sticky='nsew',
-                                          padx=(0 if col == 0 else 6, 0))
-        lists.grid_rowconfigure(0, weight=1)
+        self._lists_frame, self._list_columns = lists, None
+        self._place_lists(3)
         tk.Label(body, text='Scans that were not approved are not stored, so scan activity shows '
                             'this session only; registered devices come from the database.',
                  font=theme.FONT_SMALL, background=theme.SURFACE, foreground=theme.TEXT_MUTED,
@@ -317,13 +340,50 @@ class OverviewPage(tk.Frame):
             self.actions[key] = b
         self.open_topology = self.actions.get('topology')     # kept for existing callers
 
+    # ------------------------------------------------------------ layout for the width
+    def reflow(self, width):
+        """Cards: 4 in a row on wide windows, 2 x 2 on smaller ones, 1 per row on very
+        narrow ones. The recent lists: 3 side by side, or one under the other."""
+        from gui import ui_scale
+        logical = width / ui_scale.dpi_scale()
+        cards = 4 if logical >= CARDS_4_FROM else 2 if logical >= CARDS_2_FROM else 1
+        self._place_cards(cards)
+        self._place_lists(3 if logical >= LISTS_SIDE_BY_SIDE_FROM else 1)
+
+    def _place_cards(self, per_row):
+        if per_row == self._card_columns:
+            return
+        self._card_columns = per_row
+        frame = self._cards_frame
+        for c in range(4):
+            frame.grid_columnconfigure(c, weight=1 if c < per_row else 0,
+                                       uniform='card' if c < per_row else '')
+        for i, card in enumerate(self.cards.values()):
+            row, col = divmod(i, per_row)
+            card['frame'].grid(row=row, column=col, sticky='nsew',
+                               padx=(0 if col == 0 else 6, 0), pady=(0 if row == 0 else 6, 0))
+
+    def _place_lists(self, per_row):
+        if per_row == self._list_columns:
+            return
+        self._list_columns = per_row
+        frame = self._lists_frame
+        for c in range(3):
+            frame.grid_columnconfigure(c, weight=1 if c < per_row else 0,
+                                       uniform='list' if c < per_row else '')
+            frame.grid_rowconfigure(c, weight=1 if (per_row == 1 or c == 0) else 0)
+        for i, item in enumerate(self.lists.values()):
+            row, col = divmod(i, per_row)
+            item['frame'].grid(row=row, column=col, sticky='nsew',
+                               padx=(0 if col == 0 else 6, 0), pady=(0 if row == 0 else 6, 0))
+
     # ------------------------------------------------------------ building blocks
     def _card(self, parent, title):
         frame = tk.Frame(parent, background=theme.CARD, highlightthickness=1,
                          highlightbackground=theme.BORDER, padx=14, pady=10)
         tk.Label(frame, text=title, font=theme.mono(8, 'bold'), background=theme.CARD,
                  foreground=theme.TEXT_MUTED, anchor='w').pack(fill='x')
-        value = tk.Label(frame, text='—', font=BIG_FONT,
+        value = tk.Label(frame, text='—', font=self.big_font,
                          background=theme.CARD, foreground=theme.TEXT, anchor='w')
         value.pack(fill='x')
         detail = tk.Label(frame, text='', font=theme.FONT, background=theme.CARD,
@@ -349,9 +409,8 @@ class OverviewPage(tk.Frame):
         tree.grid(row=0, column=0, sticky='nsew')
         bar = auto_scrollbar(holder, tree)
         bind_wheel(tree)
-        for key, heading, width in columns:
-            tree.heading(key, text=heading)
-            tree.column(key, width=width, minwidth=50, anchor='w', stretch=True)
+        # 'When' is short here ('3:56 AM' today, 'Nov 19, 2026 9:05 AM' before): no seconds
+        setup_table(tree, columns, min_widths={'when': DATE_SAMPLE_SHORT})
         tree.tag_configure('failed', foreground=theme.DANGER)
         tree.tag_configure('down', foreground=theme.DANGER)
         tree.tag_configure('up', foreground=theme.SUCCESS)
@@ -367,6 +426,28 @@ class OverviewPage(tk.Frame):
         self.stale = True
         if self.winfo_ismapped() and not self.db_down:
             self.refresh(force=True)
+
+    def _resized(self, event):
+        """The page changed size: resize the big numbers once the dragging pauses."""
+        if event.widget is not self:
+            return
+        if self._big_job is not None:
+            try:
+                self.after_cancel(self._big_job)
+            except tk.TclError:
+                pass
+        width = event.width
+        self._big_job = self.after(RESIZE_SETTLE_MS, lambda: self._fit_big_numbers(width))
+
+    def _fit_big_numbers(self, width):
+        self._big_job = None
+        if width == getattr(self, '_fitted_width', None):
+            return                             # only the height changed: nothing to do
+        self._fitted_width = width
+        self.reflow(width)
+        size = big_number_size(width)
+        if self.big_font.cget('size') != size:
+            self.big_font.configure(size=size)
 
     def refresh_clicked(self):
         """The Refresh button: reload now (even during an outage), and say so."""

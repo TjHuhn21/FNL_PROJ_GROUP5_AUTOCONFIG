@@ -85,7 +85,7 @@ def test_this_sessions_scans_are_listed_with_the_registrations():
 def test_when_text():
     today = datetime(2026, 11, 20, 14, 2).date()
     assert when_text(datetime(2026, 11, 20, 14, 2), today) == '2:02 PM'
-    assert when_text(datetime(2026, 11, 19, 9, 5), today) == 'Nov 19 9:05 AM'
+    assert when_text(datetime(2026, 11, 19, 9, 5), today) == 'Nov 19, 2026 9:05 AM'
     assert when_text(None) == '' and when_text('not a date') == ''
 
 
@@ -97,7 +97,34 @@ def test_format_time_is_12_hour():
     assert format_time(datetime(2026, 11, 24, 12, 0)) == '12:00 PM'         # noon
     assert format_time(datetime(2026, 11, 24, 23, 59, 1), True) == '11:59:01 PM'
     assert format_time(None) == ''
-    assert format_date_time(datetime(2026, 11, 24, 15, 4, 5), True) == '2026-11-24 3:04:05 PM'
+    assert format_date_time(datetime(2026, 11, 24, 15, 4, 5), True) == 'Nov 24, 2026 3:04:05 PM'
+
+
+def test_dates_everywhere_use_one_12_hour_format():
+    from datetime import timezone
+    from gui import timefmt
+    assert timefmt.format_datetime(datetime(2026, 11, 24, 13, 50, 17), seconds=True) == \
+        'Nov 24, 2026 1:50:17 PM'
+    assert timefmt.format_datetime(datetime(2026, 1, 5, 0, 7)) == 'Jan 5, 2026 12:07 AM'
+    assert timefmt.format_datetime(None) == ''
+    # a stored UTC text (backups) is shown in this computer's local time
+    utc = datetime(2026, 11, 24, 5, 50, 17, tzinfo=timezone.utc)
+    local = utc.astimezone().replace(tzinfo=None)
+    assert timefmt.format_timestamp_text('2026-11-24T05:50:17Z') == \
+        timefmt.format_datetime(local, seconds=True)
+    assert timefmt.format_timestamp_text('not a time') == 'not a time'    # never hidden
+    assert timefmt.format_timestamp_text('2026-11-24 13:50:17') == 'Nov 24, 2026 1:50:17 PM'
+
+
+def test_no_military_time_is_left_in_the_screens():
+    import os
+    import re
+    root = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'gui')
+    for folder, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith('.py') and name != 'timefmt.py':
+                text = open(os.path.join(folder, name), encoding='utf-8').read()
+                assert not re.search(r"%H|strftime\(", text), name
 
 
 def age_logs(hours):

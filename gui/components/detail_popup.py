@@ -4,12 +4,14 @@ import tkinter as tk
 from tkinter import ttk
 
 from gui import theme
+from gui.components.dialogs import place_window
 
 
 def describe(record):
     """The popup text for a record (a Console record or a saved history row)."""
+    from gui.timefmt import format_datetime
     get = record.get
-    head = [f"Time:     {get('when') or get('created_at') or ''}",
+    head = [f"Time:     {get('when') or format_datetime(get('created_at'), seconds=True)}",
             f"User:     {get('user') or get('user_label') or ''}",
             f"Category: {get('category') or ''}"]
     if get('device'):
@@ -32,7 +34,7 @@ def show_detail(parent, record, title=None):
     win = tk.Toplevel(parent)
     win.title(title or 'Console entry')
     win.configure(background=theme.BG)
-    win.geometry('900x520')
+    place_window(win, parent, size=(900, 520))          # scaled, on screen, centered
     holder = tk.Frame(win, background=theme.BG)
     holder.pack(fill='both', expand=True, padx=theme.PAD, pady=theme.PAD)
     text = tk.Text(holder, wrap='none', font=theme.mono(theme.CONSOLE_SIZE), relief='flat',
