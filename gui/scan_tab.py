@@ -7,6 +7,8 @@ from tkinter import ttk, messagebox
 import validation
 from gui import theme
 from gui.db_status import database_ready, report_error
+from gui.device_login_guard import (SUCCESS, DeviceLoginGuard, outcome_of_scan_error,
+                                    warning_text)
 from gui.event_log import log_event
 from store_errors import DatabaseUnavailable, DuplicateDeviceName
 
@@ -117,6 +119,7 @@ class ScanTab(ttk.Frame):
         # A disabled button ignores its command, but a click still arrives here: explain why.
         self.approve_btn.bind('<Button-1>', self._explain_if_blocked, add='+')
         self.last_result = None     # what the last approval did (read by the main window)
+        self.device_guard = DeviceLoginGuard()   # set by the main window (signed-in account)
 
     # ----- scanning -----
     def on_scan(self):
@@ -164,14 +167,31 @@ class ScanTab(ttk.Frame):
         self.scanning = False
         self.scan_btn.state(['!disabled'])
         if msg[0] == 'error':
+            self.clear_results()                  # never leave the previous scan's devices
             self.status.config(text='Scan failed.')
             log_event('scan', f"Scan from {self._scan_seed or 'the sample network'} FAILED. "
                               f"{msg[1]}", 'error')
             self._remember({'kind': 'scan', 'seed': self._scan_seed, 'failed': True,
                             'sample': self._scan_is_demo})
-            messagebox.showerror('Scan failed', msg[1])
+            outcome = None if self._scan_is_demo else outcome_of_scan_error(msg[1])
+
+            def show(answer):
+                extra = warning_text(answer)
+                if answer and answer.get('locked'):
+                    return                         # the sign-out message explains the lock
+                messagebox.showerror('Scan failed', msg[1] + (f'\n\n{extra}' if extra else ''))
+            self.device_guard.report(self, self._scan_seed, outcome, show)
         else:
+            if not self._scan_is_demo:            # the seed accepted the login: count reset
+                self.device_guard.report(self, self._scan_seed, SUCCESS)
             self.show_found(msg[1], msg[2], sample=self._scan_is_demo)
+
+    def clear_results(self):
+        """Empty the results table (a failed scan must not show the last scan's devices)."""
+        self.found, self.found_links, self.found_is_sample = [], [], False
+        self.tree.delete(*self.tree.get_children())
+        self.approve_btn.state(['disabled'])
+        self.block_note.pack_forget()
 
     def _remember(self, entry):
         """Add one entry to this session's scan history (kept to the last 20)."""
@@ -291,10 +311,12 @@ class ScanTab(ttk.Frame):
                 existed = (not (d.get('sample') and not self.sample_store)
                            and self.store.get_device_by_ip(d['ip']) is not None)
                 # One transaction per device: the device and its login, or neither.
+                # detected_type: what this scan found; a type the user changed is kept.
+                scanned = dict(d, detected_type=d.get('type') or 'unknown')
                 if save_login and d['managed']:
-                    self.store.save_device(None, d, user, password)
+                    self.store.save_device(None, scanned, user, password)
                 else:
-                    self.store.save_device(None, d)
+                    self.store.save_device(None, scanned)
                 saved.append(d)
                 added, updated = (added, updated + 1) if existed else (added + 1, updated)
             current = None
@@ -362,7 +384,8 @@ class ScanTab(ttk.Frame):
         for d in saved:
             how = 'restored' if d in restored else 'registered'
             log_event('devices', f"{d['name']} ({d['ip']}, {d.get('type') or 'unknown'}): "
-                                 f"{how} SUCCESSFUL.", 'ok')
+                                 f"{how} SUCCESSFUL.", 'ok', tags=['change'], device=d['name'],
+                      ip=d['ip'])
         self._remember({'kind': 'approval', 'count': n})
         messagebox.showinfo('Approved', message)
         if self.on_approved:

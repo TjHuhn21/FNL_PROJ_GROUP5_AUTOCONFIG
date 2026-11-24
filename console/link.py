@@ -137,13 +137,22 @@ DANGEROUS_WORDS = ('write', 'copy', 'reload', 'erase', 'delete', 'format', 'boot
                    'upgrade', 'send', 'more', 'dir', 'event', 'kron', 'alias', 'macro', 'default',
                    'aaa', 'enable', 'disable', 'shutdown', 'no')
 _PLACEHOLDER = re.compile(r'<[A-Z_]+>')
+# Exact lines allowed although their first word is in DANGEROUS_WORDS: bringing up the
+# management interface the operator chose (interface mode only; the plan decides where).
+SAFE_EXCEPTIONS = ('no shutdown',)
+# The ONLY non-configuration command the console session can send besides `show` and
+# `enable`: saving, as the very last step of an approved plan that asked for it
+# (ConsoleSession.allow_save / save_config). Never through send_config_line.
+SAVE_COMMAND = 'write memory'
+SAVE_TIMEOUT = 120               # seconds: writing NVRAM can be slow on old devices
 
 
 def check_config_line(line, allowed=None):
     """The line if it may be sent as configuration, else ConsoleError(REFUSED). It must be
-    ONE printable line, contain no redirection, not start with a dangerous command, and
-    (when `allowed` is given) be one of the allowed lines. <PLACEHOLDER> tokens are
-    allowed: their values are substituted only when the line is written."""
+    ONE printable line, contain no redirection, not start with a dangerous command (the
+    exact lines in SAFE_EXCEPTIONS excepted), and (when `allowed` is given) be one of the
+    allowed lines. <PLACEHOLDER> tokens are allowed: their values are substituted only
+    when the line is written."""
     text = line if isinstance(line, str) else ''
     bare = text.strip()
     if not bare or '\r' in text or '\n' in text or any(not 32 <= ord(c) <= 126 for c in text):
@@ -154,6 +163,8 @@ def check_config_line(line, allowed=None):
         raise ConsoleError(REFUSED, f'"{bare}" contains "|", "<", ">" or "?" (redirection or '
                                     f'help); nothing was sent.')
     first = bare.split()[0].lower()
+    if bare in SAFE_EXCEPTIONS:
+        first = ''
     if first in DANGEROUS_WORDS or bare.lower().startswith('crypto key zeroize'):
         raise ConsoleError(REFUSED, f'"{first}" is never sent as configuration by NetCommand; '
                                     f'nothing was sent.')
@@ -526,6 +537,7 @@ class ConsoleSession:
         self._cancelled = threading.Event()
         self._enable_without_password = bool(enable_without_password)
         self._allowed = frozenset()                        # allow_config(): plan lines only
+        self._save_allowed = False                         # allow_save(): the plan saves
         self._in_config = False
         self._secrets = ()                                 # values masked in config replies
         self.listen_seconds, self.listen_quiet = listen_seconds, listen_quiet
@@ -1049,6 +1061,25 @@ class ConsoleSession:
         with self._lock:
             return self._exchange('', timeout or self.command_timeout)
 
+    def allow_save(self, allowed):
+        """Whether save_config() may run in this session (only for an approved plan whose
+        last step is saving)."""
+        with self._lock:
+            self._save_allowed = bool(allowed)
+
+    def save_config(self, timeout=None):
+        """`write memory`, at the privileged prompt, only after allow_save(True). A question
+        or any other prompt is never answered (the session closes, as for every exchange).
+        ConfigReply; the caller verifies the startup configuration with show commands."""
+        with self._lock:
+            if not getattr(self, '_save_allowed', False):
+                raise ConsoleError(REFUSED, 'Saving was not part of the approved plan; nothing '
+                                            'was sent.')
+            if self._in_config:
+                raise ConsoleError(REFUSED, 'Still in configuration mode; nothing was sent.')
+            self._say('command', SAVE_COMMAND)
+            return self._exchange(SAVE_COMMAND, timeout or SAVE_TIMEOUT)
+
     def end_config(self, timeout=None):
         """'end', then Netmiko learns the (possibly renamed) prompt again."""
         with self._lock:
@@ -1142,7 +1173,7 @@ class ConsoleSession:
         the port). Safe to call at any time, also twice or after an error. A port that was
         only listened on (nothing written yet) is just closed."""
         conn, self._conn = self._conn, None
-        self._allowed, self._in_config = frozenset(), False
+        self._allowed, self._in_config, self._save_allowed = frozenset(), False, False
         if conn is None:
             if self._serial is not None:
                 self._close_port()

@@ -63,7 +63,9 @@ def mask_email(email):
     """The email address as shown on screen: the name before the @ is partly hidden
     (first 2 + ***** + last 2; names of 4 characters or fewer: first 1 + *****), the
     domain is kept. Display only: requests always use the real address.
-    Empty or no '@' -> 'your email'."""
+    Empty or no '@' -> 'your email'.
+    The backend has the same function (backend/auth/masking.py) for its audit records: the
+    desktop's sign-in code never imports the backend, and a test keeps the two identical."""
     local, at, domain = (email or '').strip().rpartition('@')
     if not at or not local or not domain:
         return NO_EMAIL_TEXT

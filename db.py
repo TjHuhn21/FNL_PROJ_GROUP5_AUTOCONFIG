@@ -11,6 +11,7 @@ import time
 import pymysql
 from dotenv import load_dotenv
 
+import device_types
 import security
 import validation
 from store_errors import (DatabaseError, DatabaseUnavailable,  # noqa: F401  (raised here;
@@ -222,6 +223,44 @@ def _upsert_params(d):
             int(bool(d.get('managed'))), d.get('status', 'up'))
 
 
+# A scan's save (data with 'detected_type'): the same upsert, also recording what the scan
+# detected. The type itself is worked out first (device_types.type_after_scan), so a type
+# the user changed survives the rescan. Needs the detected_type column
+# (schema_update_detected_type.sql); without it the plain upsert above is used.
+_UPSERT_DETECTED_SQL = ('INSERT INTO devices (name, ip, mac, type, managed, status, '
+                        'detected_type) VALUES (%s, %s, %s, %s, %s, %s, %s) '
+                        'ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), '
+                        'name = IF(is_deleted = 0, VALUES(name), name), '
+                        'type = IF(is_deleted = 0, VALUES(type), type), '
+                        'managed = IF(is_deleted = 0, VALUES(managed), managed), '
+                        'status = IF(is_deleted = 0, VALUES(status), status), '
+                        'detected_type = IF(is_deleted = 0, VALUES(detected_type), '
+                        'detected_type)')
+_ACTIVE_TYPES_SQL = ('SELECT type, detected_type FROM devices WHERE ip = %s AND is_deleted = 0 '
+                     'FOR UPDATE')
+NO_SUCH_COLUMN = 1054                    # MySQL: Unknown column (the update was not run yet)
+
+
+def _scan_upsert(cur, data):
+    """Run the upsert for a scan's device; True when detected_type was stored, False when
+    the column does not exist yet (then the plain upsert ran and the scan's type is used,
+    as before). Runs inside save_device's transaction (the row is locked)."""
+    detected = device_types.clean(data.get('detected_type'))
+    try:
+        cur.execute(_ACTIVE_TYPES_SQL, (data['ip'],))
+    except pymysql.err.OperationalError as err:
+        if _code(err) != NO_SUCH_COLUMN:
+            raise
+        cur.execute(_UPSERT_SQL, _upsert_params(data))
+        return False
+    row = cur.fetchone()
+    kind = detected
+    if row and row.get('type'):
+        kind = device_types.type_after_scan(row.get('type'), row.get('detected_type'), detected)
+    cur.execute(_UPSERT_DETECTED_SQL, _upsert_params(dict(data, type=kind)) + (detected,))
+    return True
+
+
 def _check_name(name):
     """The same name rules as the screens (validation.check_name), checked before any
     database work. A name with spaces around it is refused, never trimmed silently."""
@@ -325,7 +364,10 @@ def save_device(device_id, data, username=None, password=None):
             if taken:
                 raise DuplicateDeviceName(data['name'], taken)
             if device_id is None:
-                cur.execute(_UPSERT_SQL, _upsert_params(data))
+                if 'detected_type' in data:          # a scan's device
+                    _scan_upsert(cur, data)
+                else:
+                    cur.execute(_UPSERT_SQL, _upsert_params(data))
                 did = cur.lastrowid
                 # The upsert SQL never changes a deleted row. Should the row with this IP
                 # be a deleted one after all, say so (and roll back) instead of reporting
@@ -340,9 +382,10 @@ def save_device(device_id, data, username=None, password=None):
                 old = cur.fetchone()
                 if old is None:
                     raise ValueError('This device no longer exists in the database.')
-                cur.execute('UPDATE devices SET name = %s, ip = %s, type = %s, status = %s, '
-                            'managed = %s WHERE id = %s',
-                            (data['name'], data['ip'], data['type'], data['status'],
+                # The status belongs to the monitor: without one in data it is kept.
+                cur.execute('UPDATE devices SET name = %s, ip = %s, type = %s, '
+                            'status = COALESCE(%s, status), managed = %s WHERE id = %s',
+                            (data['name'], data['ip'], data['type'], data.get('status'),
                              int(bool(data['managed'])), device_id))
                 if old['name'] != data['name']:      # keep the saved links pointing at the device
                     cur.execute('UPDATE links SET device_a = %s WHERE device_a = %s',
@@ -555,6 +598,74 @@ def get_logs(search='', page=1, per_page=15, status='', within_hours=None):
     return _run('SELECT l.id, l.created_at, d.name AS device, l.action, l.status, '
                 'l.details ' + sql + ' ORDER BY l.id DESC LIMIT %s OFFSET %s',
                 params + [per_page, (max(page, 1) - 1) * per_page], 'all')
+
+
+# ---------------------------------------------------------------- Console history
+# Everything the Console shows (gui.event_log), saved. The console_log table is APPEND-ONLY:
+# its triggers refuse every UPDATE and DELETE (schema_update_console_log.sql), so nobody,
+# not even this app's own database account, can change or remove an entry. There is
+# deliberately no function here that would try.
+CONSOLE_COLUMNS = ('created_at', 'user_label', 'category', 'device', 'device_ip', 'message',
+                   'result', 'level', 'tags', 'detail')
+CONSOLE_LIMITS = {'user_label': 120, 'category': 20, 'device': 80, 'device_ip': 45,
+                  'result': 500, 'tags': 100}
+
+
+def _console_row(r):
+    values = []
+    for c in CONSOLE_COLUMNS:
+        v = r.get(c)
+        if isinstance(v, str) and c in CONSOLE_LIMITS:
+            v = v[:CONSOLE_LIMITS[c]]
+        values.append(v)
+    return tuple(values)
+
+
+def add_console_events(rows):
+    """Save Console records (gui.event_log.row_of), all in one statement."""
+    if not rows:
+        return
+    _run(f"INSERT INTO console_log ({', '.join(CONSOLE_COLUMNS)}) "
+         f"VALUES ({', '.join(['%s'] * len(CONSOLE_COLUMNS))})",
+         [_console_row(r) for r in rows], many=True)
+
+
+def _console_filter(search='', tag='', user='', category='', device=''):
+    sql, params = 'FROM console_log WHERE 1 = 1', []
+    if search:
+        like = f'%{search}%'
+        sql += (' AND (message LIKE %s OR result LIKE %s OR device LIKE %s OR device_ip LIKE %s'
+                ' OR user_label LIKE %s)')
+        params += [like] * 5
+    if tag:
+        sql += ' AND FIND_IN_SET(%s, tags)'
+        params.append(tag)
+    for column, value in (('user_label', user), ('category', category), ('device', device)):
+        if value:
+            sql += f' AND {column} = %s'          # column names from this fixed list only
+            params.append(value)
+    return sql, params
+
+
+def count_console_events(search='', tag='', user='', category='', device=''):
+    sql, params = _console_filter(search, tag, user, category, device)
+    return _run('SELECT COUNT(*) AS n ' + sql, params, 'one')['n']
+
+
+def get_console_events(search='', page=1, per_page=15, tag='', user='', category='',
+                       device=''):
+    """Newest first."""
+    sql, params = _console_filter(search, tag, user, category, device)
+    return _run('SELECT id, ' + ', '.join(CONSOLE_COLUMNS) + ' ' + sql +
+                ' ORDER BY id DESC LIMIT %s OFFSET %s',
+                params + [per_page, (max(page, 1) - 1) * per_page], 'all')
+
+
+def console_event_users():
+    """Every user name in the saved history (for the Logs page's User filter)."""
+    rows = _run('SELECT DISTINCT user_label FROM console_log ORDER BY user_label LIMIT 500',
+                (), 'all')
+    return [r['user_label'] for r in rows]
 
 
 # ---------------------------------------------------------------- findings

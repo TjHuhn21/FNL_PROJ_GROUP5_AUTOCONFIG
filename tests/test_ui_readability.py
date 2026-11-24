@@ -224,14 +224,15 @@ def test_devices_logs_scan_and_picker_tables_use_the_larger_style(root, workbenc
 
 def test_logs_search_and_status_filter_are_larger(root, workbench):
     logs = workbench['logs']
-    top = logs.tree.master.winfo_children()[0]
+    top = logs.winfo_children()[0]
     labels = [w for w in top.winfo_children() if isinstance(w, ttk.Label)]
-    assert [w.cget('text') for w in labels] == ['Search:', 'Status:']
+    assert [w.cget('text') for w in labels] == ['Show:', 'Search:', 'Status:', 'User:']
     assert all(w.cget('style') == 'Form.TLabel' for w in labels)
     entry = next(w for w in top.winfo_children() if isinstance(w, ttk.Entry)
                  and not isinstance(w, ttk.Combobox))
-    box = next(w for w in top.winfo_children() if isinstance(w, ttk.Combobox))
-    assert size_of(entry.cget('font')) == size_of(box.cget('font')) == theme.FONT_FORM[1]
+    boxes = [w for w in top.winfo_children() if isinstance(w, ttk.Combobox)]
+    assert len(boxes) == 3
+    assert {size_of(w.cget('font')) for w in boxes + [entry]} == {theme.FONT_FORM[1]}
 
 
 def test_console_text_tabs_and_buttons_are_larger(root, workbench):

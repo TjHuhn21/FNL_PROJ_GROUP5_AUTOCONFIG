@@ -460,3 +460,29 @@ class AuthApiClient:
     def disable_user(self, token, user_id):
         _, p = self._request('POST', f'/admin/users/{int(user_id)}/disable', token=token)
         return self._dict(p, 'status')
+
+    def unlock_user(self, token, user_id):
+        """Clear another account's failed-device-login lock (admins only, checked by the
+        server). {'user_id', 'cleared': 'temporary' | 'permanent' | None}."""
+        _, p = self._request('POST', f'/admin/users/{int(user_id)}/unlock', token=token)
+        return self._dict(p, 'user_id', 'cleared')
+
+    def dev_reset_locks(self):
+        """TESTING MODE: ask the backend to reset every account's failed device logins and
+        locks. {'testing_mode': True, 'reset_users': n}; ApiError (403/404) when the
+        backend's testing mode is off."""
+        _, p = self._request('POST', '/dev/reset-locks')
+        return self._dict(p, 'testing_mode', 'reset_users')
+
+    # ------------------------------------------------------------ device logins
+    def report_device_login(self, token, device_ip, outcome):
+        """Report one login to a network device (Scan, Configure). The server counts the
+        failures and may lock the account; the answer describes the state."""
+        if outcome not in ('success', 'auth_failed', 'unreachable'):
+            raise ValueError('Unknown outcome.')
+        _, p = self._request('POST', '/security/device-login',
+                             {'device_ip': device_ip, 'outcome': outcome}, token=token)
+        p = self._dict(p, 'event', 'failed_count', 'remaining', 'locked', 'lockouts_left')
+        if p['locked'] not in (None, 'temporary', 'permanent'):
+            raise BadResponse(UNEXPECTED)
+        return p

@@ -476,7 +476,7 @@ def test_sql_list_users_selects_no_secrets_and_is_parameterised():
     (sql, params), = conn.sent
     for hidden in ('password_hash', 'failed_logins', 'email_normalized'):
         assert hidden not in sql
-    assert 'status = %s' in sql and 'id > %s' in sql and sql.endswith('ORDER BY id LIMIT %s')
+    assert 'status = %s' in sql and 'id > %s' in sql and sql.endswith('ORDER BY u.id LIMIT %s')
     assert params == ('pending_approval', 2, 50)
     sql_repo(conn).list_users()
     assert conn.sent[1][1] == (100,)

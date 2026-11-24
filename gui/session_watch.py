@@ -24,6 +24,8 @@ ENDED_MESSAGES = {
     'ended': 'Your session has ended (it was signed out elsewhere, expired, or the account '
              'was disabled). Sign in again.',
     'role_changed': 'Your account permissions have changed. Sign in again.',
+    'security_lock': 'Your account has been locked because of too many failed device login '
+                     'attempts.',
 }
 
 

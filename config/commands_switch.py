@@ -30,10 +30,13 @@ def _show_interface(spec):
 
 
 def vlan_commands(plan):
+    """A VLAN name is optional: without one the device names it VLAN0010 itself."""
     cmds, checks = [], []
     for vlan_id, name in plan.get('vlans', []):
-        cmds += [f'vlan {vlan_id}', f'name {name}']
-        checks.append(('show vlan brief', name))
+        cmds.append(f'vlan {vlan_id}')
+        if name:
+            cmds.append(f'name {name}')
+        checks.append(('show vlan brief', name or f'VLAN{int(vlan_id):04d}'))
     return cmds, checks
 
 
@@ -103,7 +106,17 @@ SWITCH_FEATURES = {'VLANs': vlan_commands, 'Access ports': access_port_commands,
 FEATURE_ORDER = ['VLANs', 'Access ports', 'Trunk ports', 'Port security', 'Interface settings']
 
 
+class PlanError(ValueError):
+    """The plan has invalid values (validators.check_switch_plan); nothing was built."""
+
+
 def build_commands(plan, selected):
+    """Raises PlanError when any value breaks the rules in validators.py: the backend never
+    trusts the screen's own checks."""
+    import validators
+    problems = validators.check_switch_plan(plan)
+    if problems:
+        raise PlanError('The settings were not accepted: ' + '; '.join(problems))
     all_cmds, all_checks = [], []
     for name in sorted(selected, key=lambda n: FEATURE_ORDER.index(n)
                        if n in FEATURE_ORDER else len(FEATURE_ORDER)):

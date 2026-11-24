@@ -242,6 +242,40 @@ admin whose address is not yet verified, and it is audited (`auth.email_verified
   sent, so unknown addresses are limited exactly like registered ones.
 * Every security event goes to `audit_log`; passwords, codes, tokens and hashes never do.
 
+## Lockout after failed device logins (migration 5)
+
+When the desktop's Scan or Configure page fails to log in to a network device (the device
+rejected the username or password, or did not answer), it reports this with
+`POST /security/device-login`; the server counts it against the **signed-in NetCommand
+account**. The limits are in one place, `backend/auth/device_lockout.py`:
+
+| Setting | Value |
+|---|---|
+| `MAX_FAILED_DEVICE_LOGINS` | 5 failures ... |
+| `FAILED_WINDOW_MINUTES` | ... within 10 minutes lock the account |
+| `LOCKOUT_MINUTES` | for 15 minutes (it expires by itself) |
+| `MAX_LOCKOUTS_BEFORE_PERMANENT` | the 3rd lockout ... |
+| `LOCKOUT_COUNT_WINDOW_HOURS` | ... within 24 hours is permanent (admin unlock only) |
+
+* A successful device login sets the count back to 0. Demo mode reports nothing.
+* A lock ends every session of the account at once; a locked account cannot sign in, even
+  with a correct email code (checked after the correct password, and no code is sent).
+* State: `security_device_login_state` (the count, `locked_until`, `permanent_locked_at`);
+  history: `security_lockouts` (append-only). The `users` table is unchanged; a permanent
+  lock is shown as status `locked_by_security` on the desktop's Accounts page.
+* An administrator unlocks with `POST /admin/users/{id}/unlock` (the Accounts page's
+  **Unlock** button): never their own account. It clears the lock and both counts.
+* **Recovery** when no administrator can sign in (for example the only admin is locked),
+  on the server, from the project folder:
+
+  ```powershell
+  .\venv\Scripts\python.exe manage.py lock-status <email>
+  .\venv\Scripts\python.exe manage.py unlock-user <email>
+  ```
+
+  It uses `backend/.env` (the runtime account), changes nothing else about the account and
+  is audited (`security.unlocked`, "recovery command on the server").
+
 ## Email delivery of codes (Phase 3)
 
 `backend/mail/` sends the six-digit codes: one message for **registration** (verify your
@@ -506,6 +540,8 @@ GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_job_devices` TO
 GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_job_events` TO 'netcommand_migrator'@'127.0.0.1';
 GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_device_locks` TO 'netcommand_migrator'@'127.0.0.1';
 GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`app_device_backups` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`security_device_login_state` TO 'netcommand_migrator'@'127.0.0.1';
+GRANT SELECT, CREATE, DROP             ON `netcommand_test`.`security_lockouts` TO 'netcommand_migrator'@'127.0.0.1';
 GRANT LOCK TABLES ON `netcommand\_test`.* TO 'netcommand_migrator'@'127.0.0.1';  -- only works on tables it can SELECT
 -- Optional: lets `migrate status` VERIFY the audit triggers. It also lets this
 -- account drop them; leave it out to verify as an administrator instead.
@@ -531,6 +567,8 @@ GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_job_devices` TO 'netcomma
 GRANT SELECT, INSERT         ON `netcommand_test`.`app_job_events` TO 'netcommand_api'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`app_device_locks` TO 'netcommand_api'@'127.0.0.1';
 GRANT SELECT, INSERT         ON `netcommand_test`.`app_device_backups` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE ON `netcommand_test`.`security_device_login_state` TO 'netcommand_api'@'127.0.0.1';
+GRANT SELECT, INSERT         ON `netcommand_test`.`security_lockouts` TO 'netcommand_api'@'127.0.0.1';
 ```
 
 Grant the runtime account its table privileges after `migrate up` (MySQL needs the tables

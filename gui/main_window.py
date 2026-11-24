@@ -30,6 +30,7 @@ from gui.components.inspector import Inspector
 from gui.components.rail import Rail
 from gui.configure_tab import ConfigureTab
 from gui.db_status import DatabaseStatus, report_error
+from gui.device_login_guard import DeviceLoginGuard
 from gui.devices_tab import DevicesTab
 from gui.findings_tab import FindingsTab
 from gui.logs_tab import LogsTab
@@ -73,8 +74,11 @@ SOURCE_SAMPLE = '●  sample mode · in memory'
 SOURCE_FALLBACK = '●  sample mode · database unavailable at startup'
 
 
+DEV_LOCK_RESET_TEXT = 'DEV: lock reset on restart'
+
+
 def build_main_window(root, store, demo_store=False, startup_problem=None, access=None,
-                      account=None, console_backend=None):
+                      account=None, console_backend=None, dev_lock_reset=False):
     """Builds the workbench and every page. Returns refs: one entry per page key,
     plus 'nav', 'command', 'inspector', 'console', 'show_page', 'current_page', and in
     database mode 'db_status' (gui.db_status.DatabaseStatus).
@@ -141,6 +145,10 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
             fg_color=theme.SURFACE_2, hover_color=theme.BORDER, text_color=theme.TEXT,
             command=account.on_sign_out)
         refs['sign_out_button'].pack(side='left')
+    if dev_lock_reset:          # TESTING MODE is on: a reminder to turn it off before release
+        refs['dev_label'] = ctk.CTkLabel(header, text=DEV_LOCK_RESET_TEXT,
+                                         font=theme.mono(9, 'bold'), text_color=theme.WARNING)
+        refs['dev_label'].grid(row=0, column=5, padx=(0, 12))
     ctk.CTkFrame(root, height=1, corner_radius=0, fg_color=theme.BORDER).grid(
         row=1, column=0, columnspan=2, sticky='ew')
 
@@ -265,7 +273,7 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
             noun = 'device' if result['total'] == 1 else 'devices'
             log_event('scan', f"Approved {result['total']} {noun}: {result['added']} new, "
                               f"{result['updated']} already registered (updated), "
-                              f"{result['links']} links saved.", 'ok')
+                              f"{result['links']} links saved.", 'ok', tags=['change'])
         elif result:
             log_event('scan', f"Approval FAILED after {result['saved']} of {result['total']} "
                               f"devices: {result['error']}", 'error')
@@ -286,6 +294,11 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
                            on_approved=after_approval, demo_default=demo_store,
                            sample_store=demo_store)
     refs['scan'].on_activity = overview_stale
+    # Failed device logins count against the signed-in account on the server (a lock
+    # signs it out). Without an account (the --demo start) nothing is reported.
+    refs['device_guard'] = DeviceLoginGuard(account)
+    refs['scan'].device_guard = refs['device_guard']
+    refs['configure'].device_guard = refs['device_guard']
     def on_map_select(kind, info):
         """A device or link was clicked on the interactive map: show it in the inspector.
         Registered devices are read from the store; anything without a record (sample
@@ -355,14 +368,18 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         log_event('backups', f'Restore of {result.device_ip} {event_word(level)} '
                              f'({result.status}; backup '
                              f'{os.path.basename(result.backup_file or "?")}, safety backup '
-                             f'{result.safety_backup_file or "none"}).', level)
+                             f'{result.safety_backup_file or "none"}).', level,
+                  tags=['change'] if level == 'ok' else None, device=result.device_ip,
+                  ip=result.device_ip)       # a restore (rollback) changes the device
     refs['devices'].on_restore_finished = restore_finished
 
     def save_finished(result):
         level = outcome_level(result.status)
         log_event('backups', f'Save to startup on {result.device_ip} {event_word(level)} '
                              f'({result.status}; startup backup '
-                             f'{result.startup_backup or "none"}).', level)
+                             f'{result.startup_backup or "none"}).', level,
+                  tags=['change'] if level == 'ok' else None, device=result.device_ip,
+                  ip=result.device_ip)
     refs['devices'].on_save_finished = save_finished
     if any(key == 'accounts' for key, _label in pages):
         from gui.accounts_page import AccountsPage

@@ -81,6 +81,15 @@ def _accepts_log(fn):
     return any(p.name == 'log' or p.kind == p.VAR_KEYWORD for p in params)
 
 
+def _accepts(fn, name):
+    """True when fn takes the keyword argument `name` (test fakes often do not)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name for p in params)
+
+
 def run_devices(jobs, apply_fn, post=None, on_result=None, stop=None, stop_on_failure=False,
                 preflight=None):
     """Configure the devices one after the other.
@@ -89,8 +98,11 @@ def run_devices(jobs, apply_fn, post=None, on_result=None, stop=None, stop_on_fa
     key check, config.connect.backup_key_problem). It returns None, or a reason: then no
     device is contacted at all and every device is NOT RUN with that reason.
 
-    jobs:      [{'device': {...}, 'creds': {...}, 'commands': [...], 'checks': [...]}]
-    apply_fn:  apply_config(creds, commands, checks[, log=])  (a fake in the tests)
+    jobs:      [{'device': {...}, 'creds': {...}, 'commands': [...], 'checks': [...],
+                 'expected_type': 'switch' / 'router' / None}]
+    apply_fn:  apply_config(creds, commands, checks[, log=][, expected_type=, device_name=])
+               (a fake in the tests); expected_type is passed only for Switch / Router
+               settings and only to a function that takes it
     post:      post(kind, text, device_name) for the SSH console (any thread)
     on_result: called with each device's result as soon as it is known
     stop:      a threading.Event; when set, devices not started yet are not run
@@ -102,6 +114,7 @@ def run_devices(jobs, apply_fn, post=None, on_result=None, stop=None, stop_on_fa
     """
     post = post or (lambda *a: None)
     live = _accepts_log(apply_fn)
+    typed = _accepts(apply_fn, 'expected_type')
     results, halt = [], None
     if preflight is not None and jobs:
         try:
@@ -122,12 +135,16 @@ def run_devices(jobs, apply_fn, post=None, on_result=None, stop=None, stop_on_fa
         else:
             if len(jobs) > 1:
                 post('device', f'DEVICE {i + 1} OF {len(jobs)}:  {d["name"]}  ({d["ip"]})')
+            extra = {}
+            if typed and job.get('expected_type'):     # Switch / Router settings only
+                extra = {'expected_type': job['expected_type'], 'device_name': d['name']}
             try:
                 if live:
                     ok, message = apply_fn(job['creds'], job['commands'], job['checks'],
-                                           log=lambda kind, text, n=d['name']: post(kind, text, n))
+                                           log=lambda kind, text, n=d['name']: post(kind, text, n),
+                                           **extra)
                 else:
-                    ok, message = apply_fn(job['creds'], job['commands'], job['checks'])
+                    ok, message = apply_fn(job['creds'], job['commands'], job['checks'], **extra)
                 ran_live = live
             except Exception as err:                    # never lose the other devices
                 ok, message, ran_live = False, f'Error: {type(err).__name__}: {err}', False

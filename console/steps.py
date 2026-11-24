@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from console import detect
 
 VERIFIED, FAILED, UNCERTAIN = 'verified', 'failed', 'uncertain'
-CONFIG, CHECK = 'config', 'check'
+CONFIG, CHECK, SAVE = 'config', 'check', 'save'   # SAVE: write memory (console.apply)
 NOT_RUN = 'not verified yet'
 
 # replies that mean a configuration command did not take effect (in addition to the
@@ -224,6 +224,44 @@ def _vty_check(lines, attribute, expected, name):
     return check
 
 
+def _interface_ip_check(name, ip, mask):
+    """`show running-config interface X` shows exactly this primary address."""
+    def check(text):
+        if not re.search(rf'^interface {re.escape(name)}\s*$', text or '', re.MULTILINE):
+            return UNCERTAIN, f'interface {name} is not shown'
+        found = re.findall(r'^\s*ip address (\S+) (\S+)\s*$', text, re.MULTILINE)
+        if (ip, mask) in found:
+            return VERIFIED, f'{name} has {ip} {mask}'
+        if found:
+            return FAILED, f'{name} has {found[0][0]} {found[0][1]}, not {ip} {mask}'
+        return FAILED, f'{name} has no IP address'
+    return check
+
+
+def _interface_enabled_check(name):
+    """`show ip interface brief`: the interface is no longer administratively down."""
+    def check(text):
+        row = next((i for i in detect.parse_interfaces(text) if i.name == name), None)
+        if row is None:
+            return UNCERTAIN, f'{name} is not listed'
+        if row.status == 'administratively down':
+            return FAILED, f'{name} is still administratively down'
+        return VERIFIED, f'{name} is switched on ({row.status}/{row.protocol})'
+    return check
+
+
+def _line_check(line):
+    """A `| include` output contains exactly this configuration line."""
+    def check(text):
+        lines = [l.strip() for l in (text or '').splitlines() if l.strip()]
+        if line in lines:
+            return VERIFIED, f'"{line}" is there'
+        if lines:
+            return FAILED, f'"{line}" is not there (found: {lines[0]})'
+        return FAILED, f'"{line}" is not there'
+    return check
+
+
 def _aaa_check(new_model, lists):
     def check(text):
         found = detect.parse_aaa(text)
@@ -344,7 +382,7 @@ def build_steps(plan, result, request, ssh_key_label):
                 detect.SHOW_IP_SSH, '"SSH Enabled - version 2.0"',
                 'SSH disabled, or still "version 1.99" (the command was accepted but has no '
                 'effect)', 'the SSH state was not recognised', _ssh_check('2.0'))]))
-    vty = [c for c in plan.commands if c.mode]
+    vty = [c for c in plan.commands if c.mode and c.mode.startswith('line vty ')]
     if vty or 'rsa' in ids or 'ssh_version' in ids:
         requires = tuple(ids[k] for k in ('rsa', 'ssh_version') if k in ids)
         ids['ssh_ready'] = add(PlanStep(
@@ -385,6 +423,77 @@ def build_steps(plan, result, request, ssh_key_label):
                     'other protocols (telnet, all, none)',
                     f'line vty {lines} or its transport line is not shown',
                     _vty_check(lines, 'transport_input', ['ssh'], 'transport input'))]))
+    # ---- the management address the operator typed (interface mode), and its gateway
+    if_prompt = PromptExpectation('interface configuration', f'{host_after}(config-if)#')
+    for c in by_setting.get('mgmt_ip', []):
+        name = c.mode.split('interface ', 1)[1]
+        ids['mgmt_ip'] = add(PlanStep(
+            'mgmt_ip', f'Set the management address on {name}', CONFIG, c,
+            preconditions=[f'{name} was found by the detection',
+                           'the address and mask were typed by the operator (never invented)'],
+            prompt=if_prompt, failure_replies=COMMON_FAILURE_REPLIES,
+            verifications=[Verification(
+                f'show running-config interface {name}',
+                f'"ip address {request.mgmt_ip} {request.mgmt_mask}" on {name}',
+                'no address, or another address', f'{name} is not shown',
+                _interface_ip_check(name, request.mgmt_ip, request.mgmt_mask))],
+            limitations=['Reaching the address over the network is not checked here (the '
+                         'cable, VLAN and the network around the device decide that).']))
+    for c in by_setting.get('mgmt_up', []):
+        name = c.mode.split('interface ', 1)[1]
+        ids['mgmt_up'] = add(PlanStep(
+            'mgmt_up', f'Turn {name} on', CONFIG, c,
+            requires=(ids['mgmt_ip'],) if 'mgmt_ip' in ids else (),
+            preconditions=[f'{name} was administratively down at detection'],
+            prompt=if_prompt, failure_replies=COMMON_FAILURE_REPLIES,
+            verifications=[Verification(
+                detect.SHOW_INTERFACES, f'{name} is no longer "administratively down"',
+                f'{name} is still administratively down', f'{name} is not listed',
+                _interface_enabled_check(name))],
+            limitations=['"up" also needs a cable to a working port; the step only checks that '
+                         'the interface is switched on.']))
+    for c in by_setting.get('gateway', []):
+        line = c.text
+        pattern = 'ip default-gateway' if line.startswith('ip default-gateway') else \
+            'ip route 0.0.0.0 0.0.0.0'
+        ids['gateway'] = add(PlanStep(
+            'gateway', 'Set the default gateway', CONFIG, c,
+            requires=(ids['mgmt_ip'],) if 'mgmt_ip' in ids else (),
+            preconditions=['the gateway was typed by the operator and is in the management '
+                           'subnet'],
+            prompt=config_prompt(), failure_replies=COMMON_FAILURE_REPLIES,
+            verifications=[Verification(
+                f'show running-config | include {pattern}', f'"{line}"',
+                'no such line, or another gateway only', 'the check did not run',
+                _line_check(line))]))
+    # ---- saving: the very last step, only after every other step is VERIFIED
+    if plan.save_requested:
+        before = tuple(s.step_id for s in steps)
+        host_check = Verification(
+            'show startup-config | include hostname', f'"hostname {host_after}" is saved',
+            'another hostname is saved', 'nothing is saved yet, or the check did not run',
+            _line_check(f'hostname {host_after}'))
+        checks = [host_check]
+        if 'mgmt_ip' in ids:
+            checks.append(Verification(
+                'show startup-config | include ip address',
+                f'"ip address {request.mgmt_ip} {request.mgmt_mask}" is saved',
+                'the management address is not in the saved configuration',
+                'the check did not run', _line_check(
+                    f'ip address {request.mgmt_ip} {request.mgmt_mask}')))
+        steps.append(PlanStep(
+            'save', 'Save the configuration (write memory)', SAVE, None, requires=before,
+            preconditions=['every step above is VERIFIED'],
+            prompt=PromptExpectation('privileged exec', f'{host_after}#',
+                                     note='"write memory" prints "Building configuration..." '
+                                          'and "[OK]"; a question is never answered.'),
+            failure_replies=COMMON_FAILURE_REPLIES + ('%Error', 'Error writing',
+                                                      'Overwrite the previous'),
+            questions=('[confirm]', '[yes/no]', 'Destination filename'),
+            verifications=checks, approval_required=True,
+            approval_reason='it overwrites the configuration the device starts with',
+            limitations=['Saving makes the changes permanent: they are used after every '
+                         'restart until changed again.']))
     invariants = [PlanStep(
         'aaa_unchanged', 'AAA stays exactly as detected (out of scope)', CHECK, None,
         preconditions=['AAA is never changed by this plan'],

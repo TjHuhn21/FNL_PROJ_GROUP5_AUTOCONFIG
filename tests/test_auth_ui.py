@@ -61,7 +61,9 @@ def to_code_screen(win, backend):
     ('', 'your email'), (None, 'your email'), ('no-at-sign', 'your email'),
     ('@gmail.com', 'your email'), ('abc@', 'your email')])
 def test_mask_email(email, shown):
+    from backend.auth.masking import mask_email as backend_mask_email
     assert auth_window.mask_email(email) == shown
+    assert backend_mask_email(email) == shown            # the backend's copy stays identical
 
 
 def test_code_screen_masks_the_email_but_requests_use_the_real_one(env):

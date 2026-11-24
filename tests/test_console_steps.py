@@ -310,7 +310,10 @@ def test_no_steps_without_commands(port):
 READ_ONLY_API = {'connect', 'listen', 'find_prompt', 'send_show', 'enable', 'is_active',
                  'cancel', 'disconnect'}
 CONFIG_API = {'allow_config', 'enter_config', 'send_config_line', 'refresh_prompt',
-              'end_config'}
+              'end_config',
+              # added deliberately (on request): saving as the last, separately approved step
+              # of a plan that asked for it; refused unless allow_save(True) was called
+              'allow_save', 'save_config'}
 
 
 def test_console_session_configuration_interface_is_exactly_the_approved_one():

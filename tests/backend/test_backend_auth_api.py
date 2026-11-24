@@ -331,7 +331,8 @@ def test_admin_list_approve_reject_disable(api):
     assert [r['id'] for r in rows] == [a, b]
     for row in rows:
         assert set(row) == {'id', 'email', 'full_name', 'role', 'status', 'email_verified_at',
-                            'approved_by', 'approved_at', 'created_at', 'updated_at', 'locked'}
+                            'approved_by', 'approved_at', 'created_at', 'updated_at', 'locked',
+                            'security_lock', 'security_locked_until'}
     assert api.hashed not in listed.text
     ok = api.post(f'/admin/users/{a}/approve', {'role': 'operator'}, token=tokens['admin'])
     assert ok.status_code == 200 and ok.json() == {'user_id': a, 'status': 'active'}

@@ -20,6 +20,7 @@ The simulated ports (SCENARIOS):
     SIM13 SSH off, only an HTTPS self-signed key   SIM16 switch, VTY 0-4 SSH / 5-15 Telnet
     SIM14 SSH off, a key of unknown purpose        SIM17 switch, 16 VTY lines, only 0-4 set
     SIM15 SSH off although its SSH key exists
+    SIM47 BRAND-NEW switch (no IP, nothing set)    SIM48 BRAND-NEW router (no IP, nothing set)
 
 Like the real session, it only sends single-line `show` commands (the same guard,
 console.link.check_show_command), plus `enable` when asked, plus - for an approved SSH
@@ -48,7 +49,8 @@ from console.link import (AUTH, CANCELLED, CONSOLE_BOOT_LOADER, CONSOLE_CONFIG_P
                           CONSOLE_UNKNOWN, CONSOLE_USERNAME, NOT_CONNECTED, OPERATOR_CONFIRMED,
                           OTHER, PASSWORD_PROMPT, PORT_UNAVAILABLE, PROMPT, REFUSED,
                           SETUP_DIALOG_ANSWERED, SETUP_DIALOG_NOTICE, STARTUP_ACTION, TIMEOUT,
-                          UNEXPECTED_PROMPT, VERIFIED, ConfigReply, ConnectResult, ConsoleError,
+                          UNEXPECTED_PROMPT, VERIFIED, SAVE_COMMAND, ConfigReply, ConnectResult,
+                          ConsoleError,
                           Preflight, check_config_line, check_secret, check_show_command,
                           classify_reply, gate, mask_text)
 from console.ports import ComPort, PortScan
@@ -66,6 +68,12 @@ _ROUTER = {'type': 'router', 'ports': {'GigabitEthernet': 2},
 _SWITCH = {'type': 'switch', 'ports': {'FastEthernet': 4, 'GigabitEthernet': 2},
            'interfaces': {'Vlan1': {'ip': '192.168.1.2', 'mask': '255.255.255.0',
                                     'shutdown': False}}}
+# as from the factory: the interface exists but has no address and is shut down
+_NEW_SWITCH = {'type': 'switch', 'ports': {'FastEthernet': 4, 'GigabitEthernet': 2},
+               'interfaces': {'Vlan1': {'ip': None, 'mask': None, 'shutdown': True}}}
+_NEW_ROUTER = {'type': 'router', 'ports': {'GigabitEthernet': 2},
+               'interfaces': {'GigabitEthernet0/0': {'ip': None, 'mask': None, 'shutdown': True,
+                                                     'connected': True}}}
 _DOMAIN = 'ip domain-name lab.local'
 _ADMIN = 'username labadmin privilege 15 secret 5 $1$mock$hidden'
 _GLOBALS = [_DOMAIN, _ADMIN]
@@ -143,6 +151,14 @@ SCENARIOS = {
     'SIM17': _scenario('SW17', _SWITCH, 'enabled',
                        'Simulated switch, 16 VTY lines but only vty 0 4 configured',
                        global_lines=_GLOBALS + ['ip ssh version 2'], vty_count=16),
+    # brand-new devices: no hostname, no IP address, nothing configured (management IP and
+    # saving can be set up from the Initial Setup page)
+    'SIM47': _scenario('Switch', _NEW_SWITCH, 'disabled',
+                       'Simulated BRAND-NEW switch: no IP address, nothing configured',
+                       global_lines=[], line_config={'con 0': [], 'vty 0 4': ['login']}),
+    'SIM48': _scenario('Router', _NEW_ROUTER, 'disabled',
+                       'Simulated BRAND-NEW router: no IP address, nothing configured',
+                       global_lines=[], line_config={'con 0': [], 'vty 0 4': ['login']}),
 }
 
 
@@ -544,6 +560,26 @@ class MockConsoleSession:
             self.config_sent.append('<Enter>')             # an empty line (prompt read again)
             return self._reply('', timeout=timeout)
 
+    def allow_save(self, allowed):
+        self._save_allowed = bool(allowed)
+
+    def save_config(self, timeout=None):
+        """Like ConsoleSession.save_config: `write memory` only after allow_save(True)."""
+        with self._lock:
+            self._require()
+            if not getattr(self, '_save_allowed', False):
+                raise ConsoleError(REFUSED, 'Saving was not part of the approved plan; nothing '
+                                            'was sent.')
+            if self._in_config:
+                raise ConsoleError(REFUSED, 'Still in configuration mode; nothing was sent.')
+            self._wait(self.delay)
+            self.config_sent.append(SAVE_COMMAND)
+            self._log('command', SAVE_COMMAND)
+            if self._event_for(SAVE_COMMAND) == 'unplug_on':
+                self._lost(PORT_UNAVAILABLE, f'{self.port} stopped working (was the cable '
+                                             f'unplugged?).')
+            return self._reply(SAVE_COMMAND, timeout=timeout or 120)
+
     def end_config(self, timeout=None):
         with self._lock:
             self._require()
@@ -568,5 +604,5 @@ class MockConsoleSession:
         if self.cli is not None:
             self.graceful_disconnects += 0 if self._cancelled.is_set() else 1
         self.cli = None
-        self._in_config, self._allowed = False, frozenset()
+        self._in_config, self._allowed, self._save_allowed = False, frozenset(), False
         self._log('info', f'Disconnected from {self.port} (SIMULATED).')

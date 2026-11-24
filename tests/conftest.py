@@ -63,6 +63,11 @@ def fresh_console_history(monkeypatch):
         return
     monkeypatch.setattr(event_log, '_history', [])
     monkeypatch.setattr(event_log, '_keeping', [False])
+    # nobody signed in, and nothing saved, unless the test says so
+    monkeypatch.setattr(event_log, '_user', [None])
+    monkeypatch.setattr(event_log, '_store', [None])
+    monkeypatch.setattr(event_log, '_pending', [])
+    monkeypatch.setattr(event_log, '_saving', {'off': False, 'thread': None})
 
 
 @pytest.fixture(autouse=True)

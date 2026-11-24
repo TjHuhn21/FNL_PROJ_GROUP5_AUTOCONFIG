@@ -559,8 +559,23 @@ def test_password_never_appears_in_errors():
     assert PW not in everything(res, s)
 
 
-def test_apply_module_has_no_network_access_and_never_saves():
+def test_apply_module_has_no_network_access_and_saves_only_through_the_gated_step():
+    # Updated deliberately: saving and the management address were added on request.
+    # Saving goes only through session.save_config (allowed only for a plan that asked for
+    # it); never `copy`, never a hard-coded command line, never a network connection.
     source = open(A.__file__, encoding='utf-8').read()
-    for word in ('ConnectHandler', 'paramiko', 'socket', 'save_config', "'write memory'",
-                 'copy running-config', 'ip address'):
+    for word in ('ConnectHandler', 'paramiko', 'socket', "'write memory'",
+                 'copy running-config'):
         assert word not in source, word
+    assert source.count('session.save_config()') == 1
+    assert 'session.allow_save(True)' in source and 'session.allow_save(False)' in source
+
+
+def test_without_asking_nothing_is_saved_and_no_address_is_set():
+    s, r, req, plan = prepare('SIM2', hostname='', domain='')
+    res = run(s, r, req, plan)
+    assert res.saved is False and 'write memory' not in res.commands_sent
+    assert not any(c.startswith(('ip address', 'interface ', 'ip default-gateway', 'ip route'))
+                   for c in res.commands_sent)
+    with pytest.raises(ConsoleError):                    # the session refuses on its own
+        s.save_config()

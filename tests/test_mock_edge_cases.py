@@ -84,7 +84,7 @@ def test_every_edge_scenario_has_a_unique_identifier():
 
 def test_default_port_list_is_unchanged_and_edge_cases_are_opt_in():
     assert [p.device for p in MockConsoleBackend().discover_ports().ports] == list(SCENARIOS)
-    assert len(SCENARIOS) == 17
+    assert len(SCENARIOS) == 19              # SIM47 / SIM48: brand-new switch and router
     edge = [p.device for p in MockConsoleBackend(edge_cases=True).discover_ports().ports]
     assert edge == list(SCENARIOS) + list(EDGE_SCENARIOS)
     with pytest.raises(ValueError):

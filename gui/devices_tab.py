@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+import device_types
 import validation
 from gui import theme
 from gui.db_status import database_ready, report_error
@@ -9,9 +10,11 @@ from store_errors import DATABASE_ERRORS, DeletedDeviceExists, DuplicateDeviceNa
 
 PER_PAGE = 15
 # widths for the larger table text (theme.TABLE_SIZE)
-COLUMNS = [('name', 'Name', 180), ('ip', 'IP', 150), ('type', 'Type', 100),
+COLUMNS = [('name', 'Name', 180), ('ip', 'IP', 150), ('type', 'Type', 210),
            ('status', 'Status', 85), ('managed', 'Managed', 100)]
 SORTABLE = {'name', 'ip', 'type', 'status'}
+TYPE_COLUMN = '#3'                    # the Type column, as Treeview.identify_column names it
+MANUAL_MARK = '⚠'                     # before a type that differs from the scan's detection
 
 
 class DevicesTab(ttk.Frame):
@@ -52,6 +55,10 @@ class DevicesTab(ttk.Frame):
             self.tree.tag_configure(status, background=color)
         self.tree.pack(fill='both', expand=True, pady=theme.PAD)
         self.tree.bind('<Double-1>', lambda e: self.edit())
+        # "Detected as router by scan" when the pointer is on a manually changed Type
+        self.type_tips, self._tip, self._tip_row = {}, None, None
+        self.tree.bind('<Motion>', self._hover, add='+')
+        self.tree.bind('<Leave>', lambda e: self._hide_tip(), add='+')
 
         self.empty = ttk.Label(self, text='', foreground=theme.TEXT_MUTED)
         self.empty.pack()
@@ -89,9 +96,14 @@ class DevicesTab(ttk.Frame):
             report_error(self, err)
             return
         self.tree.delete(*self.tree.get_children())
+        self.type_tips = {}
         for d in rows:
+            kind = device_types.type_label(d)
+            if device_types.manually_changed(d):
+                kind = f'{MANUAL_MARK} {kind}'
+                self.type_tips[str(d['id'])] = device_types.detected_tooltip(d)
             self.tree.insert('', 'end', iid=str(d['id']), tags=(d['status'],),
-                             values=(d['name'], d['ip'], d['type'], d['status'],
+                             values=(d['name'], d['ip'], kind, d['status'],
                                      'yes' if d['managed'] else 'no'))
         if total == 0:
             self.empty.config(text='No devices match your search.' if text else
@@ -101,6 +113,37 @@ class DevicesTab(ttk.Frame):
         self.page_label.config(text=f'Page {self.page} of {pages}  ({total} devices)')
         self.prev_btn.state(['!disabled'] if self.page > 1 else ['disabled'])
         self.next_btn.state(['!disabled'] if self.page < pages else ['disabled'])
+
+    def type_tip_at(self, x, y):
+        """(row id, tooltip text) for the Type cell at x, y, or (None, '')."""
+        if self.tree.identify_column(x) != TYPE_COLUMN:
+            return None, ''
+        row = self.tree.identify_row(y)
+        return (row, self.type_tips[row]) if row in self.type_tips else (None, '')
+
+    def _hover(self, event):
+        row, text = self.type_tip_at(event.x, event.y)
+        if row == self._tip_row:
+            return
+        self._hide_tip()
+        if not text:
+            return
+        self._tip_row = row
+        self._tip = tk.Toplevel(self.tree)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f'+{event.x_root + 12}+{event.y_root + 14}')
+        tk.Label(self._tip, text=text, font=theme.FONT_SMALL, background=theme.CARD,
+                 foreground=theme.TEXT, relief='solid', borderwidth=1, padx=6,
+                 pady=3).pack()
+
+    def _hide_tip(self):
+        self._tip_row = None
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
 
     def show_unavailable(self, reason=''):
         """The list could not be read: show no rows at all (never old rows as if current)."""
@@ -232,7 +275,8 @@ class DevicesTab(ttk.Frame):
                                      f"{outcome_text(err, 'Nothing was deleted.')} {err}")
                 return
             log_event('devices', f"Delete of {d['name']} ({d['ip']}) SUCCESSFUL (its history "
-                                 f"is kept).", 'ok')
+                                 f"is kept).", 'ok', tags=['change'], device=d['name'],
+                      ip=d['ip'])
             self._saved()
         else:
             log_event('devices', f"Delete of {d['name']} cancelled. Nothing was deleted.")
@@ -255,16 +299,22 @@ class DeviceDialog(tk.Toplevel):
         self.vars = {'name': tk.StringVar(value=d['name']),
                      'ip': tk.StringVar(value=d['ip']),
                      'type': tk.StringVar(value=d['type']),
-                     'status': tk.StringVar(value=d['status']),
                      'managed': tk.IntVar(value=int(d['managed'])),
                      'username': tk.StringVar(), 'password': tk.StringVar()}
         self.name_entry = ttk.Entry(self, textvariable=self.vars['name'], width=30)
+        self.type_box = ttk.Combobox(self, textvariable=self.vars['type'], width=27,
+                                     values=list(device_types.TYPES), state='readonly')
+        detected = device_types.detected_tooltip(device)
+        # The status is the background monitor's (ping / SSH port): shown, never edited here.
+        status_text = (f"{d['status']} (set automatically by the monitor)" if device
+                       else 'Set automatically by the monitor')
+        self.status_label = ttk.Label(self, text=status_text, foreground=theme.TEXT_MUTED)
         rows = [('Name', self.name_entry),
                 ('IP address', ttk.Entry(self, textvariable=self.vars['ip'], width=30)),
-                ('Type', ttk.Combobox(self, textvariable=self.vars['type'], width=27,
-                                      values=['switch', 'router', 'unknown'], state='readonly')),
-                ('Status', ttk.Combobox(self, textvariable=self.vars['status'], width=27,
-                                        values=['up', 'down'], state='readonly')),
+                ('Type', self.type_box)]
+        if detected:
+            rows.append(('', ttk.Label(self, text=detected + '.', foreground=theme.TEXT_MUTED)))
+        rows += [('Status', self.status_label),
                 ('', ttk.Checkbutton(self, text='Managed (we can log in)',
                                      variable=self.vars['managed'])),
                 ('Login username', ttk.Entry(self, textvariable=self.vars['username'], width=30)),
@@ -303,8 +353,12 @@ class DeviceDialog(tk.Toplevel):
         if problem:
             messagebox.showerror('Cannot save', problem, parent=self)
             return
-        data = {'name': name, 'ip': ip, 'type': v['type'], 'status': v['status'],
-                'managed': bool(v['managed'])}
+        if not self._type_change_confirmed(name, v['type']):
+            return                                   # the dialog stays open, nothing saved
+        # A new device starts as up (the monitor corrects it); an edit keeps the monitor's.
+        data = {'name': name, 'ip': ip, 'type': v['type'], 'managed': bool(v['managed'])}
+        if not self.device:
+            data['status'] = 'up'
         action = 'Saving changes to' if self.device else 'Adding'
         log_event('devices', f'{action} device {name} ({ip})...')
         try:                       # device and login together: both are saved, or neither
@@ -334,14 +388,97 @@ class DeviceDialog(tk.Toplevel):
             report_error(self, err)            # an outage also shows in the main window
             messagebox.showerror('Cannot save', f'{outcome_text(err)} {err}', parent=self)
             return
-        log_event('devices', f"{'Edit' if self.device else 'Add'} of {name} ({ip}) SUCCESSFUL"
-                             f"{' (login saved, encrypted)' if username else ''}.", 'ok')
+        login = ' (login saved, encrypted)' if username else ''
+        if self.device:
+            changes = changes_text(self.device, data, bool(username))
+            log_event('devices', f'Edit of {name} ({ip}) SUCCESSFUL: '
+                                 f"{changes or 'nothing was changed'}.", 'ok',
+                      tags=['change'] if changes else None, device=name, ip=ip)
+        else:
+            log_event('devices', f"Add of {name} ({ip}, {data['type']}) SUCCESSFUL{login}.",
+                      'ok', tags=['change'], device=name, ip=ip)
         self.destroy()
         self.on_saved()
+
+    def _type_change_confirmed(self, name, new_type):
+        """Editing a device's type needs a confirmation (only when the type changed).
+        Cancel puts the original type back and saves nothing."""
+        if not self.device or new_type == self.device['type']:
+            return True
+        old_type = self.device['type']
+        title, text = type_change_text(name, self.device.get('detected_type'), new_type)
+        if ask_type_change(self, title, text):
+            log_event('devices', f'{name}: type change from {old_type} to {new_type} '
+                                 f'confirmed.', 'warn', device=name)
+            return True
+        self.vars['type'].set(old_type)
+        log_event('devices', f'{name}: type change to {new_type} cancelled. Nothing was saved.')
+        return False
 
     def _restored(self):
         self.destroy()
         self.on_saved()
+
+
+CHANGE_FIELDS = (('name', 'name'), ('ip', 'IP'), ('type', 'type'), ('managed', 'managed'))
+
+
+def changes_text(before, after, login_changed=False):
+    """'type changed router -> switch; name changed R1 -> MOCK-R1' for an edit ('' when
+    nothing changed). The login is only said to be replaced, never shown."""
+    def shown(key, value):
+        return ('yes' if value else 'no') if key == 'managed' else str(value)
+    parts = [f'{label} changed {shown(key, before.get(key))} -> {shown(key, after[key])}'
+             for key, label in CHANGE_FIELDS
+             if key in after and shown(key, before.get(key)) != shown(key, after[key])]
+    if login_changed:
+        parts.append('login replaced (saved encrypted, not shown)')
+    return '; '.join(parts)
+
+
+def type_change_text(name, detected, new_type):
+    """(title, text) of the confirmation: the full warning when the scan definitely
+    detected another type, a simpler question otherwise (unknown, or added by hand)."""
+    if detected in device_types.KNOWN and new_type != detected:
+        what = {'switch': 'switch commands', 'router': 'router commands'}.get(
+            new_type, 'no switch or router settings')
+        effect = (f'NetCommand will send {what} to a {detected}' if new_type in device_types.KNOWN
+                  else f'NetCommand will not send switch or router settings to it')
+        return ('Change device type?',
+                f'{name} was detected as a {detected.upper()} by the scan.\n'
+                f'Are you sure you want to change it to {new_type.upper()}?\n\n'
+                f'If this is wrong, configuration on this device may fail, because {effect}.')
+    return 'Change device type?', f"Set {name}'s type to {new_type.upper()}?"
+
+
+def ask_type_change(parent, title, text):
+    """A modal question with the buttons 'Yes, change it' and 'Cancel'. True for yes.
+    (Tests replace it.)"""
+    answer = {'yes': False}
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.configure(padx=theme.PAD * 2, pady=theme.PAD * 2, background=theme.BG)
+    win.resizable(False, False)
+    ttk.Label(win, text=text, wraplength=420, justify='left').pack(anchor='w')
+
+    def choose(yes):
+        answer['yes'] = yes
+        win.destroy()
+    btns = ttk.Frame(win)
+    btns.pack(anchor='e', pady=(theme.PAD * 2, 0))
+    ttk.Button(btns, text='Cancel', command=lambda: choose(False)).pack(side='right')
+    ttk.Button(btns, text='Yes, change it', style='Accent.TButton',
+               command=lambda: choose(True)).pack(side='right', padx=4)
+    win.protocol('WM_DELETE_WINDOW', lambda: choose(False))
+    win.bind('<Escape>', lambda e: choose(False))
+    win.transient(parent.winfo_toplevel())
+    win.grab_set()
+    win.wait_window()
+    try:
+        parent.grab_set()                            # the Edit dialog is modal again
+    except tk.TclError:
+        pass
+    return answer['yes']
 
 
 class RestoreDialog(tk.Toplevel):
@@ -432,6 +569,7 @@ class RestoreDialog(tk.Toplevel):
                                  f"{outcome_text(err, 'Nothing was changed.')} {err}", parent=self)
             return
         log_event('devices', f"Restore of {d['name']} ({d['ip']}) as {self.data['name']} "
-                             f"SUCCESSFUL.", 'ok')
+                             f"SUCCESSFUL.", 'ok', tags=['change'], device=self.data['name'],
+                  ip=d['ip'])
         self.destroy()
         self.on_restored()

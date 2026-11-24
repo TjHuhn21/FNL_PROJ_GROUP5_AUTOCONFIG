@@ -70,10 +70,11 @@ def dhcp_commands(plan):
     if d.get('excluded'):
         start, end = d['excluded']
         cmds.append(f'ip dhcp excluded-address {start} {end}')
-    cmds += [f"ip dhcp pool {d['pool']}",
-             f"network {d['network']} {d['mask']}",
-             f"default-router {d['gateway']}",
-             f"dns-server {d['dns']}"]
+    cmds += [f"ip dhcp pool {d['pool']}", f"network {d['network']} {d['mask']}"]
+    if d.get('gateway'):                         # optional: an empty one is not sent
+        cmds.append(f"default-router {d['gateway']}")
+    if d.get('dns'):
+        cmds.append(f"dns-server {d['dns']}")
     return cmds, [('show ip dhcp pool', d['pool'])]
 
 
@@ -102,7 +103,17 @@ FEATURE_ORDER = ['Hostname', 'Interfaces', 'DHCP', 'Default route', 'Static rout
                  'DNS servers', 'NTP']
 
 
+class PlanError(ValueError):
+    """The plan has invalid values (validators.check_router_plan); nothing was built."""
+
+
 def build_commands(plan, selected):
+    """Raises PlanError when any value breaks the rules in validators.py: the backend never
+    trusts the screen's own checks."""
+    import validators
+    problems = validators.check_router_plan(plan)
+    if problems:
+        raise PlanError('The settings were not accepted: ' + '; '.join(problems))
     all_cmds, all_checks = [], []
     for name in sorted(selected, key=lambda n: FEATURE_ORDER.index(n)
                        if n in FEATURE_ORDER else len(FEATURE_ORDER)):

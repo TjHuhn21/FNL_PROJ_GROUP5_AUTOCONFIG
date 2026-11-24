@@ -67,12 +67,20 @@ HASH_LIKE = re.compile(r'^\$\d+\$')
 # ---------------------------------------------------------------- input
 @dataclass(frozen=True)
 class SetupRequest:
-    """What the user wants. Never holds a password: only whether one was given."""
+    """What the user wants. Never holds a password: only whether one was given.
+    mgmt_*: the management address the operator typed (an interface the detection found,
+    an IP address and mask, an optional default gateway); NetCommand never invents one.
+    save: write memory as the last step, after every other step is VERIFIED."""
     hostname: str = ''
     domain_name: str = ''
     username: str = ''
     password_set: bool = False
     key_size: int = DEFAULT_KEY_SIZE
+    mgmt_interface: str = ''
+    mgmt_ip: str = ''
+    mgmt_mask: str = ''
+    gateway: str = ''
+    save: bool = False
 
 
 def key_sizes(result):
@@ -107,8 +115,49 @@ def check_password(password, confirm):
     return None
 
 
+def check_management(interface, ip, mask, gateway, result=None):
+    """({field: message}, dotted mask) for the management address. All empty: nothing to
+    set. Otherwise the interface (one the detection found), IP address and mask are
+    required; the gateway is optional and must be a host in the same subnet."""
+    import validators as V
+    interface, ip, mask, gateway = (V.clean(x) for x in (interface, ip, mask, gateway))
+    errors = {}
+    if not (interface or ip or mask or gateway):
+        return errors, ''
+    names = [i.name for i in (result.interfaces if result is not None else [])]
+    if not interface:
+        errors['mgmt_interface'] = 'Choose the interface that gets the management address.'
+    elif result is not None and interface not in names:
+        errors['mgmt_interface'] = (f'{interface} was not found on the device by the detection '
+                                    f'({", ".join(names) or "no interfaces were read"}).')
+    for key, value, check in (('mgmt_ip', ip, V.check_ipv4), ('mgmt_mask', mask, V.check_mask)):
+        if not value:
+            errors[key] = 'Required for the management address.'
+        elif check(value):
+            errors[key] = check(value)
+    dotted = ''
+    if 'mgmt_mask' not in errors:
+        dotted = V.parse_mask(mask)
+        if dotted in ('255.255.255.255', '255.255.255.254', '0.0.0.0'):
+            errors['mgmt_mask'] = 'Use a subnet mask that leaves room for hosts (e.g. /24).'
+    if not ({'mgmt_ip', 'mgmt_mask'} & set(errors)):
+        problem = V.check_host_address(ip, dotted, 'The IP address')
+        if problem:
+            errors['mgmt_ip'] = problem
+    if gateway:
+        problem = V.check_ipv4(gateway)
+        if not problem and not ({'mgmt_ip', 'mgmt_mask'} & set(errors)):
+            problem = V.check_inside(gateway, ip, dotted, 'The gateway')
+            if not problem and gateway == ip:
+                problem = 'The gateway cannot be the device\'s own address.'
+        if problem:
+            errors['gateway'] = problem
+    return errors, dotted
+
+
 def validate_request(hostname='', domain_name='', username='', password='', confirm='',
-                     key_size=DEFAULT_KEY_SIZE, result=None):
+                     key_size=DEFAULT_KEY_SIZE, result=None, mgmt_interface='', mgmt_ip='',
+                     mgmt_mask='', gateway='', save=False):
     """(SetupRequest, {field: message}). Empty fields mean "keep what the device has".
     The password is checked here and not kept anywhere."""
     errors = {}
@@ -142,9 +191,14 @@ def validate_request(hostname='', domain_name='', username='', password='', conf
     if size is None or (allowed and size not in allowed):
         errors['key_size'] = ('Choose an RSA key size offered for this device: '
                               f'{", ".join(map(str, allowed)) or "none"}.')
+    mgmt_errors, dotted = check_management(mgmt_interface, mgmt_ip, mgmt_mask, gateway, result)
+    errors.update(mgmt_errors)
+    import validators as V
     request = SetupRequest(hostname=hostname, domain_name=domain_name, username=username,
                            password_set=bool(username and password and 'password' not in errors),
-                           key_size=size or DEFAULT_KEY_SIZE)
+                           key_size=size or DEFAULT_KEY_SIZE,
+                           mgmt_interface=V.clean(mgmt_interface), mgmt_ip=V.clean(mgmt_ip),
+                           mgmt_mask=dotted, gateway=V.clean(gateway), save=bool(save))
     return request, errors
 
 
@@ -190,6 +244,7 @@ class ConfigPlan:
     # console.apply runs them (phase 5.1.2); this module never does.
     steps: list = field(default_factory=list)
     invariants: list = field(default_factory=list)
+    save_requested: bool = False   # write memory as the last step (console.steps SAVE)
 
     def step(self, step_id):
         return next((s for s in self.steps if s.step_id == step_id), None)
@@ -224,7 +279,8 @@ class ConfigPlan:
             return []
         out = ['configure terminal']
         globals_ = [c for c in self.commands if c.mode is None]
-        out += [c.text for c in sorted(globals_, key=lambda c: _ORDER.index(c.setting))]
+        ordered = sorted(globals_, key=lambda c: _ORDER.index(c.setting))
+        out += [c.text for c in ordered if c.setting not in _AFTER_MODES]
         modes = []
         for c in self.commands:
             if c.mode and c.mode not in modes:
@@ -232,6 +288,7 @@ class ConfigPlan:
         for mode in modes:
             out.append(mode)
             out += [' ' + c.text for c in self.commands if c.mode == mode]
+        out += [c.text for c in ordered if c.setting in _AFTER_MODES]   # the gateway runs last
         out.append('end')
         return out
 
@@ -239,7 +296,9 @@ class ConfigPlan:
         return '\n'.join(self.lines())
 
 
-_ORDER = ['hostname', 'domain', 'user', 'rsa', 'ssh_version', 'vty_login', 'vty_transport']
+_ORDER = ['hostname', 'domain', 'user', 'rsa', 'ssh_version', 'vty_login', 'vty_transport',
+          'gateway']
+_AFTER_MODES = ('gateway',)        # global lines shown after the interface (their step order)
 
 
 # ---------------------------------------------------------------- building the plan
@@ -284,6 +343,9 @@ def build_plan(result, request=None):
     plan.items = [ctx.hostname(), ctx.domain(), ctx.user(), ctx.rsa(), ctx.ssh_version(),
                   ctx.ssh_settings(), ctx.ssh_other(), ctx.aaa(), ctx.vty_login(),
                   ctx.vty_transport(), ctx.management()]
+    if request.save or plan.commands:          # nothing to change and nothing asked: no row
+        plan.items.append(ctx.save())
+    plan.save_requested = request.save
     reason, status = _availability(result)
     if reason:
         plan.available, plan.reason = False, reason
@@ -313,7 +375,10 @@ def build_plan(result, request=None):
         plan.warnings.append('Keep the console cable connected until SSH has been tested: if '
                              'a VTY change goes wrong, the console still works.')
     plan.limitations = [
-        'Saving the configuration (write memory) is not part of the preview.',
+        ('Saving (write memory) runs only as the last step, after every other step is VERIFIED.'
+         if request.save else
+         'Saving the configuration (write memory) was not requested: the changes are lost '
+         'when the device restarts.'),
         'The plan is based on the detection shown; if the device was changed since, detect '
         'again.',
         'RSA key sizes offered are a conservative choice per software family; the exact limits '
@@ -323,7 +388,7 @@ def build_plan(result, request=None):
     if any(i.key == 'rsa' and i.commands for i in plan.items):
         plan.limitations.append('IOS turns SSH on by itself once an RSA key pair exists; key '
                                 'generation can take up to a minute on older routers.')
-    if plan.available and plan.commands:
+    if plan.available and (plan.commands or request.save):
         from console.steps import build_steps
         plan.steps, plan.invariants = build_steps(
             plan, result, request, ctx._ssh_key_name(request.hostname, request.domain_name))
@@ -820,17 +885,87 @@ class _Context:
 
     # ------------------------------------------------------------ information
     def management(self):
-        r = self.r
-        if r.management_interface:
-            return PlanItem('management', 'Management IP address', CONFIGURED,
-                            f'{r.management_interface} ({r.management_reason})',
-                            'SSH can reach the device through this address. Not changed.')
-        return PlanItem('management', 'Management IP address',
-                        ATTENTION if r.interfaces else UNKNOWN,
-                        r.management_reason or 'unknown',
-                        'SSH over the network needs an interface with an IP address that is up. '
-                        'Setting one is not part of this preview, and NetCommand never invents '
-                        'an IP address.')
+        """The management address: only what the operator typed (never invented), on an
+        interface the detection found. ip address / no shutdown in interface mode, and the
+        default gateway (switch: ip default-gateway; router: a default route)."""
+        r, q = self.r, self.q
+        if not q.mgmt_interface:
+            if r.management_interface:
+                return PlanItem('management', 'Management IP address', CONFIGURED,
+                                f'{r.management_interface} ({r.management_reason})',
+                                'SSH can reach the device through this address. Not changed.')
+            return PlanItem('management', 'Management IP address',
+                            ATTENTION if r.interfaces else UNKNOWN,
+                            r.management_reason or 'unknown',
+                            'SSH over the network needs an interface with an IP address that '
+                            'is up. Choose the interface and type its IP address and mask below '
+                            '(NetCommand never invents an IP address).')
+        iface = next((i for i in r.interfaces if i.name == q.mgmt_interface), None)
+        if iface is None:
+            return PlanItem('management', 'Management IP address', UNKNOWN, 'unknown',
+                            f'{q.mgmt_interface} was not found by the detection; nothing is '
+                            f'proposed for it.')
+        mode = f'interface {iface.name}'
+        item = PlanItem('management', 'Management IP address', CONFIGURED,
+                        f'{iface.name}: {iface.ip or "no IP address"} ({iface.status or "?"}/'
+                        f'{iface.protocol or "?"})', '')
+        notes = []
+        if iface.ip == q.mgmt_ip:
+            notes.append(f'{iface.name} already has {q.mgmt_ip} (its mask is not shown by the '
+                         f'detection, so it is not compared).')
+        else:
+            item.status = ATTENTION if iface.ip else MISSING
+            item.commands.append(PlanCommand(
+                f'ip address {q.mgmt_ip} {q.mgmt_mask}',
+                'Gives the device its management address, so SSH can reach it over the network.',
+                kind=MODIFY if iface.ip else ADD, disruptive=bool(iface.ip), mode=mode,
+                setting='mgmt_ip'))
+            notes.append(f'{iface.name} gets {q.mgmt_ip} {q.mgmt_mask}' + (
+                f' (it replaces {iface.ip}: network sessions to the old address will end).'
+                if iface.ip else '.'))
+        if iface.status == 'administratively down':
+            item.status = _worse(item.status, MISSING)
+            item.commands.append(PlanCommand(
+                'no shutdown', f'Turns {iface.name} on (a new device has it switched off).',
+                mode=mode, setting='mgmt_up'))
+            notes.append(f'{iface.name} is switched off and will be turned on.')
+        if q.gateway:
+            kind = self.d.device_type
+            if kind == detect.SWITCH:
+                line = f'ip default-gateway {q.gateway}'
+                why = 'Lets the switch answer devices in other networks (its default gateway).'
+            elif kind == detect.ROUTER:
+                line = f'ip route 0.0.0.0 0.0.0.0 {q.gateway}'
+                why = 'A default route, so the router can answer devices in other networks.'
+            else:
+                line = None
+            if line:
+                item.status = _worse(item.status, MISSING)
+                item.commands.append(PlanCommand(line, why, kind=MODIFY, setting='gateway'))
+                notes.append(f'Default gateway {q.gateway}' + (
+                    ' (replaces any default gateway already set).' if kind == detect.SWITCH else
+                    ' (added next to any default route already set).'))
+            else:
+                item.status = _worse(item.status, ATTENTION)
+                notes.append('The default gateway is not set: the device type (router or switch) '
+                             'was not recognised, so the right command is not known.')
+        if iface.status not in ('administratively down', None) and iface.protocol == 'down':
+            notes.append(f'{iface.name} is down: connect its cable (switch: a port in VLAN 1) '
+                         f'before using SSH over the network.')
+        item.explanation = ' '.join(notes) or 'Kept as it is.'
+        return item
+
+    def save(self):
+        """write memory, as the last step, only when asked for and only after every other
+        step is VERIFIED (console.steps)."""
+        if self.q.save:
+            return PlanItem('save', 'Save to startup-config', MISSING, 'not saved by NetCommand',
+                            'After every step above is VERIFIED, "write memory" saves the '
+                            'running configuration, so it survives a reboot. This needs its own '
+                            'approval in section 5.')
+        return PlanItem('save', 'Save to startup-config', ATTENTION, 'not requested',
+                        'Not saved: the changes stay in the running configuration and are LOST '
+                        'when the device restarts. Tick "Save to startup-config" to save them.')
 
 
 def _worse(a, b):

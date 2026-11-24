@@ -3,14 +3,23 @@ added, and Remove selected. The Configure page uses one per feature (trunks,
 port security, router interfaces, static routes...).
 
 fields:   [{'key', 'label', 'kind': 'entry' | 'combo' | 'check', 'width',
-            'values' (combo), 'default', 'hint'}]
+            'values' (combo), 'default', 'hint',
+            'check' (text -> message or None), 'typing' (validators.TYPING kind),
+            'required' (bool), 'warn' (text -> note or None)}]
 columns:  [(key, title, width)]   what the table shows for each added item
-validate: validate(values, items) -> (error message or None, item dict)
+validate: validate(values, items) -> (error or None, item dict). The error is a message,
+          or (field key, message) to show it under that field.
+
+Entry fields check themselves while typing (gui/components/field_check.CheckedEntry): a
+red border and message when invalid. Add stays disabled until every required field is
+filled in and every field is valid; Add still runs the full check (several fields
+together) and shows any problem under its field.
 """
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from gui import theme
+from gui.components.field_check import CheckedEntry
 
 
 class ListEditor(ttk.Frame):
@@ -19,6 +28,7 @@ class ListEditor(ttk.Frame):
         self.title, self.fields, self.columns, self.validate = title, fields, columns, validate
         self.items = []
         self.vars = {}
+        self.entries = {}                                # key -> CheckedEntry
         if note:
             label = ttk.Label(self, text=note, foreground=theme.TEXT_MUTED, justify='left')
             label.pack(anchor='w', fill='x', pady=(0, 8))
@@ -28,7 +38,7 @@ class ListEditor(ttk.Frame):
         for i, f in enumerate(fields):
             row, col = divmod(i, 2)
             cell = ttk.Frame(form)
-            cell.grid(row=row, column=col, sticky='w', padx=(0, 14), pady=3)
+            cell.grid(row=row, column=col, sticky='nw', padx=(0, 14), pady=3)
             kind = f.get('kind', 'entry')
             if kind == 'check':
                 var = tk.IntVar(value=int(f.get('default', 0)))
@@ -40,12 +50,20 @@ class ListEditor(ttk.Frame):
                     ttk.Combobox(cell, textvariable=var, values=f['values'], state='readonly',
                                  width=f.get('width', 12)).pack(anchor='w')
                 else:
-                    ttk.Entry(cell, textvariable=var, width=f.get('width', 14)).pack(anchor='w')
+                    entry = CheckedEntry(cell, var, check=f.get('check'), typing=f.get('typing'),
+                                         width=f.get('width', 14),
+                                         required=f.get('required', False),
+                                         warn=f.get('warn'), label=f['label'])
+                    entry.pack(anchor='w')
+                    entry.on_change = self._update_add
+                    self.entries[f['key']] = entry
             self.vars[f['key']] = var
         buttons = ttk.Frame(self)
         buttons.pack(fill='x', pady=(8, 0))
-        ttk.Button(buttons, text='Add', command=self.add).pack(side='left')
+        self.add_btn = ttk.Button(buttons, text='Add', command=self.add)
+        self.add_btn.pack(side='left')
         ttk.Button(buttons, text='Remove selected', command=self.remove).pack(side='right')
+        self._update_add()
         self.tree = ttk.Treeview(self, columns=[c[0] for c in columns], show='headings',
                                  height=height)
         for key, heading, width in columns:
@@ -57,10 +75,32 @@ class ListEditor(ttk.Frame):
         return {k: (v.get().strip() if isinstance(v, tk.StringVar) else bool(v.get()))
                 for k, v in self.vars.items()}
 
+    def ready(self):
+        """True when every required field is filled in and every field is valid."""
+        return all(e.ready() for e in self.entries.values())
+
+    def _update_add(self):
+        if hasattr(self, 'add_btn'):
+            self.add_btn.state(['!disabled'] if self.ready() else ['disabled'])
+
+    def pending_problems(self):
+        """[(field label, message)] for values typed here that are not valid (Preview and
+        Apply are blocked while they are). Untouched empty fields are not a problem."""
+        out = []
+        for e in self.entries.values():
+            if e.value():
+                problem = e.problem()
+                if problem:
+                    out.append((e.label, problem))
+        return out
+
     def add(self):
         problem, item = self.validate(self.values(), self.items)
         if problem:
-            messagebox.showerror(f'Cannot add ({self.title})', problem)
+            field, message = problem if isinstance(problem, tuple) else (None, problem)
+            if field in self.entries:
+                self.entries[field].show_error(message)
+            messagebox.showerror(f'Cannot add ({self.title})', message)
             return None
         self.items.append(item)
         for f in self.fields:                            # clear typed values, keep choices

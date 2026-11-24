@@ -13,6 +13,11 @@
   POST /admin/users/{id}/reject  200  (admin)
   POST /admin/users/{id}/disable 200  (admin; ends the account's sessions)
   POST /admin/users/{id}/role    200  (admin; {"role": ...}; ends the account's sessions)
+  POST /admin/users/{id}/unlock  200  (admin; clears a failed-device-login lock; never one's own)
+  POST /security/device-login    200  (signed in; reports one device login: the lockout state)
+  POST /dev/reset-locks          200  TESTING MODE only (device_lockout.DEV_RESET_LOCKS_ON_RESTART):
+                                      registered only while the flag is True; 403 if it is off,
+                                      in production, or not from this computer
 
 Rules kept here (everything else is AuthService's job):
   * tokens only in the Authorization: Bearer header; never in URLs or responses other
@@ -39,7 +44,8 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.auth.errors import (AccountNotActive, AuthError, CodeInvalid, DeliveryFailed,
+from backend.auth.errors import (AccountLocked, AccountNotActive, AuthError, CodeInvalid,
+                                 DeliveryFailed,
                                  InvalidRequest, LoginFailed, NotAuthenticated, NotPermitted,
                                  RetryLater, ServiceUnavailable)
 from backend.auth.rate_limit import Limit, SlidingWindowLimiter
@@ -50,7 +56,8 @@ MAX_BODY_BYTES = 8 * 1024
 MAX_TOKEN_LENGTH = 128
 API_LIMIT_PER_IP = Limit(120, 60)              # all /auth and /admin requests, per client IP
 WORKSTATION_HEADER = 'X-NetCommand-Workstation'
-PROTECTED_PREFIXES = ('/auth/', '/admin/')
+PROTECTED_PREFIXES = ('/auth/', '/admin/', '/security/', '/dev/')
+LOOPBACK_CLIENTS = ('127.0.0.1', '::1', 'localhost', 'testclient')
 ROLES = ('admin', 'operator', 'viewer')
 STATUSES = ('pending_verification', 'pending_approval', 'active', 'rejected', 'disabled')
 
@@ -61,6 +68,7 @@ ERRORS = (
     (LoginFailed, 401, 'login_failed'),
     (NotAuthenticated, 401, 'not_authenticated'),
     (AccountNotActive, 403, 'account_not_active'),
+    (AccountLocked, 403, 'account_locked'),
     (NotPermitted, 403, 'not_permitted'),
     (RetryLater, 429, 'rate_limited'),
     (DeliveryFailed, 503, 'delivery_failed'),
@@ -106,6 +114,11 @@ class ApproveBody(_Body):
 
 class RoleBody(_Body):
     role: Literal['admin', 'operator', 'viewer']
+
+
+class DeviceLoginBody(_Body):
+    device_ip: Optional[str] = Field(None, max_length=45)
+    outcome: Literal['success', 'auth_failed', 'unreachable']
 
 
 # ---------------------------------------------------------------- the service
@@ -243,6 +256,10 @@ LOGIN_MESSAGE = 'A sign-in code has been sent to your email address.'
 auth = APIRouter(prefix='/auth', tags=['authentication'], dependencies=[Depends(api_rate_limit)])
 admin = APIRouter(prefix='/admin', tags=['administration'],
                   dependencies=[Depends(api_rate_limit)])
+security = APIRouter(prefix='/security', tags=['security'],
+                     dependencies=[Depends(api_rate_limit)])
+dev = APIRouter(prefix='/dev', tags=['testing mode'], dependencies=[Depends(api_rate_limit)],
+                include_in_schema=False)
 
 
 @auth.post('/register', status_code=202)
@@ -361,6 +378,42 @@ def disable_user(request: Request, user_id: int = UserId, token: str = Depends(b
                         headers={'Cache-Control': 'no-store'})
 
 
+@admin.post('/users/{user_id}/unlock')
+def unlock_user(request: Request, user_id: int = UserId, token: str = Depends(bearer_token),
+                _admin=Depends(require_admin), service=Depends(get_auth_service)):
+    """Clear a lock after failed device logins (temporary or permanent), the failure count
+    and the lockout count. Admins only (enforced here AND in the service); never one's own
+    account (400)."""
+    cleared = guarded(service.unlock_account, token, user_id, **client_context(request))
+    return JSONResponse({'user_id': user_id, 'cleared': cleared},
+                        headers={'Cache-Control': 'no-store'})
+
+
+@security.post('/device-login')
+def device_login(request: Request, body: DeviceLoginBody, token: str = Depends(bearer_token),
+                 service=Depends(get_auth_service)):
+    """The desktop reports one login to a network device by the signed-in user. A lock
+    ends every session of the account at once (the next request answers 401)."""
+    result = guarded(service.report_device_login, token, body.device_ip, body.outcome,
+                     **client_context(request))
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
+@dev.post('/reset-locks')
+def dev_reset_locks(request: Request, service=Depends(get_auth_service)):
+    """TESTING MODE: the desktop app asks for the reset when it starts (before anyone is
+    signed in, so there is no session). Refused (403) unless the flag is on, the backend
+    is not in production, and the request comes from this computer."""
+    from backend.auth import device_lockout as DL
+    client = request.client.host if request.client else None
+    if not DL.dev_reset_enabled(request.app.state.settings.environment) or \
+            client not in LOOPBACK_CLIENTS:
+        raise NotPermitted()
+    n = guarded(service.dev_reset_locks, 'desktop app start', client_ip=client)
+    return JSONResponse({'testing_mode': True, 'reset_users': n},
+                        headers={'Cache-Control': 'no-store'})
+
+
 # ---------------------------------------------------------------- body size limit
 class BodySizeLimit:
     """ASGI middleware: requests to the authentication routes may carry at most
@@ -429,3 +482,7 @@ def install(app: FastAPI, auth_service=None):
     app.add_middleware(BodySizeLimit)
     app.include_router(auth)
     app.include_router(admin)
+    app.include_router(security)
+    from backend.auth import device_lockout as DL
+    if DL.dev_reset_enabled(app.state.settings.environment):   # testing mode only
+        app.include_router(dev)

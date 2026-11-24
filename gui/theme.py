@@ -189,6 +189,11 @@ def apply(root):
               foreground=[('disabled', TEXT_MUTED), ('readonly', TEXT)],
               selectbackground=[('readonly', CARD)],
               selectforeground=[('readonly', TEXT)], bordercolor=[('focus', ACCENT)])
+    # an invalid field on the Configure page: red border (gui/components/field_check.py)
+    for name in ('Invalid.TEntry', 'Invalid.TCombobox'):
+        style.configure(name, fieldbackground=CARD, foreground=TEXT, bordercolor=DANGER,
+                        lightcolor=DANGER, darkcolor=DANGER)
+        style.map(name, bordercolor=[('focus', DANGER)], lightcolor=[('focus', DANGER)])
     root.option_add('*TCombobox*Listbox.background', CARD)
     root.option_add('*TCombobox*Listbox.foreground', TEXT)
     root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)

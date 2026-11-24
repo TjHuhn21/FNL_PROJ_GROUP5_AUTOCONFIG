@@ -27,6 +27,13 @@ class AccountNotActive(AuthError):
                       'administrator approval, or it has been disabled.')
 
 
+class AccountLocked(AuthError):
+    """Locked after too many failed DEVICE logins (temporarily or until an admin unlocks
+    it). The message is one of device_lockout's fixed texts (how long, or admin unlock);
+    only sent after a correct password."""
+    public_message = 'This account is locked because of too many failed device logins.'
+
+
 class CodeInvalid(AuthError):
     public_message = 'The code is wrong, has expired or has already been used.'
 

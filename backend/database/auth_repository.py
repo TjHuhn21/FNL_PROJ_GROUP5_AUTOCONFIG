@@ -34,6 +34,7 @@ ago, so two simultaneous requests cannot both send a code.
 """
 import secrets
 
+from backend.auth import device_lockout as DL
 from backend.database import auth_records as R
 from backend.database.connection import close_quietly, connect_runtime, driver_error_code, \
     is_driver_error, translate
@@ -53,8 +54,14 @@ NOW = 'UTC_TIMESTAMP(6)'
 # list_users(): what an admin needs to review accounts. No password hash and no failure
 # counter; 'locked' (true/false) instead of the lock time.
 LIST_USER_FIELDS = ('id', 'email', 'full_name', 'role', 'status', 'email_verified_at',
-                    'approved_by', 'approved_at', 'created_at', 'updated_at', 'locked')
+                    'approved_by', 'approved_at', 'created_at', 'updated_at', 'locked',
+                    'security_lock', 'security_locked_until')
 _LOCK_ACTIVE = f'(locked_until IS NOT NULL AND locked_until > {NOW})'
+# A lock after too many failed DEVICE logins (migration 5; rules: auth/device_lockout.py).
+_STATE_COLUMNS = ('user_id, failed_count, first_failed_at, locked_until, permanent_locked_at, '
+                  'lockouts_reset_at')
+_SECURITY_LOCKED = (f'EXISTS (SELECT 1 FROM security_device_login_state st WHERE st.user_id = '
+                    f'u.id AND (st.permanent_locked_at IS NOT NULL OR st.locked_until > {NOW}))')
 
 USER_NOT_FOUND = 'The user does not exist.'
 TOKEN_IN_USE = 'This session token hash is already in use.'
@@ -330,20 +337,121 @@ class AuthRepository:
         R.check_limit(limit)
         if after_id is not None:
             R.check_id(after_id, 'after_id')
-        columns = ', '.join(LIST_USER_FIELDS[:-1])
-        sql, params = f'SELECT {columns}, {_LOCK_ACTIVE} AS locked FROM users WHERE 1 = 1', []
+        columns = ', '.join(f'u.{c}' for c in LIST_USER_FIELDS[:-3])
+        sql = (f'SELECT {columns}, (u.locked_until IS NOT NULL AND u.locked_until > {NOW}) AS '
+               f'locked, (CASE WHEN st.permanent_locked_at IS NOT NULL THEN \'permanent\' '
+               f'WHEN st.locked_until > {NOW} THEN \'temporary\' END) AS security_lock, '
+               f'(CASE WHEN st.permanent_locked_at IS NULL AND st.locked_until > {NOW} THEN '
+               f'st.locked_until END) AS security_locked_until FROM users u '
+               f'LEFT JOIN security_device_login_state st ON st.user_id = u.id WHERE 1 = 1')
+        params = []
         if status is not None:
-            sql += ' AND status = %s'
+            sql += ' AND u.status = %s'
             params.append(status)
         if after_id is not None:
-            sql += ' AND id > %s'
+            sql += ' AND u.id > %s'
             params.append(after_id)
-        sql += ' ORDER BY id LIMIT %s'
+        sql += ' ORDER BY u.id LIMIT %s'
         params.append(limit)
         rows = self._tx(lambda cur: self._all(cur, sql, params))
         for row in rows:
             row['locked'] = bool(row['locked'])
         return rows
+
+    # ------------------------------------------------------------ failed device logins
+    def device_login_state(self, user_id):
+        """(state, now, recent_lockouts) for this user: the stored state (or an empty one),
+        the database's current UTC time, and the lockouts that count towards a permanent
+        lock (since device_lockout.lockouts_since)."""
+        R.check_id(user_id, 'user_id')
+
+        def work(cur):
+            now = self._one(cur, f'SELECT {NOW} AS now', ())['now']
+            row = self._one(cur, f'SELECT {_STATE_COLUMNS} FROM security_device_login_state '
+                                 f'WHERE user_id = %s', (user_id,))
+            state = dict(row) if row else DL.empty_state(user_id)
+            n = self._one(cur, 'SELECT COUNT(*) AS n FROM security_lockouts WHERE user_id = %s '
+                               'AND created_at > %s',
+                          (user_id, DL.lockouts_since(state, now)))['n']
+            return state, now, n
+        return self._tx(work)
+
+    def record_device_login(self, user_id, outcome, device_ip=None,
+                            policy=DL.DEFAULT_DEVICE_POLICY):
+        """Apply one reported device login (device_lockout.decide) in ONE transaction with
+        the user's state row locked, so simultaneous reports are counted one after the
+        other. A new lockout is recorded (append-only) in the same transaction.
+        Returns decide()'s result plus 'now' (the database's UTC time)."""
+        R.check_id(user_id, 'user_id')
+        R.check_choice(outcome, DL.OUTCOMES, 'outcome')
+        ip = R.check_optional_text(device_ip, R.IP_MAX, 'device_ip')
+
+        def work(cur):
+            self._require_user(cur, user_id)
+            cur.execute(f'INSERT IGNORE INTO security_device_login_state (user_id, updated_at) '
+                        f'VALUES (%s, {NOW})', (user_id,))
+            now = self._one(cur, f'SELECT {NOW} AS now', ())['now']
+            state = dict(self._one(cur, f'SELECT {_STATE_COLUMNS} FROM '
+                                        f'security_device_login_state WHERE user_id = %s '
+                                        f'FOR UPDATE', (user_id,)))
+            recent = self._one(cur, 'SELECT COUNT(*) AS n FROM security_lockouts WHERE '
+                                    'user_id = %s AND created_at > %s',
+                               (user_id, DL.lockouts_since(state, now, policy)))['n']
+            new, result = DL.decide(state, recent, outcome, now, policy)
+            if new != state:
+                self._save_state(cur, new)
+            if result['event'] in ('temporary', 'permanent'):
+                cur.execute('INSERT INTO security_lockouts (user_id, created_at, kind, '
+                            'locked_until, device_ip, reason) VALUES (%s, %s, %s, %s, %s, %s)',
+                            (user_id, now, result['event'], result['locked_until'], ip,
+                             DL.REASONS.get(outcome)))
+            return dict(result, now=now)
+        return self._tx(work)
+
+    def unlock_device_security(self, user_id):
+        """Clear a device-login lock, the failure count and the lockout count (older
+        lockouts stay as history but stop counting). Returns the lock that was cleared
+        ('temporary' / 'permanent') or None when the account was not locked; the counts
+        are cleared either way."""
+        R.check_id(user_id, 'user_id')
+
+        def work(cur):
+            self._require_user(cur, user_id)
+            now = self._one(cur, f'SELECT {NOW} AS now', ())['now']
+            row = self._one(cur, f'SELECT {_STATE_COLUMNS} FROM security_device_login_state '
+                                 f'WHERE user_id = %s FOR UPDATE', (user_id,))
+            if not row:
+                return None
+            state = dict(row)
+            self._save_state(cur, DL.unlocked_state(state, now))
+            return DL.is_locked(state, now)
+        return self._tx(work)
+
+    def reset_all_device_security(self):
+        """TESTING MODE only (device_lockout.DEV_RESET_LOCKS_ON_RESTART): clear every
+        account's failure count, temporary and permanent lock and lockout count (lockouts
+        before now stop counting; their history rows are kept). Nothing else changes.
+        Returns how many accounts had something to clear."""
+        def work(cur):
+            n = self._one(cur, f'SELECT COUNT(*) AS n FROM security_device_login_state st '
+                               f'WHERE st.failed_count > 0 OR st.locked_until IS NOT NULL OR '
+                               f'st.permanent_locked_at IS NOT NULL OR EXISTS (SELECT 1 FROM '
+                               f'security_lockouts l WHERE l.user_id = st.user_id AND '
+                               f'l.created_at > COALESCE(st.lockouts_reset_at, \'1000-01-01\'))',
+                          ())['n']
+            cur.execute(f'UPDATE security_device_login_state SET failed_count = 0, '
+                        f'first_failed_at = NULL, locked_until = NULL, permanent_locked_at = '
+                        f'NULL, lockouts_reset_at = {NOW}, updated_at = {NOW}', ())
+            return n
+        return self._tx(work)
+
+    @staticmethod
+    def _save_state(cur, st):
+        cur.execute(f'UPDATE security_device_login_state SET failed_count = %s, '
+                    f'first_failed_at = %s, locked_until = %s, permanent_locked_at = %s, '
+                    f'lockouts_reset_at = %s, updated_at = {NOW} WHERE user_id = %s',
+                    (st['failed_count'], st['first_failed_at'], st['locked_until'],
+                     st['permanent_locked_at'], st['lockouts_reset_at'], st['user_id']))
 
     # ------------------------------------------------------------ password attempts
     def begin_password_attempt(self, user_id, threshold, lockout_seconds, *, client_ip=None,
@@ -561,7 +669,7 @@ class AuthRepository:
                  f'JOIN users u ON u.id = s.user_id WHERE s.token_hash = %s '
                  f'AND s.revoked_at IS NULL AND s.expires_at > {NOW} '
                  f'AND s.last_seen_at > {NOW} - INTERVAL %s SECOND AND u.status = \'active\' '
-                 f'AND u.email_verified_at IS NOT NULL',
+                 f'AND u.email_verified_at IS NOT NULL AND NOT {_SECURITY_LOCKED}',
             (token_hash, idle_timeout_seconds)))
 
     def touch_session(self, session_id, idle_timeout_seconds):

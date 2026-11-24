@@ -42,6 +42,7 @@ import hmac
 import os
 import re
 import tempfile
+import threading
 from collections import namedtuple
 from datetime import datetime
 
@@ -129,10 +130,15 @@ class _Report:
 
 
 def _open(creds):
-    conn = ConnectHandler(device_type='cisco_ios', host=creds['host'],
-                          username=creds['username'], password=creds['password'],
-                          secret=creds.get('secret') or creds['password'], **LOGIN_TIMEOUTS,
-                          **ssh_options.connect_options(creds['host']))
+    """A logged SSH session (device_log: every command and its result go to the Console,
+    masked); the password is never logged."""
+    import device_log
+    conn = device_log.open_logged(
+        lambda: ConnectHandler(device_type='cisco_ios', host=creds['host'],
+                               username=creds['username'], password=creds['password'],
+                               secret=creds.get('secret') or creds['password'], **LOGIN_TIMEOUTS,
+                               **ssh_options.connect_options(creds['host'])),
+        creds['host'], creds.get('username', ''))
     if conn.find_prompt().endswith('>'):
         try:
             conn.enable()
@@ -143,12 +149,15 @@ def _open(creds):
 
 
 def get_config(creds):
-    """The running-config text of a device. creds = {'host','username','password'}."""
-    conn = _open(creds)
-    try:
-        return conn.send_command('show running-config')
-    finally:
-        conn.disconnect()
+    """The running-config text of a device. creds = {'host','username','password'}.
+    (The Findings review: its commands are logged under 'findings'.)"""
+    import device_log
+    with device_log.activity(device_log.FINDINGS):
+        conn = _open(creds)
+        try:
+            return conn.send_command('show running-config')
+        finally:
+            conn.disconnect()
 
 
 # ---------------------------------------------------------------- privilege
@@ -179,6 +188,9 @@ def privilege_problem(output):
 # running configuration that is read anyway. Only what the device shows is recorded;
 # anything not found (or not a plain value) is recorded as unavailable (None), never guessed.
 SHOW_VERSION = 'show version'
+SHOW_VLAN = 'show vlan brief'
+KNOWN_TYPES = ('switch', 'router')
+TYPE_MISMATCH_START = 'Configuration FAILED on'
 _SERIAL = re.compile(r'^Processor board ID[ \t]+(\S+)[ \t\r]*$', re.MULTILINE)
 # "Cisco CISCO1941/K9 (revision 1.0) with 491520K/32768K bytes of memory."
 # "cisco WS-C2960-24TT-L (PowerPC405) processor (revision B0) with 65536K bytes of memory."
@@ -441,15 +453,30 @@ def split_reply(raw, command):
     return '\n'.join(lines).strip(), prompt
 
 
-def apply_config(creds, commands, checks=(), backup_dir=None, log=None):
+def apply_config(creds, commands, checks=(), backup_dir=None, log=None, expected_type=None,
+                 device_name=None):
     """Returns (True or False, message).
     checks is a list of (show command, text that must appear in its output).
-    log(kind, text), if given, receives every step (see the module notes)."""
+    log(kind, text), if given, receives every step (see the module notes).
+    expected_type: 'switch' / 'router' for Switch / Router settings (None: typed commands,
+    no type check). The device's own `show version` (and, without a known model, `show vlan
+    brief`) must not show the other type: if it does, the Apply stops before the backup and
+    before any configuration command (type_mismatch_message). A device whose type cannot be
+    told is not refused: the type set on the Devices page is used.
+    device_name: the name used in that message (default: the IP)."""
     host = creds['host']
     report = _Report(log)
     commands = [c for c in commands if c and c.strip() and not c.strip().startswith('#')]
     if not commands:
         return False, 'There are no commands to send.'
+    import validators                     # the last check before anything leaves this computer
+    for c in commands:
+        problem = validators.check_cli_line(c)
+        if problem:
+            report('error', f'REFUSED: "{mask(c.strip())[:80]}": {problem}')
+            return False, (f'A command was refused before connecting: "{mask(c.strip())[:80]}" '
+                           f'({problem}) No SSH connection was opened to {host}; nothing was '
+                           f'sent.')
     # Preflight: without a usable backup encryption key no SSH session is even opened.
     try:
         backup_key = load_backup_key()
@@ -466,7 +493,8 @@ def apply_config(creds, commands, checks=(), backup_dir=None, log=None):
     except Exception as err:
         return _connect_failed(err, host, report)
     try:
-        return _session(conn, host, commands, checks, backup_dir, report, backup_key)
+        return _session(conn, host, commands, checks, backup_dir, report, backup_key,
+                        expected_type, device_name)
     except NetmikoTimeoutException:
         report('error', 'The device stopped answering during the session.')
         return False, 'No answer (wrong IP, device off, or SSH not enabled).'
@@ -505,7 +533,38 @@ def _connect_failed(err, host, report):
     return False, f'Error: {type(err).__name__} (the SSH connection could not be opened).'
 
 
-def _session(conn, host, commands, checks, backup_dir, report, backup_key=None):
+def _live_type(conn, prompt, version, report):
+    """'switch', 'router' or 'unknown' as the device itself shows it: the model in
+    `show version` (already read), else `show vlan brief` (read-only), with the scan's own
+    rules (discovery.crawler.classify). Never guessed: unclear output is 'unknown'."""
+    from discovery.crawler import classify as classify_type, platform_type
+    kind = platform_type(version)
+    if kind:
+        return kind
+    report('command', f'{prompt} {SHOW_VLAN}')
+    try:
+        vlan = conn.send_command(SHOW_VLAN)
+        report.output(vlan, limit=5)
+    except (NetmikoTimeoutException, NetmikoAuthenticationException):
+        raise
+    except Exception:
+        vlan = None
+    return classify_type(version, vlan)
+
+
+def type_mismatch_message(name, expected, actual):
+    return (f'{TYPE_MISMATCH_START} {name}: the device type is set to {expected.upper()}, but '
+            f'the device is a {actual.upper()}. Fix the type on the Devices page (Edit) and try '
+            f'again. No backup was taken and no configuration command was sent; the device was '
+            f'not changed.')
+
+
+def is_type_mismatch(message):
+    return (message or '').startswith(TYPE_MISMATCH_START)
+
+
+def _session(conn, host, commands, checks, backup_dir, report, backup_key=None,
+             expected_type=None, device_name=None):
     prompt = conn.find_prompt().strip()
     report('ok', f'SSH connection established. Device prompt: {prompt}')
     if getattr(conn, 'netcommand_enabled', False):
@@ -545,6 +604,20 @@ def _session(conn, host, commands, checks, backup_dir, report, backup_key=None):
         version = None
         report('warn', f'"{SHOW_VERSION}" failed ({type(err).__name__}); the device identity '
                        f'is recorded as unavailable.')
+    if expected_type in KNOWN_TYPES:          # Switch / Router settings: is it really one?
+        actual = _live_type(conn, prompt, version, report)
+        if actual in KNOWN_TYPES and actual != expected_type:
+            report('error', f'DEVICE TYPE MISMATCH: the type is set to {expected_type}, but the '
+                            f'device reports that it is a {actual}.')
+            report('section', 'RESULT')
+            report('error', 'FAILED: no backup was taken and no configuration command was sent; '
+                            'the device was not changed.')
+            return False, type_mismatch_message(device_name or host, expected_type, actual)
+        if actual == expected_type:
+            report('ok', f'Device type confirmed: {actual}.')
+        else:
+            report('warn', f'The device type could not be confirmed from the device; going on '
+                           f'with the type set on the Devices page ({expected_type}).')
     report('command', f'{prompt} show running-config')
     running = conn.send_command('show running-config')
     identity = parse_identity(version, running)
@@ -616,9 +689,57 @@ def _session(conn, host, commands, checks, backup_dir, report, backup_key=None):
     report('command', f'{prompt} {SAVE_COMMAND}')
     saved = conn.save_config()
     report.output(saved if isinstance(saved, str) else '')
+    _record_diff(conn, prompt, host, running, report)
     report('section', 'RESULT')
     report('ok', f'SUCCESS: {len(commands)} command(s) applied, verified and saved. Backup: {backup}')
     return True, f'Applied and verified. {checksum} Backup: {backup}'
+
+
+# ---------------------------------------------------------------- before / after
+# host -> the masked running-config diff of its last successful Apply (the Console shows it
+# when the "applied" line is double-clicked). Written by the Apply thread, taken once by the
+# window's thread (take_diff).
+_DIFFS = {}
+_DIFFS_LOCK = threading.Lock()
+_NOISE = ('Building configuration', 'Current configuration :', '! Last configuration change',
+          '! NVRAM config last updated', 'ntp clock-period')
+
+
+def config_diff(before, after):
+    """A unified diff of two running configurations (masked), without the lines that change
+    on every read (byte counts, change times). '' when nothing differs."""
+    import difflib
+
+    def lines(text):
+        return [mask(l.rstrip()) for l in (text or '').splitlines()
+                if l.strip() and not l.strip().startswith(_NOISE)]
+    diff = list(difflib.unified_diff(lines(before), lines(after), 'before (running-config)',
+                                     'after (running-config)', lineterm='', n=2))
+    return '\n'.join(diff)
+
+
+def _record_diff(conn, prompt, host, before, report):
+    """Read the running configuration again (read-only) and keep the before/after."""
+    report('command', f'{prompt} show running-config')
+    try:
+        after = conn.send_command('show running-config')
+    except Exception as err:
+        report('warn', f'The configuration could not be read again for the before/after view '
+                       f'({type(err).__name__}); the change itself is saved.')
+        return
+    diff = config_diff(before, after)
+    added = sum(1 for l in diff.splitlines() if l.startswith('+') and not l.startswith('+++'))
+    removed = sum(1 for l in diff.splitlines() if l.startswith('-') and not l.startswith('---'))
+    report('info', f'Running configuration: {added} line(s) added, {removed} removed '
+                   f'(the Console shows the before/after: double-click the applied line).')
+    with _DIFFS_LOCK:
+        _DIFFS[host] = diff or '(The running configuration shows no difference.)'
+
+
+def take_diff(host):
+    """The before/after of this device's last successful Apply (once), or ''."""
+    with _DIFFS_LOCK:
+        return _DIFFS.pop(host, '')
 
 
 def _send(conn, prompt, commands, report):

@@ -10,6 +10,9 @@ account actions an admin needs. No HTTP here (that is the API phase).
   validate_session(token)                         -> SessionInfo   (or NotAuthenticated)
   logout(token)                                   -> True / False
   list_accounts / approve_account / reject_account / disable_account (admin sessions only)
+  report_device_login(token, device_ip, outcome)  -> the failed-device-login lockout state
+  unlock_account(token, user_id)                  -> clears a device-login lock (admin only)
+  recovery_unlock(email)                          -> the same from the server's command line
 
 What a client can learn
   * Whether an email address is registered: nothing. register() and
@@ -45,12 +48,15 @@ import logging
 import secrets
 from dataclasses import dataclass, field
 
+from backend.auth import device_lockout as DL
 from backend.auth import passwords
-from backend.auth.errors import (AccountNotActive, AuthError, CodeInvalid,  # noqa: F401
+from backend.auth.errors import (AccountLocked, AccountNotActive, AuthError,  # noqa: F401
+                                 CodeInvalid,
                                  DeliveryFailed, InvalidRequest, LoginFailed,
                                  NotAuthenticated, NotPermitted, RetryLater,
                                  ServiceUnavailable)
 from backend.auth.otp import issue_otp, verify_otp, _pepper_bytes
+from backend.auth.masking import mask_email
 from backend.auth.policy import DEFAULT_POLICY
 from backend.auth.rate_limit import Limit, SlidingWindowLimiter
 from backend.auth.tokens import InvalidSessionToken, hash_session_token, issue_session_token
@@ -227,6 +233,7 @@ class AuthService:
             self._audit('auth.login', 'denied', actor_user_id=uid, target_id=uid,
                         detail=f'{why_not_signed_in(user)}; no code sent', **ctx)
             raise AccountNotActive()
+        self._refuse_if_security_locked(user, 'no code sent', ctx)
         self._audit('auth.login_password_ok', 'success', actor_user_id=uid, target_id=uid,
                     detail='password correct; login code required', **ctx)
         return self._send_code(user, 'login', ctx, cooldown=True)
@@ -239,6 +246,7 @@ class AuthService:
             self._audit('auth.login', 'denied', actor_user_id=uid, target_id=uid,
                         detail=f'{why_not_signed_in(user)}; no session created', **ctx)
             raise AccountNotActive()
+        self._refuse_if_security_locked(user, 'no session created', ctx)
         issued = issue_session_token()
         session_id = self.repo.create_session(uid, issued.token_hash,
                                               self.policy.session_lifetime_seconds,
@@ -264,6 +272,7 @@ class AuthService:
         user = self.repo.get_user(old['user_id'])
         if not may_sign_in(user):
             raise AccountNotActive()
+        self._refuse_if_security_locked(user, 'no code sent', ctx)
         self._limit(('resend-email', R.normalize_email(user['email'])),
                     self.limits.resend_cooldown_per_email)
         sent = self._send_code(user, 'login', ctx, cooldown=True)
@@ -405,6 +414,142 @@ class AuthService:
                     target_id=user_id, detail=f'account disabled; {revoked} session(s) ended',
                     **ctx)
         return changed
+
+    # ------------------------------------------------------------ failed device logins
+    def report_device_login(self, token, device_ip, outcome, *, client_ip=None,
+                            workstation_label=None):
+        """The desktop reports one device login of the signed-in user (Scan, Configure):
+        outcome 'success' (count back to 0), 'auth_failed' (the device rejected the username
+        or password) or 'unreachable' (no answer). Counted on the server (device_lockout);
+        a lock signs the account out everywhere at once. Any signed-in role may report; the
+        answer says what happened and is safe to show:
+          {'event', 'failed_count', 'remaining', 'max_failed', 'locked', 'locked_until',
+           'lock_minutes', 'lockouts', 'lockouts_left', 'max_lockouts', 'message'}"""
+        ctx = self._context(client_ip, workstation_label)
+        info = self.validate_session(token)
+        if outcome not in DL.OUTCOMES:
+            raise InvalidRequest('outcome must be one of: ' + ', '.join(DL.OUTCOMES) + '.')
+        try:
+            ip = R.check_optional_text(device_ip, R.IP_MAX, 'device_ip')
+        except InvalidValue as err:
+            raise InvalidRequest(str(err)) from None
+        uid = info.user_id
+        user = self.repo.get_user(uid)
+        masked = mask_email(user['email']) if user else '?'
+        result = self.repo.record_device_login(uid, outcome, ip)
+        policy, event = DL.DEFAULT_DEVICE_POLICY, result['event']
+        reason = DL.REASONS.get(outcome, 'device login succeeded')
+        where = f'device {ip or "?"}'
+        if event == 'failed':
+            self._audit('security.device_login_failed', 'failure', actor_user_id=uid,
+                        target_id=uid, detail=f'{masked}: {where}: {reason} (failure '
+                                              f"{result['failed_count']} of {policy.max_failed} "
+                                              f"within {self._minutes(policy.failed_window)} "
+                                              f'minutes)', **ctx)
+        elif event in ('temporary', 'permanent'):
+            self._audit('security.device_login_failed', 'failure', actor_user_id=uid,
+                        target_id=uid, detail=f'{masked}: {where}: {reason} (failure '
+                                              f"{result['failed_count']} of {policy.max_failed})",
+                        **ctx)
+            if event == 'temporary':
+                self._audit('security.account_locked', 'denied', actor_user_id=uid,
+                            target_id=uid, detail=f'{masked}: locked for '
+                                                  f'{self._minutes(policy.lockout)} minutes '
+                                                  f"after {policy.max_failed} failed device "
+                                                  f"logins (last: {where}, {reason}); lockout "
+                                                  f"{result['lockouts']} of "
+                                                  f'{policy.max_lockouts} in 24 hours', **ctx)
+            else:
+                self._audit('security.account_locked_permanent', 'denied', actor_user_id=uid,
+                            target_id=uid, detail=f'{masked}: locked until an administrator '
+                                                  f"unlocks it ({result['lockouts']} lockouts "
+                                                  f'in 24 hours; last: {where}, {reason})',
+                            **ctx)
+            ended = self.repo.revoke_user_sessions(uid, 'security_lock')
+            for purpose in R.PURPOSES:
+                self.repo.invalidate_user_challenges(uid, purpose)
+            self._audit('auth.sessions_revoked', 'success', actor_user_id=uid, target_id=uid,
+                        detail=f'{masked}: signed out (security lock); {ended} session(s) '
+                               f'ended', **ctx)
+        locked_until = result['locked_until']
+        message = None
+        if result['locked'] == 'permanent':
+            message = DL.PERMANENT_MESSAGE
+        elif result['locked'] == 'temporary':
+            message = DL.temporary_message(result['lockouts_left'], policy)
+        return {'event': event, 'failed_count': result['failed_count'],
+                'remaining': result['remaining'], 'max_failed': policy.max_failed,
+                'locked': result['locked'],
+                'locked_until': None if locked_until is None else
+                locked_until.isoformat(timespec='seconds') + 'Z',
+                'lock_minutes': self._minutes(policy.lockout), 'lockouts': result['lockouts'],
+                'lockouts_left': result['lockouts_left'], 'max_lockouts': policy.max_lockouts,
+                'message': message}
+
+    def unlock_account(self, token, user_id, *, client_ip=None, workstation_label=None):
+        """An admin clears another account's device-login lock (temporary or permanent),
+        its failure count and its lockout count. Never one's own account. Returns the lock
+        that was cleared ('temporary' / 'permanent') or None if there was none."""
+        ctx = self._context(client_ip, workstation_label)
+        admin = self._admin(token, ctx, 'security.unlocked')
+        try:
+            R.check_id(user_id, 'user_id')
+        except InvalidValue as err:
+            raise InvalidRequest(str(err)) from None
+        if user_id == admin.user_id:
+            self._audit('security.unlocked', 'denied', actor_user_id=admin.user_id,
+                        target_id=user_id, detail='an administrator cannot unlock their own '
+                                                  'account', **ctx)
+            raise InvalidRequest('You cannot unlock your own account. Ask another '
+                                 'administrator, or use the recovery command on the server.')
+        target = self.repo.get_user(user_id)
+        if target is None:
+            raise InvalidRequest('The account does not exist.')
+        admin_user = self.repo.get_user(admin.user_id)
+        cleared = self.repo.unlock_device_security(user_id)
+        self._audit('security.unlocked', 'success', actor_user_id=admin.user_id,
+                    target_id=user_id,
+                    detail=f"{mask_email(target['email'])}: {cleared or 'no'} lock cleared by "
+                           f"administrator {mask_email(admin_user['email']) if admin_user else admin.user_id}; "
+                           f'failure and lockout counts reset', **ctx)
+        return cleared
+
+    def recovery_unlock(self, email, *, workstation_label='server command line'):
+        """The server's recovery command (manage.py unlock-user): the same unlock, without a
+        session, for when no administrator can sign in. Returns (user, cleared lock)."""
+        user = self.repo.find_user_by_email(self._email(email))
+        if user is None:
+            raise InvalidRequest('No account has this email address.')
+        cleared = self.repo.unlock_device_security(user['id'])
+        self._audit('security.unlocked', 'success', target_id=user['id'],
+                    workstation_label=workstation_label,
+                    detail=f"{mask_email(user['email'])}: {cleared or 'no'} lock cleared by the "
+                           f'recovery command on the server; failure and lockout counts reset')
+        return user, cleared
+
+    def dev_reset_locks(self, source, *, client_ip=None):
+        """TESTING MODE only: reset every account's device-login attempts, locks and
+        lockout counts (the caller checks device_lockout.dev_reset_enabled). Audited.
+        Returns how many accounts had something to clear."""
+        n = self.repo.reset_all_device_security()
+        self._audit('security.dev_reset', 'success', client_ip=client_ip,
+                    workstation_label=source,
+                    detail=f'TESTING MODE (DEV_RESET_LOCKS_ON_RESTART): device-login attempts '
+                           f'and locks cleared for {n} account(s) on {source}')
+        return n
+
+    def _refuse_if_security_locked(self, user, what, ctx):
+        state, now, _ = self.repo.device_login_state(user['id'])
+        message = DL.sign_in_refusal(state, now)
+        if message:
+            self._audit('auth.login', 'denied', actor_user_id=user['id'], target_id=user['id'],
+                        detail=f"{mask_email(user['email'])}: locked after failed device "
+                               f'logins; {what}', **ctx)
+            raise AccountLocked(message)
+
+    @staticmethod
+    def _minutes(delta):
+        return int(delta.total_seconds() // 60)
 
     # ------------------------------------------------------------ helpers
     @staticmethod

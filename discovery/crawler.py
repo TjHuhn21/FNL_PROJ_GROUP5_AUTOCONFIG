@@ -176,9 +176,13 @@ def parse_lldp(text):
 
 # ---------------------------------------------------------------- talking to one device
 def _login(ip, username, password):
-    conn = ConnectHandler(device_type='cisco_ios', host=ip, username=username,
-                          password=password, secret=password, **LOGIN_TIMEOUTS,
-                          **ssh_options.connect_options(ip))
+    """A logged SSH session (device_log): its commands are logged under 'scan'."""
+    import device_log
+    conn = device_log.open_logged(
+        lambda: ConnectHandler(device_type='cisco_ios', host=ip, username=username,
+                               password=password, secret=password, **LOGIN_TIMEOUTS,
+                               **ssh_options.connect_options(ip)),
+        ip, username, category=device_log.SCAN)
     if conn.find_prompt().endswith('>'):          # user mode: step up to privileged mode
         try:
             conn.enable()

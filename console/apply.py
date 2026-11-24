@@ -30,8 +30,11 @@ the others are NOT RUN. Cancelling takes effect only between steps.
 Afterwards (when the console is back at the privileged prompt): the AAA invariant check
 and a complete read-only re-detection.
 
-Never sent: write memory / copy (D3: nothing is saved; changes stay in the running
-configuration only), a management IP address, or a network SSH login (D2). The password
+A management address (interface mode: ip address / no shutdown, and the default gateway)
+is sent only when the operator typed it, on an interface the detection found. Saving
+(`write memory`, never `copy`) is sent only when the plan asked for it (separately
+approved), as the LAST step, after every other step is VERIFIED; the startup configuration
+is then checked. Never sent: a network SSH login (D2). The password
 is substituted into its line only when that line is written; it is never stored,
 logged, returned, or put in an exception (ApplyResult holds <SSH_PASSWORD> only).
 """
@@ -41,9 +44,10 @@ from dataclasses import dataclass, field
 
 from console import detect
 from console.link import (BOOT_LOADER, CONFIG_TIMEOUT, PASSWORD_PROMPT, PROMPT, QUESTION,
-                          UNSAFE_OUTPUT, ConsoleError, check_config_line, prompt_parts)
+                          SAVE_COMMAND, UNSAFE_OUTPUT, ConsoleError, check_config_line,
+                          prompt_parts)
 from console.plan import PASSWORD_PLACEHOLDER, build_plan, check_password, plan_is_stale
-from console.steps import CHECK, FAILED, UNCERTAIN, VERIFIED, readiness
+from console.steps import CHECK, FAILED, SAVE, UNCERTAIN, VERIFIED, readiness
 
 BLOCKED, NOT_RUN = 'blocked', 'not run'
 STATUS_TEXT = {VERIFIED: 'VERIFIED', FAILED: 'FAILED', UNCERTAIN: 'UNCERTAIN',
@@ -53,8 +57,11 @@ REFUSED, SUCCESS, FAILURE, INCOMPLETE, CANCELLED = ('refused', 'success', 'faile
                                                     'cancelled')
 RSA_TIMEOUT = 180            # seconds: key generation can take a minute or more on old routers
 CONFIRM_WORDS = 'APPLY SSH'
-NOT_SAVED = ('Nothing was saved: the changes are in the running configuration only. Saving '
-             '(write memory) is a separate step that NetCommand does not perform here.')
+NOT_SAVED = ('Nothing was saved: the changes are in the running configuration only and are '
+             'lost when the device restarts. Tick "Save to startup-config" in the preview to '
+             'save them as the last step.')
+SAVED = ('Saved: "write memory" ran as the last step and the startup configuration was '
+         'checked, so the changes survive a restart.')
 REFRESH = '<Enter> (prompt read again)'
 
 
@@ -99,7 +106,7 @@ class ApplyResult:
     recovery: list = field(default_factory=list)      # what the operator should do now
     final_detection: object = None                    # DetectionResult after the run
     cancelled: bool = False
-    saved: bool = False                               # always False (D3)
+    saved: bool = False                               # True only when the save step is VERIFIED
     console_released: bool = False                   # the port was closed, nothing typed,
                                                       # because the console was not at '#'
 
@@ -285,13 +292,14 @@ class _Runner:
         self._expect(rec, reply, config)
         try:
             before = config
+            sub = _sub_mode(c.mode)                 # 'config-line' / 'config-if' / None
             if c.mode:
-                line_mode = f'{self.host}(config-line)#'
+                line_mode = f'{self.host}({sub})#'
                 self._send(rec, c.mode, config, line_mode, markers)
                 before = line_mode
             secrets = {PASSWORD_PLACEHOLDER: self._password} \
                 if PASSWORD_PLACEHOLDER in c.text else None
-            after = f'{new_host}(config-line)#' if c.mode else f'{new_host}(config)#'
+            after = f'{new_host}({sub})#' if c.mode else f'{new_host}(config)#'
             reply = self._send(rec, c.text, before, after, markers,
                                timeout=RSA_TIMEOUT if step.step_id == 'rsa' else CONFIG_TIMEOUT,
                                secrets=secrets)
@@ -401,9 +409,30 @@ class _Runner:
         except Exception:
             return False
 
+    def save(self, step, rec):
+        """`write memory` at the verified '<host>#' prompt (the session allows it only for
+        a plan that asked for it). The reply must end at the same prompt; a question is never
+        answered. Returns the reply text; the startup checks then decide."""
+        if self.console != 'exec':
+            raise _Stop(UNCERTAIN, 'the console is not at the privileged prompt, so nothing was '
+                                   'saved')
+        self.out.commands_sent.append(SAVE_COMMAND)
+        rec.commands.append(SAVE_COMMAND)
+        reply = self.session.save_config()
+        rec.reply += reply.text.rstrip() + '\n'
+        if reply.state == PROMPT:
+            body, _logs = detect.strip_log_lines(reply.text)
+            if any(m in body for m in step.failure_replies):
+                raise _Stop(FAILED, 'the device did not save: '
+                                    + _first_error(body, step.failure_replies), console='exec')
+        self._expect(rec, reply, f'{self.host}#', logged=True)
+        return reply.text
+
     def _one(self, step, rec):
         reply = None
-        if step.kind != CHECK:
+        if step.kind == SAVE:
+            reply, _logs = detect.strip_log_lines(self.save(step, rec))
+        elif step.kind != CHECK:
             text = self.configure(step, rec)
             reply, _logs = detect.strip_log_lines(text)
             if any(m in reply for m in step.failure_replies):   # (normally _send raises)
@@ -485,6 +514,14 @@ class _Runner:
                 out.recovery.append(f'The final re-detection did not run ({err}); detect again.')
 
 
+def _sub_mode(mode):
+    """The prompt suffix of a configuration sub-mode: 'line vty 0 4' -> 'config-line',
+    'interface Vlan1' -> 'config-if'; None for global configuration."""
+    if not mode:
+        return None
+    return 'config-if' if mode.startswith('interface ') else 'config-line'
+
+
 def _first_error(text, markers):
     """The reply line that matched a failure marker."""
     for line in text.replace('\r', '').split('\n'):
@@ -529,6 +566,9 @@ def apply_plan(session, plan, result, request, password='', confirm='', confirma
     password = confirm = None                       # the runner holds the only reference
     runner.host = host
     session.allow_config(allowed_lines(plan))
+    saving = bool(getattr(plan, 'save_requested', False))
+    if saving:
+        session.allow_save(True)                    # write memory: only as the save step
     try:
         runner.run()
     except BaseException:                           # a programming error: never leave the
@@ -536,6 +576,13 @@ def apply_plan(session, plan, result, request, password='', confirm='', confirma
         raise
     finally:
         runner._password = None
+        if saving:
+            try:
+                session.allow_save(False)
+            except Exception:
+                pass
+    save_rec = out.step('save')
+    out.saved = save_rec is not None and save_rec.status == VERIFIED
     if runner.console == 'exec' and runner._active():
         runner.final_checks(detect_fn)
     else:
@@ -605,12 +652,12 @@ def _conclude(out):
                          f'(UNCERTAIN).',
              CANCELLED: 'Cancelled between steps.'}
     out.message = words[out.outcome] + (f' Verified: {", ".join(done)}.' if done else '') + \
-        ' ' + NOT_SAVED
+        ' ' + (SAVED if out.saved else NOT_SAVED)
     if out.changed and out.outcome != SUCCESS:
         out.recovery.append('Steps marked VERIFIED are in effect in the running configuration. '
                             'Steps marked BLOCKED or NOT RUN were not sent. Review the device at '
                             'the console before applying again; a new preview will only propose '
                             'what is still missing.')
-    if out.changed:
+    if out.changed and not out.saved:
         out.recovery.append(NOT_SAVED + ' Keep the console cable connected until SSH has been '
                                         'tested.')

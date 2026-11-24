@@ -223,7 +223,7 @@ def test_router_forms(page):
     routes.vars['next_hop'].set('10.0.0.254'); routes.add()
     assert [m[1] for m in shown] == ['Cannot add (router interface)'] * 2 + \
         ['Cannot add (static route)']
-    assert 'Did you mean 172.16.0.0' in shown[-1][2]
+    assert shown[-1][2] == 'Use the network address: 172.16.0.0'
     conf.make_preview()
     assert conf.commands_from_preview() == [
         'hostname EDGE-1', 'interface Gi0/0', 'ip address 10.0.0.1 255.255.255.0', 'no shutdown',
@@ -238,15 +238,17 @@ def test_router_dhcp_checks(page):
                  'gateway': '192.168.2.1', 'dns': '8.8.8.8'}.items():
         conf.dhcp[k].set(v)
     conf.make_preview()
-    assert shown[-1][1] == 'DHCP settings' and 'not inside' in shown[-1][2]
+    # Preview is blocked by the form check, which lists the field and the reason
+    assert shown[-1][1] == 'Cannot preview: fix these fields first'
+    assert 'DHCP > DHCP gateway: The gateway 192.168.2.1 is not inside' in shown[-1][2]
     conf.dhcp['gateway'].set('192.168.1.1')
     conf.dhcp['ex_start'].set('192.168.1.20'); conf.dhcp['ex_end'].set('192.168.1.1')
     conf.make_preview()
-    assert 'reversed' in shown[-1][2]
+    assert '"Exclude from" must not be after "Exclude to"' in shown[-1][2]
     conf.dhcp['ex_start'].set('192.168.1.1'); conf.dhcp['ex_end'].set('192.168.1.20')
     conf.hostname.set('bad name')
     conf.make_preview()
-    assert shown[-1][1] == 'Hostname'
+    assert 'Basics > Hostname: No spaces allowed in a hostname.' in shown[-1][2]
     conf.hostname.set('')
     conf.make_preview()
     assert conf.commands_from_preview()[0] == 'ip dhcp excluded-address 192.168.1.1 192.168.1.20'

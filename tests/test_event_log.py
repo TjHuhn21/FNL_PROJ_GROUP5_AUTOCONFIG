@@ -156,5 +156,7 @@ def test_monitor_changes_are_labelled(console):
     c.status_changed({'name': 'R1', 'ip': '10.0.0.1', 'status': 'down'}, 'up')
     c.flush()
     assert [(m, l) for _t, _s, m, l in c.lines] == [
-        ('R1 (10.0.0.1): status check FAILED, the device is DOWN (was up). Recorded.', 'error'),
+        ('R1 (10.0.0.1): status check WARNING, the device went DOWN (was up). Recorded.', 'warn'),
         ('R1 (10.0.0.1): status check SUCCESSFUL, the device is UP (was down). Recorded.', 'ok')]
+    # the monitor's automatic work is "system", on that device
+    assert {(r['user'], r['device']) for r in c.records} == {('system', 'R1')}

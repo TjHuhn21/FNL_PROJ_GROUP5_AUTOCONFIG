@@ -36,12 +36,15 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import validation
+import validators as V
 from config import commands_router, commands_switch
 from config import connect, multi
 from config.interfaces import parse_ports, port_count
 from gui import theme
 from gui.db_status import database_ready, report_error
+from gui.device_login_guard import SUCCESS, DeviceLoginGuard, outcome_of_apply, warning_text
 from gui.components.device_picker import DevicePicker, plural
+from gui.components.field_check import CheckedEntry
 from gui.components import login_dialog
 from gui.components.list_editor import ListEditor, wrap_to_width
 from gui.components.scroll_frame import ScrollFrame
@@ -118,6 +121,14 @@ class _DeviceBox:
         self.tab._show_forms_for_device()
 
 
+def _default_route_problem(text):
+    """The default route's next hop: an IP address, not 0.0.0.0 or a broadcast address."""
+    problem = V.check_ipv4(text)
+    if not problem and V.clean(text) in ('0.0.0.0', '255.255.255.255'):
+        problem = f'The next hop cannot be {V.clean(text)}.'
+    return problem
+
+
 def _caption(parent, text):
     return ttk.Label(parent, text=text, font=theme.mono(9, 'bold'), foreground=theme.TEXT_MUTED)
 
@@ -131,6 +142,7 @@ class ConfigureTab(ttk.Frame):
         super().__init__(parent, padding=(theme.PAD, 4, theme.PAD, theme.PAD))
         self.store = store
         self.log = log or (lambda *a, **k: None)
+        self.device_guard = DeviceLoginGuard()   # set by the main window (signed-in account)
         self.on_change = on_change or (lambda: None)
         self.on_applied = on_applied or (lambda: None)
         self._pending = None                      # what the current preview was built from
@@ -231,9 +243,12 @@ class ConfigureTab(ttk.Frame):
         tabs.add(trunk_page, text='Trunks')
         self.trunk_editor = ListEditor(
             trunk_page, 'trunk',
-            [{'key': 'ports', 'label': 'Ports', 'width': 16},
-             {'key': 'allowed', 'label': 'Allowed VLANs', 'width': 14},
-             {'key': 'native', 'label': 'Native VLAN', 'width': 8},
+            [{'key': 'ports', 'label': 'Ports', 'width': 16, 'required': True,
+              'check': V.check_port_list},
+             {'key': 'allowed', 'label': 'Allowed VLANs', 'width': 14, 'typing': 'vlan_list',
+              'check': V.check_vlan_list},
+             {'key': 'native', 'label': 'Native VLAN', 'width': 8, 'typing': 'number',
+              'check': lambda t: V.check_vlan_id(t, 'native VLAN')},
              {'key': 'encapsulation', 'label': 'encapsulation dot1q', 'kind': 'check',
               'default': 1}],
             [('ports', 'Ports', 110), ('allowed', 'Allowed', 90), ('native', 'Native', 60)],
@@ -246,8 +261,11 @@ class ConfigureTab(ttk.Frame):
         tabs.add(sec_page, text='Port security')
         self.security_editor = ListEditor(
             sec_page, 'port security',
-            [{'key': 'ports', 'label': 'Access ports', 'width': 16},
-             {'key': 'maximum', 'label': 'Max MAC addresses', 'width': 6, 'default': '2'},
+            [{'key': 'ports', 'label': 'Access ports', 'width': 16, 'required': True,
+              'check': V.check_port_list},
+             {'key': 'maximum', 'label': 'Max MAC addresses', 'width': 6, 'default': '2',
+              'typing': 'number', 'required': True,
+              'check': lambda t: V.check_number(t, 1, V.PORT_SECURITY_MAX, 'Max MAC addresses')},
              {'key': 'violation', 'label': 'On violation', 'kind': 'combo',
               'values': ['shutdown', 'restrict', 'protect'], 'default': 'shutdown'},
              {'key': 'sticky', 'label': 'Learn MACs (sticky)', 'kind': 'check', 'default': 1}],
@@ -261,10 +279,12 @@ class ConfigureTab(ttk.Frame):
         tabs.add(if_page, text='Interfaces')
         self.switch_if_editor = ListEditor(
             if_page, 'interface',
-            [{'key': 'ports', 'label': 'Ports', 'width': 16},
+            [{'key': 'ports', 'label': 'Ports', 'width': 16, 'required': True,
+              'check': V.check_port_list},
              {'key': 'state', 'label': 'State', 'kind': 'combo',
               'values': ['(leave)', 'no shutdown', 'shutdown'], 'default': '(leave)'},
-             {'key': 'description', 'label': 'Description', 'width': 34}],
+             {'key': 'description', 'label': 'Description', 'width': 34,
+              'check': V.check_description}],
             [('ports', 'Ports', 110), ('state', 'State', 90), ('description', 'Description', 140)],
             self._validate_switch_interface,
             note=PORT_HINT + '.  "shutdown" turns the ports off; "no shutdown" turns them on.')
@@ -275,10 +295,17 @@ class ConfigureTab(ttk.Frame):
         row = ttk.Frame(box); row.pack(fill='x')
         ttk.Label(row, text='VLAN ID').grid(row=0, column=0, sticky='w')
         ttk.Label(row, text='Name').grid(row=0, column=1, sticky='w')
-        ttk.Entry(row, textvariable=self.vid, width=8).grid(row=1, column=0, padx=(0, 8), pady=2)
-        ttk.Entry(row, textvariable=self.vname, width=18).grid(row=1, column=1, padx=(0, 8),
-                                                               pady=2)
-        ttk.Button(row, text='Add VLAN', command=self.add_vlan).grid(row=1, column=2, pady=2)
+        self.vid_entry = CheckedEntry(row, self.vid, typing='number', width=8, required=True,
+                                      label='VLAN ID', check=self._vlan_id_problem,
+                                      warn=V.vlan_id_warning)
+        self.vid_entry.grid(row=1, column=0, padx=(0, 8), pady=2, sticky='nw')
+        self.vname_entry = CheckedEntry(row, self.vname, width=18, label='VLAN name',
+                                        check=lambda t: V.check_name(t, 'The VLAN name'))
+        self.vname_entry.grid(row=1, column=1, padx=(0, 8), pady=2, sticky='nw')
+        self.add_vlan_btn = ttk.Button(row, text='Add VLAN', command=self.add_vlan)
+        self.add_vlan_btn.grid(row=1, column=2, pady=2, sticky='nw')
+        for e in (self.vid_entry, self.vname_entry):
+            e.on_change = self._update_add_buttons
         self.vlan_tree = ttk.Treeview(box, columns=('id', 'name'), show='headings', height=4)
         self.vlan_tree.heading('id', text='VLAN ID'); self.vlan_tree.heading('name', text='Name')
         self.vlan_tree.column('id', width=80, minwidth=70, stretch=False)
@@ -291,11 +318,21 @@ class ConfigureTab(ttk.Frame):
         prow = ttk.Frame(box); prow.pack(fill='x')
         ttk.Label(prow, text='Access ports').grid(row=0, column=0, sticky='w')
         ttk.Label(prow, text='in VLAN').grid(row=0, column=1, sticky='w')
-        ttk.Entry(prow, textvariable=self.port, width=20).grid(row=1, column=0, padx=(0, 8),
-                                                               pady=2)
-        self.port_vlan_box = ttk.Combobox(prow, textvariable=self.port_vlan, width=8, values=[])
-        self.port_vlan_box.grid(row=1, column=1, padx=(0, 8), pady=2)
-        ttk.Button(prow, text='Add ports', command=self.add_port).grid(row=1, column=2, pady=2)
+        self.port_entry = CheckedEntry(prow, self.port, width=20, required=True,
+                                       label='Access ports', check=V.check_port_list)
+        self.port_entry.grid(row=1, column=0, padx=(0, 8), pady=2, sticky='nw')
+        # "in VLAN": a VLAN of the list above, or one that already exists on the device
+        self.port_vlan_entry = CheckedEntry(prow, self.port_vlan, typing='number', width=8,
+                                            required=True, label='in VLAN', combo_values=[],
+                                            check=lambda t: V.check_vlan_id(t),
+                                            warn=self._port_vlan_note)
+        self.port_vlan_entry.grid(row=1, column=1, padx=(0, 8), pady=2, sticky='nw')
+        self.port_vlan_box = self.port_vlan_entry.entry
+        self.add_port_btn = ttk.Button(prow, text='Add ports', command=self.add_port)
+        self.add_port_btn.grid(row=1, column=2, pady=2, sticky='nw')
+        for e in (self.port_entry, self.port_vlan_entry):
+            e.on_change = self._update_add_buttons
+        self._update_add_buttons()
         hint = ttk.Label(box, text=PORT_HINT, foreground=theme.TEXT_MUTED, justify='left')
         hint.pack(anchor='w', fill='x', pady=(4, 0))
         wrap_to_width(hint)
@@ -321,36 +358,51 @@ class ConfigureTab(ttk.Frame):
         basics.grid_columnconfigure(1, weight=1)
         self.hostname, self.default_route = tk.StringVar(), tk.StringVar()
         self.dns_servers, self.ntp_server = tk.StringVar(), tk.StringVar()
-        rows = [('Hostname', self.hostname), ('Default route (next hop)', self.default_route),
-                ('DNS servers (comma list)', self.dns_servers), ('NTP server', self.ntp_server)]
-        for r, (label, var) in enumerate(rows, start=1):
-            ttk.Label(basics, text=label).grid(row=r, column=0, sticky='w', pady=3)
-            ttk.Entry(basics, textvariable=var, width=20).grid(row=r, column=1, sticky='w',
-                                                               padx=8, pady=3)
+        rows = [('Hostname', self.hostname, None, V.check_hostname),
+                ('Default route (next hop)', self.default_route, 'ipv4',
+                 _default_route_problem),
+                ('DNS servers (comma list)', self.dns_servers, 'ipv4_list', V.check_ipv4_list),
+                ('NTP server', self.ntp_server, 'ipv4', V.check_ipv4)]
+        self.basic_entries = {}
+        for r, (label, var, typing, check) in enumerate(rows, start=1):
+            ttk.Label(basics, text=label).grid(row=r, column=0, sticky='nw', pady=3)
+            entry = CheckedEntry(basics, var, check=check, typing=typing, width=20, label=label)
+            entry.grid(row=r, column=1, sticky='w', padx=8, pady=3)
+            self.basic_entries[label] = entry
 
         dhcp_page = ttk.Frame(tabs, padding=10)
         tabs.add(dhcp_page, text='DHCP')
-        self.dhcp = {k: tk.StringVar() for k in
-                     ('pool', 'network', 'mask', 'gateway', 'dns', 'ex_start', 'ex_end')}
-        rows = [('DHCP pool name', self.dhcp['pool']), ('DHCP network', self.dhcp['network']),
-                ('DHCP mask', self.dhcp['mask']), ('DHCP gateway', self.dhcp['gateway']),
-                ('DNS server', self.dhcp['dns']),
-                ('Exclude from', self.dhcp['ex_start']), ('Exclude to', self.dhcp['ex_end'])]
-        for r, (label, var) in enumerate(rows):
-            ttk.Label(dhcp_page, text=label).grid(row=r, column=0, sticky='w', pady=3)
-            ttk.Entry(dhcp_page, textvariable=var, width=20).grid(row=r, column=1, sticky='w',
-                                                                  padx=8, pady=3)
+        self.dhcp = {k: tk.StringVar() for k in V.DHCP_FIELDS}
+        rows = [('DHCP pool name', 'pool', None, lambda t: V.check_name(t, 'The pool name')),
+                ('DHCP network', 'network', 'ipv4', V.check_ipv4),
+                ('DHCP mask', 'mask', 'mask', V.check_mask),
+                ('DHCP gateway', 'gateway', 'ipv4', V.check_ipv4),
+                ('DNS server', 'dns', 'ipv4', V.check_ipv4),
+                ('Exclude from', 'ex_start', 'ipv4', V.check_ipv4),
+                ('Exclude to', 'ex_end', 'ipv4', V.check_ipv4)]
+        self.dhcp_entries = {}
+        for r, (label, key, typing, check) in enumerate(rows):
+            ttk.Label(dhcp_page, text=label).grid(row=r, column=0, sticky='nw', pady=3)
+            entry = CheckedEntry(dhcp_page, self.dhcp[key], check=check, typing=typing, width=20,
+                                 label=label)
+            entry.grid(row=r, column=1, sticky='w', padx=8, pady=3)
+            entry.on_change = self._recheck_dhcp      # the fields depend on each other
+            self.dhcp_entries[key] = entry
 
         if_page = ttk.Frame(tabs, padding=10)
         tabs.add(if_page, text='Interfaces')
         self.router_if_editor = ListEditor(
             if_page, 'router interface',
-            [{'key': 'name', 'label': 'Interface', 'width': 12},
+            [{'key': 'name', 'label': 'Interface', 'width': 12, 'required': True,
+              'check': V.check_interface_name},
              {'key': 'state', 'label': 'State', 'kind': 'combo',
               'values': ['(leave)', 'no shutdown', 'shutdown'], 'default': 'no shutdown'},
-             {'key': 'ip', 'label': 'IP address', 'width': 15},
-             {'key': 'mask', 'label': 'Subnet mask', 'width': 15},
-             {'key': 'description', 'label': 'Description', 'width': 30}],
+             {'key': 'ip', 'label': 'IP address', 'width': 15, 'typing': 'ipv4',
+              'check': V.check_ipv4},
+             {'key': 'mask', 'label': 'Subnet mask', 'width': 15, 'typing': 'mask',
+              'check': V.check_mask},
+             {'key': 'description', 'label': 'Description', 'width': 30,
+              'check': V.check_description}],
             [('name', 'Interface', 80), ('ip', 'IP', 105), ('mask', 'Mask', 105),
              ('state', 'State', 90)],
             self._validate_router_interface,
@@ -362,9 +414,12 @@ class ConfigureTab(ttk.Frame):
         tabs.add(route_page, text='Static routes')
         self.route_editor = ListEditor(
             route_page, 'static route',
-            [{'key': 'network', 'label': 'Destination network', 'width': 15},
-             {'key': 'mask', 'label': 'Subnet mask', 'width': 15},
-             {'key': 'next_hop', 'label': 'Next hop', 'width': 15}],
+            [{'key': 'network', 'label': 'Destination network', 'width': 15, 'typing': 'ipv4',
+              'required': True, 'check': V.check_ipv4},
+             {'key': 'mask', 'label': 'Subnet mask', 'width': 15, 'typing': 'mask',
+              'required': True, 'check': V.check_mask},
+             {'key': 'next_hop', 'label': 'Next hop', 'width': 15, 'required': True,
+              'check': self._next_hop_problem}],
             [('network', 'Network', 105), ('mask', 'Mask', 105), ('next_hop', 'Next hop', 105)],
             self._validate_route,
             note='For example 10.10.0.0  255.255.0.0  via 192.168.1.254. '
@@ -485,13 +540,46 @@ class ConfigureTab(ttk.Frame):
         self.target_note.config(text=text)
 
     # ------------------------------------------------------------ VLANs and access ports
+    def _vlan_id_problem(self, text):
+        """A VLAN ID 1-4094 that is not in the list yet."""
+        problem = V.check_vlan_id(text)
+        if not problem and int(V.clean(text)) in {v for v, _ in self.vlans}:
+            problem = f'VLAN {V.clean(text)} is already in the list.'
+        return problem
+
+    def _port_vlan_note(self, text):
+        """'in VLAN': fine when it is in the list above; otherwise it must already exist on
+        the device (said, never blocked: the device's VLANs are not known here)."""
+        if V.check_vlan_id(text):
+            return None
+        if int(V.clean(text)) in {v for v, _ in self.vlans}:
+            return None
+        return (f'VLAN {V.clean(text)} is not in the list above: it must already exist on '
+                f'the device.')
+
+    def _update_add_buttons(self):
+        """Add VLAN / Add ports only while their required fields are valid."""
+        for button, entries in ((getattr(self, 'add_vlan_btn', None),
+                                 (getattr(self, 'vid_entry', None),
+                                  getattr(self, 'vname_entry', None))),
+                                (getattr(self, 'add_port_btn', None),
+                                 (getattr(self, 'port_entry', None),
+                                  getattr(self, 'port_vlan_entry', None)))):
+            if button is None or None in entries:
+                continue
+            button.state(['!disabled'] if all(e.ready() for e in entries) else ['disabled'])
+
     def add_vlan(self):
-        problem = validation.check_vlan(self.vid.get().strip(), {v for v, _ in self.vlans}) \
-            or validation.check_vlan_name(self.vname.get())
-        if problem:
-            messagebox.showerror('Cannot add VLAN', problem)
-            return
-        self.vlans.append((int(self.vid.get().strip()), self.vname.get().strip()))
+        vid, name = V.clean(self.vid.get()), V.clean(self.vname.get())
+        for entry, problem in ((self.vid_entry, self._vlan_id_problem(vid) if vid
+                                else 'Enter a VLAN ID from 1 to 4094.'),
+                               (self.vname_entry, name and
+                                V.check_name(name, 'The VLAN name'))):
+            if problem:
+                entry.show_error(problem)
+                messagebox.showerror('Cannot add VLAN', problem)
+                return
+        self.vlans.append((int(vid), name))
         self.vid.set(''); self.vname.set('')
         self._show_lists()
 
@@ -501,14 +589,18 @@ class ConfigureTab(ttk.Frame):
         self._show_lists()
 
     def add_port(self):
-        spec = self.port.get().strip()
-        problem = validation.check_port_list(spec) \
-            or validation.check_vlan(self.port_vlan.get().strip(), ()) \
+        spec, vid = V.clean(self.port.get()), V.clean(self.port_vlan.get())
+        port_problem = (V.check_port_list(spec) if spec else
+                        'Enter the access ports, e.g. Fa0/1-5.') \
             or self._ports_unused(spec, [p for p, _ in self.ports])
-        if problem:
-            messagebox.showerror('Cannot add ports', problem)
-            return
-        self.ports.append((spec, int(self.port_vlan.get().strip())))
+        vlan_problem = V.check_vlan_id(vid) if vid else 'Choose the VLAN for these ports.'
+        for entry, problem in ((self.port_entry, port_problem),
+                               (self.port_vlan_entry, vlan_problem)):
+            if problem:
+                entry.show_error(problem)
+                messagebox.showerror('Cannot add ports', problem)
+                return
+        self.ports.append((spec, int(vid)))
         self.port.set('')
         self._show_lists()
 
@@ -526,6 +618,8 @@ class ConfigureTab(ttk.Frame):
             n = port_count(port)
             self.port_tree.insert('', 'end', values=(port if n == 1 else f'{port}  ({n} ports)', vid))
         self.port_vlan_box['values'] = [v for v, _ in self.vlans]
+        self.vid_entry.recheck()                 # "already in the list" may have changed
+        self.port_vlan_entry.recheck()
 
     @staticmethod
     def _ports_unused(spec, others):
@@ -539,75 +633,170 @@ class ConfigureTab(ttk.Frame):
         return None
 
     # ------------------------------------------------------------ validation of list items
+    # Each returns (problem, item). A problem is (field key, message): it is shown under
+    # that field (validators.py has the rules; the backend checks them again).
     def _validate_trunk(self, v, items):
-        problem = validation.check_port_list(v['ports']) \
-            or self._ports_unused(v['ports'], [i['ports'] for i in items])
-        if not problem and v['allowed']:
-            problem = validation.check_vlan_list(v['allowed'])
-        if not problem and v['native']:
-            problem = validation.check_vlan_number(v['native'], allow_1=True)
-        if problem:
+        problem = ('ports', V.check_port_list(v['ports']) if v['ports'] else 'Required.')
+        if not problem[1]:
+            problem = ('ports', self._ports_unused(v['ports'], [i['ports'] for i in items]))
+        if not problem[1] and v['allowed']:
+            problem = ('allowed', V.check_vlan_list(v['allowed']))
+        if not problem[1] and v['native']:
+            problem = ('native', V.check_vlan_id(v['native'], 'native VLAN'))
+        if problem[1]:
             return problem, None
-        allowed = validation.compress_vlans(validation.vlan_list(v['allowed'])) if v['allowed'] else ''
+        allowed = validation.compress_vlans(V.parse_vlan_list(v['allowed'])) if v['allowed'] else ''
         return None, {'ports': v['ports'], 'allowed': allowed,
                       'native': int(v['native']) if v['native'] else None,
                       'encapsulation': v['encapsulation']}
 
     def _validate_port_security(self, v, items):
-        problem = validation.check_port_list(v['ports']) \
-            or self._ports_unused(v['ports'], [i['ports'] for i in items])
-        if not problem and not (v['maximum'].isdigit() and 1 <= int(v['maximum']) <= 132):
-            problem = 'Max MAC addresses must be a number from 1 to 132.'
-        if problem:
+        problem = ('ports', V.check_port_list(v['ports']) if v['ports'] else 'Required.')
+        if not problem[1]:
+            problem = ('ports', self._ports_unused(v['ports'], [i['ports'] for i in items]))
+        if not problem[1]:
+            problem = ('maximum', V.check_number(v['maximum'], 1, V.PORT_SECURITY_MAX,
+                                                 'Max MAC addresses'))
+        if not problem[1] and (v['violation'] or 'shutdown') not in V.VIOLATIONS:
+            problem = ('violation', 'Choose protect, restrict or shutdown.')
+        if problem[1]:
             return problem, None
         return None, {'ports': v['ports'], 'maximum': int(v['maximum']),
                       'violation': v['violation'] or 'shutdown', 'sticky': v['sticky']}
 
     def _validate_switch_interface(self, v, items):
-        problem = validation.check_port_list(v['ports']) \
-            or self._ports_unused(v['ports'], [i['ports'] for i in items])
+        problem = ('ports', V.check_port_list(v['ports']) if v['ports'] else 'Required.')
+        if not problem[1]:
+            problem = ('ports', self._ports_unused(v['ports'], [i['ports'] for i in items]))
         state = '' if v['state'] in ('', '(leave)') else v['state']
-        if not problem and not state and not v['description']:
-            problem = 'Choose a state or type a description (or both).'
-        if not problem and v['description']:
-            problem = validation.check_description(v['description'])
-        if problem:
+        if not problem[1] and v['description']:
+            problem = ('description', V.check_description(v['description']))
+        if not problem[1] and not state and not v['description']:
+            problem = ('description', 'Choose a state or type a description (or both).')
+        if problem[1]:
             return problem, None
         return None, {'ports': v['ports'], 'state': state, 'description': v['description']}
 
     def _validate_router_interface(self, v, items):
-        problem = validation.check_single_interface(v['name'])
-        if not problem and any(_port_set(i['name']) & _port_set(v['name']) for i in items):
-            problem = f"{v['name']} is already in the list."
+        problem = ('name', V.check_interface_name(v['name']) if v['name'] else 'Required.')
+        if not problem[1] and V.interface_key(v['name']) in \
+                {V.interface_key(i['name']) for i in items}:
+            problem = ('name', f"{v['name']} is already in the list.")
         state = '' if v['state'] in ('', '(leave)') else v['state']
-        if not problem and (v['ip'] or v['mask']):
-            problem = validation.check_host_address(v['ip'], v['mask'])
-        if not problem and v['description']:
-            problem = validation.check_description(v['description'])
-        if not problem and not (v['ip'] or state or v['description']):
-            problem = 'Enter an IP address, a state or a description.'
-        if problem:
+        if not problem[1]:
+            problem = V.check_interface_address(v['ip'], v['mask']) or (None, None)
+        if not problem[1] and v['description']:
+            problem = ('description', V.check_description(v['description']))
+        if not problem[1] and not (v['ip'] or state or v['description']):
+            problem = ('ip', 'Enter an IP address, a state or a description.')
+        if problem[1]:
             return problem, None
-        return None, {'name': v['name'], 'ip': v['ip'], 'mask': v['mask'], 'state': state,
+        mask = V.parse_mask(v['mask']) if v['mask'] else ''          # /24 -> 255.255.255.0
+        return None, {'name': v['name'], 'ip': v['ip'], 'mask': mask, 'state': state,
                       'description': v['description']}
 
+    @staticmethod
+    def _next_hop_problem(text):
+        """A static route's next hop on its own: an IP address or an interface name."""
+        text = V.clean(text)
+        if V.check_ipv4(text) is None:
+            return None if text not in ('0.0.0.0', '255.255.255.255') else \
+                f'The next hop cannot be {text}.'
+        if text[:1].isdigit():
+            return V.check_ipv4(text, 'next hop')
+        return None if V.check_interface_name(text) is None else \
+            'Enter an IP address (e.g. 192.168.1.1) or an interface (e.g. Gi0/0).'
+
     def _validate_route(self, v, items):
-        problem = validation.check_network(v['network'], v['mask']) \
-            or validation.check_ip(v['next_hop'])
-        if not problem and (v['network'], v['mask']) in [(i['network'], i['mask']) for i in items]:
-            problem = f"A route to {v['network']} {v['mask']} is already in the list."
-        if not problem and v['network'] == '0.0.0.0':
-            problem = 'Use the Default route field (Basics) for 0.0.0.0.'
+        problem = V.check_static_route(v['network'], v['mask'], v['next_hop'])
         if problem:
             return problem, None
-        return None, {'network': v['network'], 'mask': v['mask'], 'next_hop': v['next_hop']}
+        mask = V.parse_mask(v['mask'])                               # /16 -> 255.255.0.0
+        if (v['network'], mask) in [(i['network'], i['mask']) for i in items]:
+            return ('network', f"A route to {v['network']} {mask} is already in the "
+                               f"list."), None
+        return None, {'network': v['network'], 'mask': mask, 'next_hop': v['next_hop']}
+
+    # ------------------------------------------------------------ the whole form
+    def _recheck_dhcp(self):
+        """The DHCP fields depend on each other (network address, gateway inside it...):
+        show every problem under its field as soon as the fields involved are filled in."""
+        if getattr(self, '_dhcp_busy', False):
+            return
+        self._dhcp_busy = True
+        try:
+            entries = self.dhcp_entries
+            if len(entries) < len(V.DHCP_FIELDS):
+                return
+            values = {k: e.value() for k, e in entries.items()}
+            together = {f: m for f, m in V.check_dhcp(values)
+                        if m != 'Required when any DHCP field is filled in.'}
+            for key, e in entries.items():
+                own = e.problem() if e.value() else None
+                if own:
+                    continue                              # its own message is already shown
+                if key in together:
+                    e.show_error(together[key])
+                elif e._forced:
+                    e._show(None, None)
+                    e._forced = None
+        finally:
+            self._dhcp_busy = False
+
+    def form_problems(self, kind):
+        """Everything in the form that is not valid: [(section > field, message)]. Preview
+        and Apply are blocked while there is any."""
+        out = []
+
+        def own(section, entries):
+            for e in entries:
+                if e.value():
+                    problem = e.problem()
+                    if problem:
+                        out.append((f'{section} > {e.label}', problem))
+        if kind == 'router':
+            own('Basics', self.basic_entries.values())
+            labels = {key: e.label for key, e in self.dhcp_entries.items()}
+            for field, message in V.check_dhcp({k: e.value()
+                                                for k, e in self.dhcp_entries.items()}):
+                out.append((f'DHCP > {labels[field]}', message))
+            for section, editor in (('Interfaces', self.router_if_editor),
+                                    ('Static routes', self.route_editor)):
+                out += [(f'{section} > {label}', m) for label, m in editor.pending_problems()]
+        else:
+            own('VLANs & access', (self.vid_entry, self.vname_entry, self.port_entry,
+                                   self.port_vlan_entry))
+            for section, editor in (('Trunks', self.trunk_editor),
+                                    ('Port security', self.security_editor),
+                                    ('Interfaces', self.switch_if_editor)):
+                out += [(f'{section} > {label}', m) for label, m in editor.pending_problems()]
+        return out
+
+    def _blocked_by_form(self, kind, action):
+        """True (after saying what is wrong) when the form has invalid values."""
+        problems = self.form_problems(kind)
+        if not problems:
+            return False
+        text = '\n'.join(f'- {where}: {message}' for where, message in problems)
+        self.log('configure', f'{action} blocked: {len(problems)} invalid field'
+                              f"{'' if len(problems) == 1 else 's'} in "
+                              f'{multi.KINDS[kind].lower()}. '
+                              + '; '.join(f'{w}: {m}' for w, m in problems), 'error')
+        messagebox.showerror(f'Cannot {action.lower()}: fix these fields first',
+                             f'{text}\n\nNothing was sent to any device.')
+        return True
 
     # ------------------------------------------------------------ building the commands
     def _build_plan(self, kind, count=1):
         """(commands, checks, feature names) for `count` devices of this kind,
         or None after showing a message."""
-        if kind == 'router':
-            return self._router_plan(count)
+        try:
+            return self._router_plan(count) if kind == 'router' else self._switch_plan()
+        except (commands_switch.PlanError, commands_router.PlanError) as err:
+            messagebox.showerror('Settings not accepted', str(err))   # the backend's check
+            return None
+
+    def _switch_plan(self):
         plan = {'vlans': list(self.vlans), 'access_ports': list(self.ports),
                 'trunks': list(self.trunk_editor.items),
                 'port_security': list(self.security_editor.items),
@@ -623,51 +812,42 @@ class ConfigureTab(ttk.Frame):
         def fail(title, problem):
             messagebox.showerror(title, problem)
             return None
-        hostname = self.hostname.get().strip()
+        hostname = V.clean(self.hostname.get())
         if hostname:
-            problem = validation.check_hostname(hostname)
+            problem = V.check_hostname(hostname)
             if not problem and count > 1:
                 problem = (f'A hostname must be unique, but {count} routers are selected. '
                            f'Select one router to set its hostname, or clear the field.')
             if problem:
                 return fail('Hostname', problem)
             plan['hostname'] = hostname; selected.append('Hostname')
-        route = self.default_route.get().strip()
+        route = V.clean(self.default_route.get())
         if route:
-            problem = validation.check_ip(route)
+            problem = _default_route_problem(route)
             if problem:
                 return fail('Default route', problem)
             plan['default_route'] = route; selected.append('Default route')
-        dns = [s.strip() for s in self.dns_servers.get().split(',') if s.strip()]
-        for server in dns:
-            problem = validation.check_ip(server)
-            if problem:
-                return fail('DNS servers', problem)
-        if dns:
-            plan['dns_servers'] = dns; selected.append('DNS servers')
-        ntp = self.ntp_server.get().strip()
+        if V.clean(self.dns_servers.get()):
+            try:
+                plan['dns_servers'] = V.parse_ipv4_list(self.dns_servers.get())
+            except ValueError as err:
+                return fail('DNS servers', str(err))
+            selected.append('DNS servers')
+        ntp = V.clean(self.ntp_server.get())
         if ntp:
-            problem = validation.check_ip(ntp)
+            problem = V.check_ipv4(ntp)
             if problem:
                 return fail('NTP server', problem)
             plan['ntp_server'] = ntp; selected.append('NTP')
-        d = {k: v.get().strip() for k, v in self.dhcp.items()}
+        d = {k: V.clean(v.get()) for k, v in self.dhcp.items()}
         if any(d.values()):
-            problem = (validation.check_name(d['pool'])
-                       or validation.check_network(d['network'], d['mask'])
-                       or validation.check_ip_in_network(d['gateway'], d['network'], d['mask'],
-                                                         'The DHCP gateway')
-                       or validation.check_ip(d['dns']))
-            if not problem and (d['ex_start'] or d['ex_end']):
-                problem = validation.check_ip_order(d['ex_start'], d['ex_end']) \
-                    or validation.check_ip_in_network(d['ex_start'], d['network'], d['mask'],
-                                                      'The excluded range start') \
-                    or validation.check_ip_in_network(d['ex_end'], d['network'], d['mask'],
-                                                      'The excluded range end')
-            if problem:
-                return fail('DHCP settings', problem)
-            plan['dhcp'] = {'pool': d['pool'], 'network': d['network'], 'mask': d['mask'],
-                            'gateway': d['gateway'], 'dns': d['dns'],
+            problems = V.check_dhcp(d)
+            if problems:
+                labels = {k: e.label for k, e in self.dhcp_entries.items()}
+                return fail('DHCP settings', '\n'.join(f'{labels[f]}: {m}' for f, m in problems))
+            plan['dhcp'] = {'pool': d['pool'], 'network': d['network'],
+                            'mask': V.parse_mask(d['mask']), 'gateway': d['gateway'],
+                            'dns': d['dns'],
                             'excluded': (d['ex_start'], d['ex_end']) if d['ex_start'] else None}
             selected.append('DHCP')
         if self.router_if_editor.items:
@@ -693,6 +873,8 @@ class ConfigureTab(ttk.Frame):
         kind = self.config_kind()
         names = ', '.join(d['name'] for d in chosen)
         self.log('configure', f'{names}: validating the configuration...')
+        if self._blocked_by_form(kind, 'Preview'):
+            return
         targets, skipped = multi.split_targets(chosen, kind)
         if not targets:
             self.log('configure', f'{names}: validation FAILED: none of them can receive '
@@ -834,8 +1016,11 @@ class ConfigureTab(ttk.Frame):
             else:
                 built = self._built.get(d['id'])
                 checks = built[1] if built and built[0] == b['commands'] else []
+                kind = kind_of_label(b['label'])
                 jobs.append({'device': d, 'commands': b['commands'], 'checks': checks,
-                             'edited': not built or built[0] != b['commands']})
+                             'edited': not built or built[0] != b['commands'],
+                             # checked against the device itself before anything is sent
+                             'expected_type': kind if kind in multi.KINDS else None})
             seen.add(b['name'])
         return jobs, problems
 
@@ -916,7 +1101,14 @@ class ConfigureTab(ttk.Frame):
         if not self.selected_devices() and not self.blocks_from_preview()[0]:
             messagebox.showinfo('Select a device', 'Tick at least one managed device first.')
             return
+        if self._blocked_by_form(self.config_kind(), 'Apply'):
+            return
         jobs, problems = self._jobs_from_preview()
+        for j in jobs:                      # the preview can be edited: check every line again
+            for command in j['commands']:
+                problem = V.check_cli_line(command)
+                if problem:
+                    problems.append(f"{j['device']['name']}: \"{command.strip()[:60]}\": {problem}")
         if problems:
             if len(problems) == 1 and problems[0].startswith('There is nothing'):
                 messagebox.showinfo('Nothing to apply', problems[0])
@@ -977,7 +1169,7 @@ class ConfigureTab(ttk.Frame):
             d = j['device']
             self.log('configure', f"{d['name']}: applying {len(j['commands'])} command"
                                   f"{'' if len(j['commands']) == 1 else 's'} to {d['ip']} "
-                                  f"(encrypted backup first)...")
+                                  f"(encrypted backup first)...", device=d['name'], ip=d['ip'])
         if len(jobs) == 1:
             d = jobs[0]['device']
             self.session.start_run(d['name'], d['ip'], len(jobs[0]['commands']))
@@ -1038,11 +1230,19 @@ class ConfigureTab(ttk.Frame):
         except Exception as err:
             report_error(self, err)
             r['message'] += f'  (could not write the log: {err})'
+        who = {'device': d['name'], 'ip': d.get('ip')}
         if r['ok']:
-            self.log('configure', f"{d['name']}: apply SUCCESSFUL. {r['message']}", 'ok')
+            # a change: double-clicking it shows the running-config before/after
+            self.log('configure', f"{d['name']}: configuration applied, apply SUCCESSFUL. "
+                                  f"{r['message']}", 'ok', tags=['change'],
+                     detail=connect.take_diff(d.get('ip')), **who)
+        elif connect.is_type_mismatch(r['message']):   # it names the device itself
+            self.log('configure', r['message'], 'error', **who)
         else:
             state = '' if r['status'] == multi.FAILED else f" ({r['status']})"
-            self.log('configure', f"{d['name']}: apply FAILED{state}. {r['message']}", 'error')
+            changed = r['status'] in (multi.PARTIAL, multi.NOT_VERIFIED)  # something went in
+            self.log('configure', f"{d['name']}: apply FAILED{state}. {r['message']}", 'error',
+                     tags=['change'] if changed else None, **who)
 
     def _finish(self, results):
         self.busy = False
@@ -1072,12 +1272,13 @@ class ConfigureTab(ttk.Frame):
                                                  'configured. See the SSH session.')
             return
         c = multi.counts(results)
+        popup = None                                   # (title, text), shown after reporting
         if len(results) == 1:
             r = results[0]
             self.status.config(text='Done.' if r['ok'] else
                                'The change did not complete. See the SSH session.')
             if not r['ok'] and not refused:            # a refused login gets the retry question
-                messagebox.showerror('Apply failed', r['message'])
+                popup = ('Apply failed', r['message'])
         else:
             text = f"{c['completed']} of {c['total']} devices configured"
             if c['failed']:
@@ -1087,10 +1288,43 @@ class ConfigureTab(ttk.Frame):
             self.status.config(text=text + '. The summary is in the SSH session.')
             self.log('configure', text + '.', 'ok' if c['completed'] == c['total'] else 'error')
             if c['completed'] != c['total']:
-                messagebox.showerror('Some devices were not configured',
-                                     multi.summary_text(results, skipped))
-        if refused:
-            self._offer_login_retry(refused)
+                popup = ('Some devices were not configured', multi.summary_text(results, skipped))
+
+        def after_reports(answer):
+            """answer: the server's answer to the last FAILED login reported (or None)."""
+            if answer and answer.get('locked'):
+                return                                 # signed out: the message says why
+            extra = warning_text(answer)
+            if popup:
+                messagebox.showerror(popup[0], popup[1] + (f'\n\n{extra}' if extra else ''))
+            elif extra:
+                messagebox.showwarning('Failed device login', extra)
+            if refused:
+                self._offer_login_retry(refused)
+        self._report_logins(results, after_reports)
+
+    def _report_logins(self, results, then):
+        """Report every device's login outcome to the server's lockout, one after the
+        other (they count in order); then then(answer of the last failure, or None)."""
+        reports = [(r['device']['ip'], outcome_of_apply(r)) for r in results]
+        reports = [(ip, o) for ip, o in reports if o is not None]
+        last = {'answer': None}
+
+        def next_report(index=0):
+            if index == len(reports):
+                then(last['answer'])
+                return
+            ip, outcome = reports[index]
+
+            def done(answer):
+                if answer and outcome != SUCCESS:
+                    last['answer'] = answer
+                if answer and answer.get('locked'):
+                    then(answer)                       # locked: no more reports, no retry
+                    return
+                next_report(index + 1)
+            self.device_guard.report(self, ip, outcome, done)
+        next_report()
 
     # ------------------------------------------------------------ logins after an Apply
     def _save_confirmed_logins(self, results):
@@ -1128,7 +1362,8 @@ class ConfigureTab(ttk.Frame):
                      'warn')
             return False
         self._cred_source[device['id']] = 'saved'
-        self.log('configure', f'{name}: SSH login saved (encrypted) for future use.', 'ok')
+        self.log('configure', f'{name}: SSH login saved (encrypted) for future use.', 'ok',
+                 tags=['change'], device=name)
         return True
 
     def _offer_login_retry(self, jobs):
@@ -1242,8 +1477,9 @@ class ConfigureTab(ttk.Frame):
             self.log('configure', f'{old}: the new hostname {new_name} could not be saved in the '
                                   f'device list ({err}). {keep}', 'warn')
             return False
-        self.log('configure', f'{old} is now {new_name} (hostname applied; same device record, '
-                              f'links and history kept).', 'ok')
+        self.log('configure', f'{old}: name changed {old} -> {new_name} (hostname applied; same '
+                              f'device record, links and history kept).', 'ok',
+                 tags=['change'], device=new_name)
         return True
 
     def _clear_applied_sections(self):

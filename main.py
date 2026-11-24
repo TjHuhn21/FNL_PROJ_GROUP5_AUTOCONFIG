@@ -14,6 +14,7 @@ import sys
 import threading
 from tkinter import messagebox
 
+from gui import event_log
 from gui.event_log import keep_history, log_event
 
 SIGNED_OUT, CLOSED = 'signed_out', 'closed'
@@ -118,8 +119,25 @@ def window_title(demo, startup_problem, access, mock_lab=''):
 APPLY_POLL_MS = 200          # how often a postponed close checks whether an SSH Apply ended
 
 
+def dev_reset_locks(client):
+    """TESTING MODE: when the backend's DEV_RESET_LOCKS_ON_RESTART is on, it clears every
+    account's failed device logins and locks now (POST /dev/reset-locks). True if it did;
+    False when testing mode is off (the endpoint is missing or refuses) or the backend is
+    not reachable (the sign-in window then says so)."""
+    from desktop_auth.api_client import ApiError
+    reset = getattr(client, 'dev_reset_locks', None)
+    if reset is None:                         # a client without it (an older or stand-in one)
+        return False
+    try:
+        reset()
+    except ApiError:
+        return False
+    log_event('dev', '[DEV] Lockout attempts and locks reset (testing mode).', 'warn')
+    return True
+
+
 def run_workbench(store, demo, startup_problem, access=None, client=None, session=None,
-                  make_root=None):
+                  make_root=None, dev_lock_reset=False):
     """Open the workbench. Returns SIGNED_OUT (show the sign-in window again) or CLOSED.
     make_root: the window factory (tests only; default customtkinter.CTk)."""
     from gui.main_window import build_main_window, mock_lab_label
@@ -180,8 +198,10 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
             log_event('app', 'Sign-out SUCCESSFUL.', 'ok')
             finish(SIGNED_OUT)
 
-        def session_ended(reason):
-            message = ENDED_MESSAGES.get(reason, ENDED_MESSAGES['ended'])
+        def session_ended(reason, message=None):
+            """message: the server's own text (a security lock says how long, or that only
+            an administrator can unlock it); otherwise the fixed text for the reason."""
+            message = message or ENDED_MESSAGES.get(reason, ENDED_MESSAGES['ended'])
             if outcome['done'] or outcome['deferred']:
                 return
             log_event('app', f'Signed out by the server: {message}', 'warn')
@@ -224,7 +244,8 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
 
         account = SignedInContext(client, session, sign_out, session_ended)
     refs = build_main_window(root, store, demo, startup_problem=startup_problem,
-                             access=access, account=account, console_backend=console_backend())
+                             access=access, account=account, console_backend=console_backend(),
+                             dev_lock_reset=dev_lock_reset)
     if session is not None:
         refs['session_watcher'] = SessionWatcher(root, client, session, session_ended)
         root.protocol('WM_DELETE_WINDOW', close_window)
@@ -266,7 +287,9 @@ def main():
     if '--demo' in sys.argv:                 # DEMO MODE: only ever by asking for it
         from desktop_auth.session import Access
         store, demo, startup_problem = choose_store(True)
+        event_log.set_store(store)           # the in-memory store: kept for this run only
         run_workbench(store, demo, startup_problem, access=Access(None, demo=True))
+        event_log.save_now()
         return
     from desktop_auth.api_client import ApiConfigError, client_from_environment
     try:
@@ -279,20 +302,28 @@ def main():
                                            f'use sample data without signing in.')
         return
     store = None
+    testing_mode = dev_reset_locks(client)    # before sign-in, so a locked account can sign in
     while True:
         log_event('app', 'Waiting for sign-in...')
         session = sign_in(client)
         if session is None:                  # the sign-in window was closed
             log_event('app', 'Sign-in window closed without signing in.', 'warn')
             return
+        event_log.set_user(getattr(session, 'email', None))  # lines are now this user's
         if store is None:
             log_event('app', 'Connecting to the database...')
             store, demo, startup_problem = choose_store(False)
             if startup_problem:
                 log_event('app', f'Connecting to the database FAILED: {startup_problem} '
                                  f'Using sample mode.', 'error')
-        if run_workbench(store, demo, startup_problem, access=session.access, client=client,
-                         session=session) != SIGNED_OUT:
+            event_log.set_store(store)       # the Console history is saved from now on
+        try:
+            ended = run_workbench(store, demo, startup_problem, access=session.access,
+                                  client=client, session=session, dev_lock_reset=testing_mode)
+        finally:
+            event_log.set_user(None)
+            event_log.save_now()             # nothing logged is lost on sign-out or close
+        if ended != SIGNED_OUT:
             return
 
 

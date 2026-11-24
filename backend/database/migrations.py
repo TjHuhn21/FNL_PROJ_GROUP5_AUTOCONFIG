@@ -35,7 +35,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from backend.database import (audit_triggers, m0001_auth_tables, m0002_app_tables,
-                              m0003_jobs_locks, m0004_device_backups)
+                              m0003_jobs_locks, m0004_device_backups,
+                              m0005_device_login_security)
 from backend.database.connection import is_connection_lost, is_driver_error, translate
 from backend.database.errors import MigrationError
 from backend.database.privileges import can_see_triggers
@@ -104,7 +105,8 @@ def _from_module(module):
 
 
 MIGRATIONS = tuple(_from_module(m) for m in (m0001_auth_tables, m0002_app_tables,
-                                             m0003_jobs_locks, m0004_device_backups))
+                                             m0003_jobs_locks, m0004_device_backups,
+                                             m0005_device_login_security))
 ALL_TABLES = frozenset(t for m in MIGRATIONS for t in m.tables)
 
 

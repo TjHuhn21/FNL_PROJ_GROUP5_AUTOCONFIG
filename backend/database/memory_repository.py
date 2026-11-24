@@ -10,6 +10,7 @@ import secrets
 import threading
 from datetime import datetime, timedelta, timezone
 
+from backend.auth import device_lockout as DL
 from backend.database import auth_records as R
 from backend.database.auth_repository import (ADMIN_EXISTS, LAST_ADMIN, LIST_USER_FIELDS,
                                               TOKEN_IN_USE, USER_NOT_FOUND)
@@ -32,6 +33,7 @@ class InMemoryAuthRepository:
         self.clock = clock
         self._lock = threading.RLock()
         self._users, self._challenges, self._sessions, self._audit = {}, {}, {}, []
+        self._security, self._lockouts = {}, []         # migration 5 (device logins)
         self._next = {'user': 1, 'challenge': 1, 'session': 1, 'audit': 1}
 
     def _id(self, kind):
@@ -211,8 +213,12 @@ class InMemoryAuthRepository:
                 if (status is not None and u['status'] != status) or (
                         after_id is not None and uid <= after_id):
                     continue
-                row = {k: copy.copy(u[k]) for k in LIST_USER_FIELDS if k != 'locked'}
+                row = {k: copy.copy(u[k]) for k in LIST_USER_FIELDS[:-3]}
                 row['locked'] = self._lock_active(u, now)
+                state = self._security.get(uid)
+                row['security_lock'] = DL.is_locked(state, now)
+                row['security_locked_until'] = (state['locked_until']
+                                                if row['security_lock'] == 'temporary' else None)
                 rows.append(row)
                 if len(rows) == limit:
                     break
@@ -409,6 +415,8 @@ class InMemoryAuthRepository:
             u = self._users.get(s['user_id'])
             if not u or u['status'] != 'active' or u['email_verified_at'] is None:
                 return None
+            if DL.is_locked(self._security.get(u['id']), now):
+                return None
             row = {k: s[k] for k in _SESSION_PUBLIC}
             row.update(role=u['role'], user_status=u['status'])
             return row
@@ -477,3 +485,66 @@ class InMemoryAuthRepository:
                     if (actor_user_id is None or r['actor_user_id'] == actor_user_id)
                     and (action is None or r['action'] == action)]
             return rows[:limit]
+
+    # ------------------------------------------------------------ failed device logins
+    def _recent_lockouts(self, user_id, state, now, policy=DL.DEFAULT_DEVICE_POLICY):
+        since = DL.lockouts_since(state, now, policy)
+        return sum(1 for x in self._lockouts if x['user_id'] == user_id and x['created_at'] > since)
+
+    def device_login_state(self, user_id):
+        R.check_id(user_id, 'user_id')
+        with self._lock:
+            now = self.clock()
+            state = dict(self._security.get(user_id) or DL.empty_state(user_id))
+            return state, now, self._recent_lockouts(user_id, state, now)
+
+    def record_device_login(self, user_id, outcome, device_ip=None,
+                            policy=DL.DEFAULT_DEVICE_POLICY):
+        R.check_id(user_id, 'user_id')
+        R.check_choice(outcome, DL.OUTCOMES, 'outcome')
+        ip = R.check_optional_text(device_ip, R.IP_MAX, 'device_ip')
+        with self._lock:
+            if user_id not in self._users:
+                raise InvalidValue(USER_NOT_FOUND)
+            now = self.clock()
+            state = dict(self._security.get(user_id) or DL.empty_state(user_id))
+            new, result = DL.decide(state, self._recent_lockouts(user_id, state, now, policy),
+                                    outcome, now, policy)
+            self._security[user_id] = new
+            if result['event'] in ('temporary', 'permanent'):
+                self._lockouts.append({'id': len(self._lockouts) + 1, 'user_id': user_id,
+                                       'created_at': now, 'kind': result['event'],
+                                       'locked_until': result['locked_until'],
+                                       'device_ip': ip, 'reason': DL.REASONS.get(outcome)})
+            return dict(result, now=now)
+
+    def unlock_device_security(self, user_id):
+        R.check_id(user_id, 'user_id')
+        with self._lock:
+            if user_id not in self._users:
+                raise InvalidValue(USER_NOT_FOUND)
+            state = self._security.get(user_id)
+            if not state:
+                return None
+            now = self.clock()
+            self._security[user_id] = DL.unlocked_state(state, now)
+            return DL.is_locked(state, now)
+
+    def list_lockouts(self, user_id):
+        """Every recorded lockout of this user (tests and reports)."""
+        with self._lock:
+            return [dict(x) for x in self._lockouts if x['user_id'] == user_id]
+
+    def reset_all_device_security(self):
+        """TESTING MODE only: as AuthRepository.reset_all_device_security."""
+        with self._lock:
+            now, n = self.clock(), 0
+            for uid, state in list(self._security.items()):
+                since = state.get('lockouts_reset_at')
+                had_lockouts = any(x['user_id'] == uid and (since is None or x['created_at'] > since)
+                                   for x in self._lockouts)
+                if (state['failed_count'] or state['locked_until'] is not None
+                        or state['permanent_locked_at'] is not None or had_lockouts):
+                    n += 1
+                self._security[uid] = DL.unlocked_state(state, now)
+            return n

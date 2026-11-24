@@ -8,6 +8,7 @@ import pytest
 from backend.database import m0002_app_tables as M2
 from backend.database import m0003_jobs_locks as M3
 from backend.database import m0004_device_backups as M4
+from backend.database import m0005_device_login_security as M5
 from backend.database import migrate
 from backend.database.errors import MigrationError
 from backend.database.migrations import (ALL_TABLES, APP_TABLES, MIGRATIONS, SHARED_PREFIX,
@@ -22,15 +23,17 @@ from test_backend_migrations import EXPECTED, Conn, FakeSchema, app_statements, 
 NEW = (M2, M3, M4)
 NEW_TABLES = M2.TABLES + M3.TABLES + M4.TABLES
 AUTH_TABLES = ('users', 'email_challenges', 'sessions', 'audit_log')
+SECURITY_TABLES = M5.TABLES         # migration 5: failed device logins (not app_ tables)
 # Pinned: a migration must never change once it may have been applied somewhere. Changing
 # one of these means writing a NEW migration instead.
-CHECKSUMS = {2: MIGRATIONS[1].checksum, 3: MIGRATIONS[2].checksum, 4: MIGRATIONS[3].checksum}
+CHECKSUMS = {2: MIGRATIONS[1].checksum, 3: MIGRATIONS[2].checksum, 4: MIGRATIONS[3].checksum,
+             5: MIGRATIONS[4].checksum}
 _FK = re.compile(r'CONSTRAINT\s+(\w+)\s+FOREIGN KEY\s+\((\w+)\)\s+REFERENCES\s+(\w+)\s+\((\w+)\)'
                  r'\s+ON DELETE (\w+) ON UPDATE (\w+)')
 
 
 def create_sql(table):
-    for module in NEW:
+    for module in NEW + (M5,):
         for sql in module.UP:
             if re.match(rf'\s*CREATE TABLE {table} \(', sql):
                 return sql
@@ -45,20 +48,21 @@ def foreign_keys(table):
 def test_four_migrations_in_order_with_the_approved_prefixed_tables():
     check_definitions()
     assert [(m.version, m.name) for m in MIGRATIONS] == [
-        (1, 'auth_tables'), (2, 'app_tables'), (3, 'jobs_locks'), (4, 'device_backups')]
+        (1, 'auth_tables'), (2, 'app_tables'), (3, 'jobs_locks'), (4, 'device_backups'),
+        (5, 'device_login_security')]
     assert MIGRATIONS[0].tables == AUTH_TABLES                     # unchanged
     assert NEW_TABLES == ('app_devices', 'app_device_credentials', 'app_links', 'app_findings',
                           'app_status_events', 'app_config_logs', 'app_jobs', 'app_job_devices',
                           'app_job_events', 'app_device_locks', 'app_device_backups')
     assert all(t.startswith(SHARED_PREFIX) for t in NEW_TABLES)
-    assert ALL_TABLES == frozenset(AUTH_TABLES + NEW_TABLES)
-    assert set(SHARED_TABLES) == set(NEW_TABLES)
+    assert ALL_TABLES == frozenset(AUTH_TABLES + NEW_TABLES + SECURITY_TABLES)
+    assert set(SHARED_TABLES) == set(NEW_TABLES) | set(SECURITY_TABLES)
 
 
 def test_checksums_are_pinned_and_distinct():
     for m in MIGRATIONS[1:]:
         assert m.checksum == CHECKSUMS[m.version] and re.fullmatch(r'[0-9a-f]{64}', m.checksum)
-    assert len({m.checksum for m in MIGRATIONS}) == 4
+    assert len({m.checksum for m in MIGRATIONS}) == 5
     m = MIGRATIONS[1]
     changed = Migration(m.version, m.name, m.up[:-1] + (m.up[-1] + ' ',), m.down, m.tables)
     assert changed.checksum != m.checksum                          # one space is a change
@@ -247,22 +251,24 @@ def test_backups_store_only_encrypted_content_with_metadata():
 # ================================================================ grants
 def test_runtime_grants_cover_every_new_table_without_delete():
     runtime = dict(RUNTIME_GRANTS)
-    for table in NEW_TABLES:
+    for table in NEW_TABLES + SECURITY_TABLES:
         assert 'SELECT' in runtime[table] and 'INSERT' in runtime[table]
         assert not {'DELETE', 'DROP', 'ALTER', 'CREATE', 'TRIGGER'} & set(runtime[table])
     for table in APPEND_ONLY_TABLES:
         assert runtime[table] == ('SELECT', 'INSERT'), table
     assert set(APPEND_ONLY_TABLES) == {'app_status_events', 'app_config_logs',
-                                       'app_job_events', 'app_device_backups'}
+                                       'app_job_events', 'app_device_backups',
+                                       'security_lockouts'}
     assert not set(APP_TABLES) & set(runtime)                      # desktop tables: nothing
 
 
 def test_migration_grants_cover_every_new_table_and_each_foreign_key_parent():
     migration = {t: set(p) for t, p in MIGRATION_GRANTS}
-    for table in NEW_TABLES:
+    for table in NEW_TABLES + SECURITY_TABLES:
         assert {'SELECT', 'CREATE', 'DROP'} <= migration[table]
         assert not {'INSERT', 'UPDATE', 'DELETE'} & migration[table]
-    parents = {parent for t in NEW_TABLES for _, _, parent, _, _, _ in foreign_keys(t)}
+    parents = {parent for t in NEW_TABLES + SECURITY_TABLES
+               for _, _, parent, _, _, _ in foreign_keys(t)}
     assert parents == {'users', 'app_devices', 'app_jobs'}
     for parent in parents:
         assert 'REFERENCES' in migration[parent], parent
@@ -275,7 +281,7 @@ def test_generated_runtime_grants_pass_the_runtime_check():
     lines = grant_statements(RUNTIME_GRANTS, 'netcommand_test', RUNTIME_ACCOUNT)
     assert check_runtime_grants(lines, 'netcommand_test') == []
     assert missing_runtime_grants(lines, 'netcommand_test') == []
-    assert len(grant_statements(MIGRATION_GRANTS, 'netcommand_test', MIGRATION_ACCOUNT)) == 16
+    assert len(grant_statements(MIGRATION_GRANTS, 'netcommand_test', MIGRATION_ACCOUNT)) == 18
 
 
 @pytest.mark.parametrize('line, fragment', [
@@ -312,11 +318,12 @@ def test_missing_shared_grants_are_reported():
 def test_up_applies_all_four_and_never_touches_desktop_tables():
     schema = FakeSchema()
     r, _ = runner(schema)
-    assert r.up() == [1, 2, 3, 4]
-    assert set(NEW_TABLES) | set(AUTH_TABLES) | {TRACKING_TABLE} <= schema.tables_
+    assert r.up() == [1, 2, 3, 4, 5]
+    assert set(NEW_TABLES) | set(AUTH_TABLES) | set(SECURITY_TABLES) | {TRACKING_TABLE} <= \
+        schema.tables_
     assert set(APP_TABLES) <= schema.tables_ and app_statements(schema) == []
-    assert [schema.records[v]['checksum'] for v in (2, 3, 4)] == [CHECKSUMS[2], CHECKSUMS[3],
-                                                                   CHECKSUMS[4]]
+    assert [schema.records[v]['checksum'] for v in (2, 3, 4, 5)] == [
+        CHECKSUMS[2], CHECKSUMS[3], CHECKSUMS[4], CHECKSUMS[5]]
     assert r.status().problems == [] and r.status().pending == []
 
 
@@ -326,11 +333,11 @@ def test_upgrading_a_database_that_has_only_migration_1():
     runner(schema, MIGRATIONS[:1])[0].up()
     schema.executed.clear()
     r, _ = runner(schema)
-    assert [m.version for m in r.status().pending] == [2, 3, 4]
-    assert r.up(dry_run=True) == [2, 3, 4] and schema.executed == []
-    assert r.up() == [2, 3, 4]
+    assert [m.version for m in r.status().pending] == [2, 3, 4, 5]
+    assert r.up(dry_run=True) == [2, 3, 4, 5] and schema.executed == []
+    assert r.up() == [2, 3, 4, 5]
     created = [re.match(r'CREATE TABLE (\w+)', s).group(1) for s in schema.executed]
-    assert created == list(NEW_TABLES)                             # in dependency order
+    assert created == list(NEW_TABLES + SECURITY_TABLES)           # in dependency order
     assert not any(t in ' '.join(schema.executed) for t in ('CREATE TABLE users',
                                                             'CREATE TABLE audit_log'))
 
@@ -340,12 +347,12 @@ def test_rollback_to_1_drops_only_the_shared_tables_newest_first():
     r, _ = runner(schema)
     r.up()
     schema.executed.clear()
-    assert r.down(1) == [4, 3, 2]
+    assert r.down(1) == [5, 4, 3, 2]
     assert schema.executed == [f'DROP TABLE IF EXISTS {t}' for t in
                                reversed(M2.TABLES + M3.TABLES + M4.TABLES)][::1] or True
     order = [s.split()[-1] for s in schema.executed]
-    assert order == list(reversed(M4.TABLES)) + list(reversed(M3.TABLES)) + \
-        list(reversed(M2.TABLES))
+    assert order == list(reversed(M5.TABLES)) + list(reversed(M4.TABLES)) + \
+        list(reversed(M3.TABLES)) + list(reversed(M2.TABLES))
     assert set(AUTH_TABLES) <= schema.tables_ and not set(NEW_TABLES) & schema.tables_
     assert set(APP_TABLES) <= schema.tables_ and sorted(schema.records) == [1]
     assert r.status().problems == []
@@ -379,7 +386,7 @@ def test_a_failure_inside_migration_2_is_reported_and_repaired():
     assert r.down_partial(2) == [2]
     assert schema.executed == ['DROP TABLE IF EXISTS app_device_credentials',
                                'DROP TABLE IF EXISTS app_devices']
-    assert r.up() == [2, 3, 4] and r.status().problems == []
+    assert r.up() == [2, 3, 4, 5] and r.status().problems == []
 
 
 def test_plan_prints_every_shared_table_without_connecting(monkeypatch):

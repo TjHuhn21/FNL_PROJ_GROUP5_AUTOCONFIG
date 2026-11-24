@@ -34,6 +34,26 @@ def server_config(app, settings):
     return config
 
 
+def dev_reset_on_start(settings, out=print):
+    """TESTING MODE (backend/auth/device_lockout.py: DEV_RESET_LOCKS_ON_RESTART): clear every
+    account's failed device logins and locks when the backend starts. Never in production.
+    A database problem is reported and the backend starts anyway."""
+    from backend.auth import device_lockout as DL
+    if not DL.dev_reset_enabled(settings.environment) or settings.database is None:
+        return None
+    try:
+        from backend.auth.service import AuthService
+        n = AuthService.from_settings(settings, mailer=object()).dev_reset_locks(
+            'backend start')
+    except Exception as err:                      # class name only: never a value
+        out(f'[DEV] Lockout reset on startup FAILED ({type(err).__name__}); attempts and locks '
+            f'were not cleared.')
+        return None
+    out(f'[DEV] Lockout reset on startup: cleared attempts and locks for {n} user'
+        f'{"" if n == 1 else "s"}. Set DEV_RESET_LOCKS_ON_RESTART = False to disable.')
+    return n
+
+
 def main():
     try:
         settings = load_settings()
@@ -45,6 +65,7 @@ def main():
     from backend.logging_config import configure_logging
     configure_logging(settings)
     logging.getLogger('backend').info('Starting NetCommand backend: %s', describe(settings))
+    dev_reset_on_start(settings)
     try:
         config = server_config(create_app(settings), settings)
     except (OSError, ssl.SSLError):

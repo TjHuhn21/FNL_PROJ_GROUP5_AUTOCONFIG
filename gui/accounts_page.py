@@ -1,21 +1,45 @@
-"""Accounts page (admins only): list accounts, approve, reject or disable them, and change
-another account's role.
+"""Accounts page (admins only): list accounts, approve, reject or disable them, change
+another account's role, and unlock an account that was locked after failed device logins.
 
 Every action is an API call (GET /admin/users, POST /admin/users/{id}/approve|reject|
-disable|role) with the session token; the server checks that the caller is an admin and
+disable|role|unlock) with the session token; the server checks that the caller is an admin and
 audits the action. A 401 means the session has ended: the workbench signs out.
 """
 import tkinter as tk
+from datetime import datetime, timezone
 from tkinter import messagebox, ttk
 
 from desktop_auth.api_client import ApiError
 from gui import background, theme
+from gui.auth_window import mask_email
+from gui.event_log import log_event
+from gui.timefmt import format_time
 
 FILTERS = ('pending_approval', 'all', 'active', 'pending_verification', 'rejected', 'disabled')
 ROLES = ('viewer', 'operator', 'admin')
 COLUMNS = (('id', 'ID', 50), ('email', 'Email', 230), ('full_name', 'Name', 170),
            ('role', 'Role', 80), ('status', 'Status', 140), ('verified', 'Email verified', 110),
-           ('locked', 'Locked', 70))
+           ('locked', 'Lock', 230))
+PERMANENT_STATUS = 'locked_by_security'
+ACTION_STATUS = {'Approved': 'active', 'Rejected': 'rejected', 'Disabled': 'disabled'}
+
+
+def lock_text(user):
+    """'Temporarily locked until 11:30 AM', 'Locked: admin unlock required', or ''."""
+    lock = user.get('security_lock')
+    if lock == 'permanent':
+        return 'Locked: admin unlock required'
+    if lock == 'temporary':
+        until = user.get('security_locked_until')
+        try:                                       # the server sends UTC
+            when = datetime.fromisoformat(str(until).replace('Z', '')).replace(
+                tzinfo=timezone.utc).astimezone()
+            return f'Temporarily locked until {format_time(when)}'
+        except ValueError:
+            return 'Temporarily locked'
+    if user.get('locked'):
+        return 'Sign-in locked (wrong passwords)'
+    return ''
 
 
 class AccountsPage(ttk.Frame):
@@ -50,7 +74,8 @@ class AccountsPage(ttk.Frame):
                                       command=self.approve)
         self.reject_btn = ttk.Button(actions, text='Reject', command=self.reject)
         self.disable_btn = ttk.Button(actions, text='Disable', command=self.disable)
-        for b in (self.approve_btn, self.reject_btn, self.disable_btn):
+        self.unlock_btn = ttk.Button(actions, text='Unlock', command=self.unlock)
+        for b in (self.approve_btn, self.reject_btn, self.disable_btn, self.unlock_btn):
             b.pack(side='left', padx=(0, 6))
 
         roles = ttk.Frame(self)
@@ -87,6 +112,7 @@ class AccountsPage(ttk.Frame):
                 if error.status == 401:
                     self.account.on_session_end('ended')
                     return
+                log_event('accounts', f'Account request FAILED: {error}', 'error')
                 self.say(str(error), error=True)
             elif error is not None:
                 self.say('The request failed. Try again.', error=True)
@@ -108,10 +134,11 @@ class AccountsPage(ttk.Frame):
             for u in users:
                 iid = str(u['id'])
                 self.rows[iid] = u
+                status = PERMANENT_STATUS if u.get('security_lock') == 'permanent' \
+                    else u.get('status', '')
                 self.tree.insert('', 'end', iid=iid, values=(
                     u['id'], u.get('email', ''), u.get('full_name', ''), u.get('role', ''),
-                    u.get('status', ''), 'yes' if u.get('email_verified_at') else 'no',
-                    'yes' if u.get('locked') else 'no'))
+                    status, 'yes' if u.get('email_verified_at') else 'no', lock_text(u)))
             self.say(note or (f'{len(users)} account(s).' if users else 'No accounts to show.'))
         self._call(lambda token: client.list_users(token, status=status), ok)
 
@@ -125,8 +152,14 @@ class AccountsPage(ttk.Frame):
             return
 
         def ok(_result):
+            log_event('accounts', f"Account {mask_email(user.get('email', ''))}: {verb.lower()}, "
+                                  f"status {user.get('status') or '?'} -> {ACTION_STATUS.get(verb, '?')}"
+                                  f' (by {self._me()}): SUCCESSFUL.', 'ok', tags=['change'])
             self.refresh(note=f"{verb}: {user.get('email', user['id'])}.")
         self._call(lambda token: call(token, user['id']), ok)
+
+    def _me(self):
+        return mask_email(getattr(self.account.session, 'email', '') or '')
 
     def approve(self):
         role, client = self.role.get(), self.account.client
@@ -165,6 +198,10 @@ class AccountsPage(ttk.Frame):
         client = self.account.client
 
         def ok(result):
+            log_event('accounts', f"Account {mask_email(user.get('email', ''))}: role changed "
+                                  f"{result['previous_role']} -> {result['role']} (by "
+                                  f'{self._me()}; signed out everywhere): SUCCESSFUL.', 'ok',
+                      tags=['change'])
             self.refresh(note=f"Role changed: {user.get('email', user['id'])} is now "
                               f"{result['role']} (was {result['previous_role']}); signed out "
                               f"everywhere.")
@@ -175,3 +212,33 @@ class AccountsPage(ttk.Frame):
         self._act('Disabled', client.disable_user,
                   confirm='Disable the account {email}? It is signed out everywhere and '
                           'can no longer sign in.')
+
+    def unlock(self):
+        """Clear the selected account's lock after failed device logins (temporary or
+        permanent), with its failure and lockout counts. The server allows it only for an
+        admin and never for one's own account; this only asks first."""
+        user = self.selected()
+        if not user:
+            self.say('Select an account first.', error=True)
+            return
+        if user['id'] == self.account.session.user_id:
+            self.say('You cannot unlock your own account. Ask another administrator, or use '
+                     'the recovery command on the server.', error=True)
+            return
+        if not user.get('security_lock'):
+            self.say(f"{user.get('email', user['id'])} is not locked.")
+            return
+        if not messagebox.askyesno('Unlock account',
+                                   f"Unlock {user.get('email', user['id'])}? Its failed device "
+                                   f'login count and lockout count are reset.', parent=self):
+            self.say('Not unlocked.')
+            return
+        client, me = self.account.client, mask_email(getattr(self.account.session, 'email', ''))
+        target = mask_email(user.get('email', ''))
+        log_event('security', f'Unlocking {target}...')
+
+        def ok(result):
+            log_event('security', f"Unlock of {target} SUCCESSFUL ({result.get('cleared') or 'no'} "
+                                  f'lock cleared by administrator {me}).', 'ok', tags=['change'])
+            self.refresh(note=f"Unlocked: {user.get('email', user['id'])}.")
+        self._call(lambda token: client.unlock_user(token, user['id']), ok)

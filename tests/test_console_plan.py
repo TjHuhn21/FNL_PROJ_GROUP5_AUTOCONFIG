@@ -423,7 +423,9 @@ def test_no_password_anywhere_in_the_plan():
 
 def test_request_never_holds_a_password():
     fields = set(SetupRequest.__dataclass_fields__)
-    assert fields == {'hostname', 'domain_name', 'username', 'password_set', 'key_size'}
+    assert fields == {'hostname', 'domain_name', 'username', 'password_set', 'key_size',
+                      # the management address and saving (added on request): no secrets
+                      'mgmt_interface', 'mgmt_ip', 'mgmt_mask', 'gateway', 'save'}
 
 
 # ------------------------------------------------------------------ staleness

@@ -51,7 +51,9 @@ def test_runtime_grants_are_exactly_the_required_least_privilege_set():
         'app_job_devices': ('SELECT', 'INSERT', 'UPDATE'),
         'app_job_events': ('SELECT', 'INSERT'),
         'app_device_locks': ('SELECT', 'INSERT', 'UPDATE'),
-        'app_device_backups': ('SELECT', 'INSERT')}
+        'app_device_backups': ('SELECT', 'INSERT'),
+        'security_device_login_state': ('SELECT', 'INSERT', 'UPDATE'),
+        'security_lockouts': ('SELECT', 'INSERT')}
     granted = {p for _, privs in RUNTIME_GRANTS for p in privs}
     assert granted == {'SELECT', 'INSERT', 'UPDATE'}             # no DELETE / DDL at all
     assert check_runtime_grants(RUNTIME_LINES, DB) == []

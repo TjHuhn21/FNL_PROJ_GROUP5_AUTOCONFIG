@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS devices (
   ip           VARCHAR(15)  NOT NULL UNIQUE,
   mac          VARCHAR(17)  NOT NULL DEFAULT '',
   type         ENUM('switch','router','unknown') NOT NULL DEFAULT 'unknown',
+  -- what the last scan detected (NULL: added by hand); existing databases: run
+  -- schema_update_detected_type.sql once
+  detected_type ENUM('switch','router','unknown') NULL DEFAULT NULL,
   managed      TINYINT(1)   NOT NULL DEFAULT 0,
   status       ENUM('up','down') NOT NULL DEFAULT 'up',
   username     VARCHAR(50)  NOT NULL DEFAULT '',
@@ -50,6 +53,33 @@ CREATE TABLE IF NOT EXISTS status_events (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
+
+-- The saved Console history: append-only (the triggers refuse every UPDATE and DELETE).
+-- Existing databases: run schema_update_console_log.sql once.
+CREATE TABLE IF NOT EXISTS console_log (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  created_at  DATETIME(3)  NOT NULL,
+  user_label  VARCHAR(120) NOT NULL,
+  category    VARCHAR(20)  NOT NULL,
+  device      VARCHAR(80)  NULL,
+  device_ip   VARCHAR(45)  NULL,
+  message     TEXT         NOT NULL,
+  result      VARCHAR(500) NULL,
+  level       ENUM('info','ok','warn','error') NOT NULL,
+  tags        VARCHAR(100) NOT NULL DEFAULT '',
+  detail      MEDIUMTEXT   NULL,
+  KEY ix_console_log_time (created_at),
+  KEY ix_console_log_user (user_label),
+  KEY ix_console_log_device (device)
+) ENGINE=InnoDB;
+
+CREATE TRIGGER IF NOT EXISTS console_log_no_update BEFORE UPDATE ON console_log
+  FOR EACH ROW SIGNAL SQLSTATE '45000'
+  SET MESSAGE_TEXT = 'console_log is append-only: entries cannot be changed';
+
+CREATE TRIGGER IF NOT EXISTS console_log_no_delete BEFORE DELETE ON console_log
+  FOR EACH ROW SIGNAL SQLSTATE '45000'
+  SET MESSAGE_TEXT = 'console_log is append-only: entries cannot be deleted';
 
 CREATE TABLE IF NOT EXISTS config_logs (
   id         INT AUTO_INCREMENT PRIMARY KEY,

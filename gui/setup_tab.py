@@ -14,9 +14,11 @@ device detection (Console-Based SSH Auto-Setup, phase 3).
        Configuration        time, verifying each with show commands. It needs the new
                             account's password typed again, the typed confirmation
                             "APPLY SSH <hostname>", and a tick for every disruptive step.
-                            Running configuration only: nothing is saved, no IP address is
-                            set and no network SSH login is tried. Stopping takes effect
-                            between steps only, never during a command exchange.
+                            Optionally also the management IP address the operator types
+                            (on an interface the detection found) and, as the very last step,
+                            saving (write memory, separately approved). No network SSH login
+                            is tried. Stopping takes effect between steps only, never during
+                            a command exchange.
 
 Detection and preview only read. Only the Apply section changes the device, and only
 with the plan it was shown. The preview password fields are emptied when a preview is
@@ -50,6 +52,7 @@ from console.link import (BAUD_RATES, CANCELLED, DEFAULT_BAUD, IDLE_CONFIRMATION
 from console.plan import (CONFLICT, DEFAULT_KEY_SIZE, PREVIEW_NOTICE, STATUS_TEXT, UNKNOWN,
                           build_plan, key_sizes, plan_is_stale, validate_request)
 from console.ports import discover_ports
+import validators
 from gui import background, theme
 from gui.components.scroll_frame import ScrollFrame, bind_wheel
 
@@ -132,10 +135,11 @@ STEPS_NOTE = ('Each command as a step: what it needs first and how it is checked
               'with read-only show commands. Previewing runs nothing; Apply (section 5) runs '
               'these steps in this order, one at a time.')
 APPLY_NOTICE = ('Apply sends the commands of the preview above through the console, one step '
-                'at a time, and checks each with show commands before the next. The changes stay '
-                'in the running configuration: nothing is saved (no write memory), no IP address '
-                'is configured, and no network SSH login is tried. Device questions are never '
-                'answered: Apply stops and tells you.')
+                'at a time, and checks each with show commands before the next. A management IP '
+                'address is set only if you typed one, and the configuration is saved (write '
+                'memory) only if you ticked "Save to startup-config": then as the last step, '
+                'after every other step is verified. No network SSH login is tried. Device '
+                'questions are never answered: Apply stops and tells you.')
 APPLY_STATUS_TEXT = {**ssh_apply.STATUS_TEXT, 'running': 'RUNNING...', 'pending': 'waiting'}
 APPLY_COLORS = {'verified': theme.SUCCESS_SOFT, 'failed': theme.DANGER_SOFT,
                 'uncertain': theme.WARNING_SOFT, 'blocked': theme.SURFACE_2,
@@ -1050,9 +1054,38 @@ class SetupTab(ttk.Frame):
         self.key_box = ttk.Combobox(form, textvariable=self.key_var, state='disabled', width=8,
                                     font=theme.FONT_FORM, values=())
         self.key_box.grid(row=3, column=2, sticky='w')
+
+        # the management address: typed by the operator, on an interface the detection found
+        ttk.Label(page, text='Management IP address (so SSH can reach the device over the '
+                             'network; optional)', font=theme.FONT_FORM_BOLD).pack(
+            anchor='w', pady=(theme.PAD, 0))
+        mgmt = ttk.Frame(page)
+        mgmt.pack(fill='x')
+        for key in ('mgmt_interface', 'mgmt_ip', 'mgmt_mask', 'gateway'):
+            self.want[key] = tk.StringVar()
+        ttk.Label(mgmt, text='Interface').grid(row=0, column=0, sticky='w', pady=(4, 0))
+        self.mgmt_box = ttk.Combobox(mgmt, textvariable=self.want['mgmt_interface'], width=22,
+                                     state='readonly', font=theme.FONT_FORM, values=())
+        self.mgmt_box.grid(row=1, column=0, sticky='w', padx=(0, theme.PAD * 2))
+        self.preview_entries['mgmt_interface'] = self.mgmt_box
+        for col, (key, label, typing) in enumerate(
+                (('mgmt_ip', 'IP address (e.g. 192.168.1.2)', 'ipv4'),
+                 ('mgmt_mask', 'Subnet mask (e.g. 255.255.255.0 or /24)', 'mask'),
+                 ('gateway', 'Default gateway (optional)', 'ipv4')), start=1):
+            ttk.Label(mgmt, text=label).grid(row=0, column=col, sticky='w', pady=(4, 0))
+            entry = ttk.Entry(mgmt, textvariable=self.want[key], width=20, font=theme.FONT_FORM)
+            ok = entry.register(lambda p, kind=typing: validators.typing_ok(kind, p))
+            entry.configure(validate='key', validatecommand=(ok, '%P'))  # digits and dots only
+            entry.grid(row=1, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
+            self.preview_entries[key] = entry
+        self.save_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(page, variable=self.save_var, style='Form.TCheckbutton',
+                        text='Save to startup-config (write memory) as the last step, after '
+                             'every step is verified, so the setup survives a restart').pack(
+            anchor='w', pady=(theme.PAD, 0))
         # any change to the values makes an existing preview out of date
         self._inputs_changed = False
-        for var in list(self.want.values()) + [self.key_var]:
+        for var in list(self.want.values()) + [self.key_var, self.save_var]:
             var.trace_add('write', lambda *_a: self._on_input_changed())
         self.preview_error = ttk.Label(page, text='', foreground=theme.DANGER, wraplength=820,
                                        justify='left', style='Form.TLabel')
@@ -1076,6 +1109,11 @@ class SetupTab(ttk.Frame):
         self.key_box.configure(values=sizes)
         if sizes and self.key_var.get() not in sizes:
             self.key_var.set(str(DEFAULT_KEY_SIZE) if str(DEFAULT_KEY_SIZE) in sizes else sizes[0])
+        # the management interface: only interfaces the detection found ('' = not set)
+        names = [i.name for i in (self.result.interfaces if self.result is not None else [])]
+        self.mgmt_box.configure(values=[''] + names)
+        if self.want['mgmt_interface'].get() not in names:
+            self.want['mgmt_interface'].set('')
         self._apply_state()
 
     def _read_request(self):
@@ -1086,7 +1124,11 @@ class SetupTab(ttk.Frame):
         self.want['confirm'].set('')
         request, errors = validate_request(values['hostname'], values['domain_name'],
                                            values['username'], values['password'],
-                                           values['confirm'], self.key_var.get(), self.result)
+                                           values['confirm'], self.key_var.get(), self.result,
+                                           mgmt_interface=values['mgmt_interface'],
+                                           mgmt_ip=values['mgmt_ip'],
+                                           mgmt_mask=values['mgmt_mask'],
+                                           gateway=values['gateway'], save=self.save_var.get())
         values.clear()
         if errors:
             self.preview_error.configure(text='\n'.join(errors.values()))
@@ -1201,8 +1243,10 @@ class SetupTab(ttk.Frame):
 
         ttk.Label(box, text='Proposed commands (in order)', font=theme.FONT_FORM_BOLD).pack(
             anchor='w')
-        if plan.commands:
+        if plan.commands or plan.save_requested:
             lines = plan.lines()
+            if plan.save_requested:                # an exec command, after `end`
+                lines = lines + [f'{link.SAVE_COMMAND}      (last, after every step is VERIFIED)']
             text = tk.Text(box, height=len(lines) + 1, font=theme.mono(theme.CODE_SIZE),
                            wrap='none', borderwidth=1, relief='solid', padx=8, pady=6)
             text.insert('1.0', '\n'.join(lines))
@@ -1246,7 +1290,8 @@ class SetupTab(ttk.Frame):
         Definitions only: nothing on this page runs them."""
         lines = [STEPS_NOTE, '']
         for n, step in enumerate(plan.steps + plan.invariants, start=1):
-            what = step.command.text if step.command is not None else '(read-only check)'
+            what = step.command.text if step.command is not None else \
+                (link.SAVE_COMMAND if step.kind == 'save' else '(read-only check)')
             lines.append(f'{n}. {step.title}  [{step.step_id}]')
             lines.append(f'     command:  {what}')
             lines.append(f'     needs:    {", ".join(step.requires) or "nothing before it"}')

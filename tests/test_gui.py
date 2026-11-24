@@ -105,9 +105,12 @@ def test_bad_input_shows_messages_not_crashes(app):
     root, r = app
     conf, shown = r['configure'], r['shown']
     conf.vid.set('abc'); conf.add_vlan()
-    conf.vid.set('1'); conf.vname.set('X'); conf.add_vlan()
     conf.vid.set('10'); conf.vname.set('bad name'); conf.add_vlan()
+    conf.vid.set('5000'); conf.vname.set('X'); conf.add_vlan()
     assert [s[0] for s in shown].count('showerror') == 3 and conf.vlans == []
+    conf.vid.set('1'); conf.vname.set('X'); conf.add_vlan()    # VLAN 1: warned, not blocked
+    assert conf.vlans == [(1, 'X')]
+    conf.vlans.clear(); conf._show_lists()
     r['scan'].demo.set(0); r['scan'].on_scan()            # no login typed
     assert shown[-1][1] == 'Login needed'
     r['scan'].user.set('admin'); r['scan'].pw.set('x'); r['scan'].seed.set('999.1.1.1')

@@ -21,10 +21,11 @@ SCHEMA_DANGEROUS = ('CREATE', 'DROP', 'ALTER')
 # the runtime account may only read and add rows. The others: no DELETE/DROP/ALTER (devices
 # are soft-deleted, findings superseded, locks released by UPDATE).
 APPEND_ONLY_TABLES = ('app_status_events', 'app_config_logs', 'app_job_events',
-                      'app_device_backups')
+                      'app_device_backups', 'security_lockouts')
 SHARED_TABLES = ('app_devices', 'app_device_credentials', 'app_links', 'app_findings',
                  'app_status_events', 'app_config_logs', 'app_jobs', 'app_job_devices',
-                 'app_job_events', 'app_device_locks', 'app_device_backups')
+                 'app_job_events', 'app_device_locks', 'app_device_backups',
+                 'security_device_login_state', 'security_lockouts')
 SHARED_DANGEROUS = ('ALL', 'ALL PRIVILEGES', 'DELETE', 'DROP', 'ALTER', 'TRIGGER')
 
 
@@ -139,6 +140,10 @@ RUNTIME_GRANTS = (
     ('app_job_events', ('SELECT', 'INSERT')),            # append-only
     ('app_device_locks', ('SELECT', 'INSERT', 'UPDATE')),
     ('app_device_backups', ('SELECT', 'INSERT')),        # append-only
+    # Failed device logins and lockouts (migration 5): the state is updated in place;
+    # lockouts are history (append-only).
+    ('security_device_login_state', ('SELECT', 'INSERT', 'UPDATE')),
+    ('security_lockouts', ('SELECT', 'INSERT')),         # append-only
 )
 MIGRATION_GRANTS = (
     ('schema_migrations', ('SELECT', 'INSERT', 'DELETE', 'CREATE')),
@@ -159,6 +164,8 @@ MIGRATION_GRANTS = (
     ('app_job_events', ('SELECT', 'CREATE', 'DROP')),
     ('app_device_locks', ('SELECT', 'CREATE', 'DROP')),
     ('app_device_backups', ('SELECT', 'CREATE', 'DROP')),
+    ('security_device_login_state', ('SELECT', 'CREATE', 'DROP')),
+    ('security_lockouts', ('SELECT', 'CREATE', 'DROP')),
 )
 # Never granted to the migration or runtime account: done by an administrator only.
 # Dropping audit_log destroys audit history (DROP and TRUNCATE bypass the triggers), so a

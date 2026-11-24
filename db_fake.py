@@ -4,6 +4,7 @@ import functools
 import threading
 from datetime import datetime, timedelta
 
+import device_types
 from store_errors import DeletedDeviceExists, DeviceNotDeleted, DuplicateDeviceName
 
 SORT_KEYS = {
@@ -21,6 +22,7 @@ _next = {'device': 1, 'log': 1, 'finding': 1, 'event': 1}
 def reset():
     _devices.clear(); _logins.clear(); _links.clear()
     _logs.clear(); _findings.clear(); _events.clear()
+    _console.clear()
     for k in _next:
         _next[k] = 1
 
@@ -92,16 +94,24 @@ def upsert_device(d):
     taken = _name_taken(d['name'], exclude_ip=d['ip'])
     if taken:
         raise DuplicateDeviceName(d['name'], taken)
+    scanned = 'detected_type' in d                 # a scan's device (as db._scan_upsert)
+    detected = device_types.clean(d.get('detected_type')) if scanned else None
     for existing in _devices.values():
         if existing['ip'] == d['ip']:
             if existing['is_deleted']:
                 raise DeletedDeviceExists(get_deleted_device_by_ip(d['ip']))
-            existing.update(name=d['name'], type=d.get('type', 'unknown'),
+            kind = d.get('type', 'unknown')
+            if scanned:
+                kind = device_types.type_after_scan(existing['type'],
+                                                    existing.get('detected_type'), detected)
+                existing['detected_type'] = detected
+            existing.update(name=d['name'], type=kind,
                             managed=bool(d.get('managed')), status=d.get('status', 'up'))
             return existing['id']
     did = _next['device']; _next['device'] += 1
     _devices[did] = {'id': did, 'name': d['name'], 'ip': d['ip'], 'mac': d.get('mac', ''),
-                     'type': d.get('type', 'unknown'), 'managed': bool(d.get('managed')),
+                     'type': detected if scanned else d.get('type', 'unknown'),
+                     'detected_type': detected, 'managed': bool(d.get('managed')),
                      'status': d.get('status', 'up'), 'is_deleted': False,
                      'created_at': datetime.now()}
     return did
@@ -117,7 +127,8 @@ def update_device(device_id, data):
         raise DuplicateDeviceName(data['name'], taken)
     d = _devices[device_id]
     old_name = d['name']
-    d.update(name=data['name'], ip=data['ip'], type=data['type'], status=data['status'],
+    d.update(name=data['name'], ip=data['ip'], type=data['type'],
+             status=data.get('status') or d['status'],      # the monitor's, unless given
              managed=bool(data['managed']))
     if old_name != d['name']:
         for i, (a, pa, b, pb) in enumerate(_links):
@@ -297,6 +308,49 @@ def save_links(links):
 def get_links():
     names = {d['name'] for d in _live()}
     return [l for l in _links if l[0] in names and l[2] in names]
+
+
+# ---------------------------------------------------------------- Console history
+# Same contract as db.py: append-only (there is no way to change or remove an entry).
+_console = []
+
+
+def add_console_events(rows):
+    with _write_lock:
+        for r in rows:
+            _console.append(dict(r, id=len(_console) + 1))
+
+
+def _console_rows(search='', tag='', user='', category='', device=''):
+    s = (search or '').lower()
+    out = []
+    for r in _console:
+        text = ' '.join(str(r.get(k) or '') for k in
+                        ('message', 'result', 'device', 'device_ip', 'user_label')).lower()
+        if s and s not in text:
+            continue
+        if tag and tag not in (r.get('tags') or '').split(','):
+            continue
+        if (user and r.get('user_label') != user) or (category and r.get('category') != category) \
+                or (device and r.get('device') != device):
+            continue
+        out.append(r)
+    return out
+
+
+def count_console_events(search='', tag='', user='', category='', device=''):
+    return len(_console_rows(search, tag, user, category, device))
+
+
+def get_console_events(search='', page=1, per_page=15, tag='', user='', category='',
+                       device=''):
+    rows = list(reversed(_console_rows(search, tag, user, category, device)))
+    start = (max(page, 1) - 1) * per_page
+    return [dict(r) for r in rows[start:start + per_page]]
+
+
+def console_event_users():
+    return sorted({r.get('user_label') for r in _console if r.get('user_label')})
 
 
 # ---------------------------------------------------------------- logs

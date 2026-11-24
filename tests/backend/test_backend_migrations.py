@@ -173,7 +173,7 @@ def app_statements(schema):
 # ================================================================ definitions
 def test_migration_definitions_are_valid_and_ordered():
     check_definitions()
-    assert [m.version for m in MIGRATIONS] == [1, 2, 3, 4]
+    assert [m.version for m in MIGRATIONS] == [1, 2, 3, 4, 5]
     assert MIGRATIONS[0].tables == ('users', 'email_challenges', 'sessions', 'audit_log')
 
 
@@ -266,7 +266,7 @@ def test_trigger_verification():
 def test_up_creates_tables_only_and_says_audit_is_not_yet_protected():
     schema = FakeSchema()
     r, log = runner(schema)
-    assert r.up() == [1, 2, 3, 4]
+    assert r.up() == [1, 2, 3, 4, 5]
     assert {'users', 'email_challenges', 'sessions', 'audit_log', TRACKING_TABLE} <= schema.tables_
     assert set(APP_TABLES) <= schema.tables_ and app_statements(schema) == []
     assert not any('TRIGGER' in s.upper() for s in schema.executed)
@@ -293,7 +293,7 @@ def test_status_reports_protected_only_when_both_triggers_are_verified():
 def test_up_twice_does_nothing_the_second_time_and_dry_run_changes_nothing():
     schema = FakeSchema()
     r, log = runner(schema)
-    assert r.up(dry_run=True) == [1, 2, 3, 4] and schema.executed == []
+    assert r.up(dry_run=True) == [1, 2, 3, 4, 5] and schema.executed == []
     r.up()
     count = len(schema.executed)
     assert r.up() == [] and len(schema.executed) == count
@@ -356,7 +356,7 @@ def test_a_failure_part_way_is_reported_honestly_and_can_be_repaired():
     assert r.down_partial(1) == [1]
     assert not (set(M1.TABLES) & schema.tables_) and set(APP_TABLES) <= schema.tables_
     assert ('lock', ('users', 'email_challenges')) in schema.events      # locked while dropped
-    assert r.up() == [1, 2, 3, 4] and r.status().problems == []
+    assert r.up() == [1, 2, 3, 4, 5] and r.status().problems == []
 
 
 def test_lost_connection_is_reported_as_uncertain():
@@ -398,7 +398,7 @@ def test_lock_is_required_and_unknown_target_refused():
         runner(FakeSchema(lock_free=False))[0].up()
     assert 'Another migration is running' in str(err.value)
     with pytest.raises(MigrationError):
-        runner(FakeSchema())[0].up(5)
+        runner(FakeSchema())[0].up(6)                  # no migration 6
 
 
 # ================================================================ rolling back
@@ -571,7 +571,7 @@ def test_partial_repair_after_audit_log_was_created_needs_the_administrator():
     assert schema.executed == REMAINING_DROPS
     assert not (set(M1.TABLES) & schema.tables_) and r.status().problems == []
     del schema.record                                # the instance override; the class method returns
-    assert r.up() == [1, 2, 3, 4]
+    assert r.up() == [1, 2, 3, 4, 5]
 
 
 def test_cli_rollback_explains_the_administrator_step():
