@@ -172,11 +172,13 @@ def test_successful_dhcp_clears_only_the_dhcp_fields(app):
     conf.vid.set('30'); conf.vname.set('VOICE'); conf.add_vlan()      # switch form: unrelated
     conf.make_preview()
     assert 'ip dhcp pool LAN' in conf.commands_from_preview()
-    conf.ntp_server.set('10.0.0.123')                 # typed after the Preview: not applied
+    conf.ntp_server.set('10.0.0.123')                 # typed after the Preview:
+    assert run_apply(root, conf, {}) == []            # Apply is blocked until Preview again
+    assert 'Settings changed since the last preview' in conf.status.cget('text')
+    conf.ntp_server.set('')                           # back to what was previewed
     sent = run_apply(root, conf, {})
     assert any('ip dhcp pool LAN' in c for c in sent[0][1])
     assert all(v.get() == '' for v in conf.dhcp.values())             # applied: cleared
-    assert conf.ntp_server.get() == '10.0.0.123'                      # pending: kept
     assert conf.vlans == [(30, 'VOICE')]                              # other form: kept
     assert conf.commands_from_preview() == []                         # nothing left pending
 

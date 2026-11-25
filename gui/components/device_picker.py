@@ -106,6 +106,10 @@ class DevicePicker(ttk.Frame):
         self.set_checked(self.checked | {d['id'] for d in self.visible()})
 
     def clear(self):
+        """Untick every device. confirm_clear(count) -> bool (set by the page) may ask first."""
+        ask = getattr(self, 'confirm_clear', None)
+        if ask is not None and not ask(len(self.checked)):
+            return
         self.set_checked([])
 
     def _clicked(self, event):

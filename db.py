@@ -674,6 +674,21 @@ def console_event_users():
     return [r['user_label'] for r in rows]
 
 
+# ---------------------------------------------------------------- per-user settings
+# (schema_update_user_settings.sql) small flags such as "the welcome tour was completed"
+def get_user_setting(user_key, name):
+    """The stored value (text), or None when it was never set."""
+    row = _run('SELECT value FROM user_settings WHERE user_key = %s AND name = %s',
+               (str(user_key)[:190], str(name)[:64]), 'one')
+    return row['value'] if row else None
+
+
+def set_user_setting(user_key, name, value):
+    _run('INSERT INTO user_settings (user_key, name, value) VALUES (%s, %s, %s) '
+         'ON DUPLICATE KEY UPDATE value = VALUES(value)',
+         (str(user_key)[:190], str(name)[:64], str(value)[:255]))
+
+
 # ---------------------------------------------------------------- findings
 def clear_findings():
     _run('DELETE FROM findings')

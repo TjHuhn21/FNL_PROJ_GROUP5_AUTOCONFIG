@@ -216,11 +216,14 @@ class TopologyTab(ttk.Frame):
         if not canvas.nodes:
             return False
         if self.layouts.has(self.layout_scope):
-            if not messagebox.askyesno(
+            from gui.components.dialogs import confirm
+            if not confirm(
                     'Reset layout',
                     'Put every device back in the automatic layout?\n\n'
                     'Your saved layout will be deleted, so the map will open in the '
-                    'automatic layout from now on. This cannot be undone.'):
+                    'automatic layout from now on. This cannot be undone.',
+                    'Reset and delete layout', parent=self, danger=True):
+                self.log('topology', 'Reset layout cancelled. The saved layout was kept.')
                 return False
             try:
                 self.layouts.delete(self.layout_scope)

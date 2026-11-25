@@ -297,8 +297,10 @@ def test_everything_is_saved_and_clear_keeps_it(console):
     assert db_fake.count_console_events() == 7
     assert db_fake.count_console_events(tag='change') == 1
     assert db_fake.count_console_events(user='system') == 2
-    c.clear()
-    assert c.records == [] and db_fake.count_console_events() == 7     # only the screen
+    c.clear()                         # asks first; the confirmed Clear is logged (saved) too
+    event_log.save_now()
+    assert c.records == [] and db_fake.count_console_events() == 8     # nothing deleted
+    assert db_fake.count_console_events(search='Clearing the Console screen confirmed') == 1
     row = db_fake.get_console_events(search='configuration applied')[0]
     assert row['detail'] == '+ description Uplink' and row['device'] == 'MOCK-R1'
 

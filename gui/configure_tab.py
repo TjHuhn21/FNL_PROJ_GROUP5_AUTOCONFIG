@@ -40,7 +40,9 @@ import validators as V
 from config import commands_router, commands_switch
 from config import connect, multi
 from config.interfaces import parse_ports, port_count
-from gui import theme
+from config.risk import disconnect_risks
+from gui import activity, theme
+from gui.components.dialogs import confirm, inform
 from gui.components.tables import setup_table
 from gui.db_status import database_ready, report_error
 from gui.device_login_guard import SUCCESS, DeviceLoginGuard, outcome_of_apply, warning_text
@@ -79,6 +81,8 @@ def applied_hostname(commands):
 
 
 PORT_HINT ='One port, a range or a list: Fa0/1   Fa0/1-5   Fa0/1-Fa0/5   Fa0/1-5, Gi0/1'
+PREVIEW_OUTDATED = ('Settings changed since the last preview. Click Preview again, so the '
+                    'commands you read are the ones that are sent. Nothing was sent.')
 KIND_OF_TAB = ['switch', 'router']              # self.forms tab index -> configuration kind
 # '# ===== SW1  10.0.0.2  switch  |  Switch settings =====' starts a device's section
 HEADER = re.compile(r'^#\s*=====\s*(\S+)\s+(\S+)\s+(\S+)\s+\|\s*(.+?)\s*=====\s*$')
@@ -186,10 +190,15 @@ class ConfigureTab(ttk.Frame):
         _caption(left, 'DEVICES').pack(anchor='w', pady=(0, 6))
         self.picker = DevicePicker(left, on_change=self._show_forms_for_device)
         self.picker.pack(fill='both', expand=True)
+        self.picker.confirm_clear = self._confirm_clear_selection
         self.device_hint = self.picker.empty
 
         # ---- settings
-        _caption(middle, 'SETTINGS').pack(anchor='w', pady=(0, 2))
+        settings_head = ttk.Frame(middle)
+        settings_head.pack(fill='x', pady=(0, 2))
+        _caption(settings_head, 'SETTINGS').pack(side='left')
+        self.clear_form_btn = ttk.Button(settings_head, text='Clear form', command=self.clear_form)
+        self.clear_form_btn.pack(side='right')
         self.target_note = ttk.Label(middle, text='', foreground=theme.TEXT_SOFT)
         self.target_note.pack(anchor='w', fill='x', pady=(0, 6))
         wrap_to_width(self.target_note)
@@ -599,7 +608,13 @@ class ConfigureTab(ttk.Frame):
         self._show_lists()
 
     def remove_vlan(self):
-        for item in sorted(self.vlan_tree.selection(), key=lambda i: -self.vlan_tree.index(i)):
+        chosen = self.vlan_tree.selection()
+        if len(chosen) > 1 and not confirm(
+                'Remove VLANs', f'Remove {len(chosen)} VLANs from the list? Nothing has been '
+                                f'sent to any device yet.', f'Remove {len(chosen)} VLANs',
+                parent=self, log=('configure', f'Removing {len(chosen)} VLANs')):
+            return
+        for item in sorted(chosen, key=lambda i: -self.vlan_tree.index(i)):
             del self.vlans[self.vlan_tree.index(item)]
         self._show_lists()
 
@@ -620,7 +635,14 @@ class ConfigureTab(ttk.Frame):
         self._show_lists()
 
     def remove_port(self):
-        for item in sorted(self.port_tree.selection(), key=lambda i: -self.port_tree.index(i)):
+        chosen = self.port_tree.selection()
+        if len(chosen) > 1 and not confirm(
+                'Remove access ports', f'Remove {len(chosen)} rows from the access port list? '
+                                       f'Nothing has been sent to any device yet.',
+                f'Remove {len(chosen)} rows', parent=self,
+                log=('configure', f'Removing {len(chosen)} access port rows')):
+            return
+        for item in sorted(chosen, key=lambda i: -self.port_tree.index(i)):
             del self.ports[self.port_tree.index(item)]
         self._show_lists()
 
@@ -1040,31 +1062,129 @@ class ConfigureTab(ttk.Frame):
         return jobs, problems
 
     def _confirm_text(self, jobs):
+        """The summary shown before anything is sent (one line per device)."""
         targets = {j['device']['id'] for j in jobs}
         left_out = [d for d in self.selected_devices() if d['id'] not in targets]
-        if len(jobs) == 1 and not left_out:
-            d = jobs[0]['device']
-            text = (f"Send {len(jobs[0]['commands'])} commands to {d['name']} ({d['ip']})?\n\n"
-                    f"An encrypted backup of its configuration (.ncbak) is saved and "
-                    f"verified first, and the result is checked afterwards.")
-        else:
-            text = f'Configure {len(jobs)} device(s), one after the other:\n'
-            text += ''.join(f"\n   {j['device']['name']}  ({j['device']['ip']})  -  "
-                            f"{len(j['commands'])} commands" for j in jobs)
-            if left_out:
-                text += '\n\nSelected but NOT configured:'
-                kind = self.config_kind()
-                text += ''.join(f"\n   {d['name']}: "
-                                f"{multi.incompatibility(d, kind) or 'not in the preview'}"
-                                for d in left_out)
-            text += ('\n\nEach device: encrypted backup first, then the commands, then its '
-                     'checks; it is '
-                     'saved only if its own checks pass. If a device rejects a command, the '
-                     'devices after it are not started.')
+        n = len(jobs)
+        text = f"Apply configuration to {plural(n, 'device')}?\n"
+        for j in jobs:
+            d, count = j['device'], len(j['commands'])
+            text += (f"\n   {d['name']} ({d.get('type') or 'unknown'}, {d['ip']}): "
+                     f"{count} command{'' if count == 1 else 's'}")
+        if left_out:
+            text += '\n\nSelected but NOT configured:'
+            kind = self.config_kind()
+            text += ''.join(f"\n   {d['name']}: "
+                            f"{multi.incompatibility(d, kind) or 'not in the preview'}"
+                            for d in left_out)
+        text += ('\n\nA backup is saved first: an encrypted backup of each device\'s '
+                 'configuration (.ncbak) is saved and verified before any command is sent, and '
+                 'every device is checked afterwards.')
+        if n > 1:
+            text += (' The devices are configured one after the other; if a device rejects a '
+                     'command, the devices after it are not started.')
         edited = [j['device']['name'] for j in jobs if j['edited']]
         if edited:
             text += (f"\n\nEdited by hand, so not checked automatically: {', '.join(edited)}.")
         return text
+
+    @staticmethod
+    def _commands_text(jobs):
+        """Every command of the Apply, per device ("View commands" in the confirmation)."""
+        out = []
+        for j in jobs:
+            d = j['device']
+            out.append(f"! {d['name']} ({d['ip']})")
+            out += [f'  {c}' for c in j['commands']]
+            out.append('')
+        return '\n'.join(out).rstrip()
+
+    def _risks(self, jobs):
+        """{device name: [warnings]} for commands that may disconnect NetCommand."""
+        found = {}
+        for j in jobs:
+            warnings = disconnect_risks(j['commands'], j['device']['ip'])
+            if warnings:
+                found[j['device']['name']] = warnings
+        return found
+
+    @staticmethod
+    def _is_empty(value):
+        if isinstance(value, dict):
+            return not any(str(v).strip() for v in value.values())
+        if isinstance(value, str):
+            return not value.strip()
+        return not value
+
+    def preview_outdated(self):
+        """True when the settings were changed after the last Preview (the preview no
+        longer shows what the form says). A preview not built from the form (Findings
+        suggestions, typed by hand) is never 'outdated'."""
+        pending = self._pending
+        if not pending:
+            return False
+        for feature, (read, _clear) in self._sections(pending['kind']).items():
+            now = read()
+            if feature in pending['values']:
+                if now != pending['values'][feature]:
+                    return True
+            elif not self._is_empty(now):
+                return True
+        return False
+
+    def has_unsaved(self):
+        """Settings typed in the form that were not applied yet (asked about before
+        signing out or closing)."""
+        for kind in ('switch', 'router'):
+            for _feature, (read, _clear) in self._sections(kind).items():
+                if not self._is_empty(read()):
+                    return True
+        typed = any(str(editor.vars[f['key']].get()).strip() != str(f.get('default', '')).strip()
+                    for editor in self._editors() for f in editor.fields
+                    if f.get('kind', 'entry') == 'entry')     # a default value is not typed
+        return typed or any(str(v.get()).strip() for v in (getattr(self, 'vid', None),
+                                                  getattr(self, 'vname', None),
+                                                  getattr(self, 'port', None)) if v is not None)
+
+    def clear_form(self):
+        """Empty every setting (both device types) after a confirmation; the preview and
+        the device ticks stay. Nothing is sent anywhere."""
+        if not self.has_unsaved():
+            self.status.config(text='The form is already empty.')
+            return False
+        if not confirm('Clear form', 'Clear every setting you entered (switch and router '
+                                     'settings)? The preview and the device selection stay. '
+                                     'Nothing is sent to any device.', 'Clear form',
+                       parent=self, danger=True, log=('configure', 'Clearing the form')):
+            return False
+        for kind in ('switch', 'router'):
+            for _feature, (_read, clear) in self._sections(kind).items():
+                clear()
+        for editor in self._editors():
+            for f in editor.fields:
+                if f.get('kind', 'entry') == 'entry':
+                    editor.vars[f['key']].set(str(f.get('default', '')))
+        for name in ('vid', 'vname', 'port'):
+            var = getattr(self, name, None)
+            if var is not None:
+                var.set('')
+        self.status.config(text='Form cleared. Fill in new settings and click Preview.')
+        return True
+
+    def _confirm_clear_selection(self, count):
+        """The device list's Clear selection: ask only when settings are filled in."""
+        if count < 1 or not self.has_unsaved():
+            return True
+        return confirm('Clear selection',
+                       f"Untick {plural(count, 'device')}? The settings you entered stay in "
+                       f"the form; tick the devices again and click Preview before Apply.",
+                       'Clear selection', parent=self,
+                       log=('configure', 'Clearing the device selection'))
+
+    def _editors(self):
+        return [e for e in (getattr(self, name, None) for name in (
+            'trunk_editor', 'security_editor', 'switch_if_editor', 'router_if_editor',
+            'route_editor')) if e is not None]
 
     def _collect_creds(self, devices):
         """{device id: creds}. Saved logins are used as they are; for devices without a
@@ -1118,6 +1238,12 @@ class ConfigureTab(ttk.Frame):
             return
         if self._blocked_by_form(self.config_kind(), 'Apply'):
             return
+        if self.preview_outdated():         # the preview no longer matches the form
+            self.log('configure', 'Apply blocked: the settings changed since the last preview. '
+                                  'Nothing was sent.', 'warn')
+            self.status.config(text=PREVIEW_OUTDATED)
+            inform('Preview again', PREVIEW_OUTDATED, parent=self, level='warning')
+            return
         jobs, problems = self._jobs_from_preview()
         for j in jobs:                      # the preview can be edited: check every line again
             for command in j['commands']:
@@ -1145,10 +1271,28 @@ class ConfigureTab(ttk.Frame):
                                  f'any change, so nothing was sent to any device. Set up the key '
                                  f'with backup_keys.py (see docs/BACKUP_ENCRYPTION.md).')
             return
-        if not messagebox.askyesno('Apply to devices' if len(jobs) > 1 else 'Apply to device',
-                                   self._confirm_text(jobs)):
+        n = len(jobs)
+        if not confirm('Apply to devices' if n > 1 else 'Apply to device',
+                       self._confirm_text(jobs),
+                       f"Apply to {plural(n, 'device')}" if n > 1 else
+                       f"Apply to {jobs[0]['device']['name']}",
+                       parent=self, danger=True, details=self._commands_text(jobs)):
             self.log('configure', 'Apply cancelled. Nothing was sent.', 'warn')
             return
+        risks = self._risks(jobs)
+        if risks:
+            names = ', '.join(risks)
+            text = f'This may disconnect NetCommand from {names}:\n'
+            for name, warnings in risks.items():
+                text += ''.join(f'\n   • {name}: {w}' for w in warnings)
+            text += '\n\nContinue?'
+            self.log('configure', f'Apply: commands that may disconnect NetCommand from {names} '
+                                  f'(asking first).', 'warn')
+            if not confirm('May disconnect NetCommand', text, 'Apply anyway', parent=self,
+                           danger=True):
+                self.log('configure', 'Apply cancelled (connection risk). Nothing was sent.',
+                         'warn')
+                return
         self._pending_saves = {}
         try:
             creds = self._collect_creds([j['device'] for j in jobs])
@@ -1179,6 +1323,7 @@ class ConfigureTab(ttk.Frame):
         self.apply_btn.state(['disabled'])
         self.stop_btn.state(['!disabled'] if len(jobs) > 1 else ['disabled'])
         names = ', '.join(j['device']['name'] for j in jobs)
+        activity.start('configure', f'A configuration is still being applied to {names}.')
         self.status.config(text=f'Applying to {names}... the SSH session is shown below.')
         for j in jobs:
             d = j['device']
@@ -1261,6 +1406,7 @@ class ConfigureTab(ttk.Frame):
 
     def _finish(self, results):
         self.busy = False
+        activity.finish('configure')
         self.apply_btn.state(['!disabled'])
         self.stop_btn.state(['disabled'])
         skipped = getattr(self, '_skipped', [])
@@ -1387,10 +1533,11 @@ class ConfigureTab(ttk.Frame):
         devices = [j['device'] for j in jobs]
         names = ', '.join(d['name'] for d in devices)
         it = 'them' if len(devices) > 1 else 'it'
-        if not messagebox.askyesno(
+        if not confirm(
                 'SSH login refused',
                 f'{names} refused the SSH login, so nothing was changed on {it}.\n\n'
-                f'Enter the login again and retry {it}?', parent=self):
+                f'Enter the login again and retry {it}?', 'Enter the login again',
+                cancel_text='Not now', parent=self):
             self.log('configure', f'The SSH login was refused by {names}; not retried. Nothing '
                                   f'was changed on {it}.', 'warn')
             return

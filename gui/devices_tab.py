@@ -4,7 +4,7 @@ from tkinter import ttk, messagebox
 import device_types
 import validation
 from gui import theme
-from gui.components.dialogs import place_window
+from gui.components.dialogs import confirm, place_window
 from gui.components.tables import setup_table
 from gui.components.wrap_frame import WrapFrame
 from gui.db_status import database_ready, report_error
@@ -51,7 +51,7 @@ class DevicesTab(ttk.Frame):
         top.add(self.add_btn, padx=(0, 0))
 
         self.tree = ttk.Treeview(self, columns=[c[0] for c in COLUMNS],
-                                 show='headings', selectmode='browse', style='Data.Treeview')
+                                 show='headings', selectmode='extended', style='Data.Treeview')
         setup_table(self.tree, COLUMNS, no_tooltip=('type',),      # Type has its own tooltip
                     commands={k: (lambda k=k: self.sort(k)) for k in SORTABLE})
         for status, color in theme.STATUS_COLORS.items():
@@ -63,8 +63,14 @@ class DevicesTab(ttk.Frame):
         self.tree.bind('<Motion>', self._hover, add='+')
         self.tree.bind('<Leave>', lambda e: self._hide_tip(), add='+')
 
-        self.empty = ttk.Label(self, text='', foreground=theme.TEXT_MUTED)
-        self.empty.pack()
+        # The empty state: what to do next instead of a blank table
+        self.on_go_scan = None                       # set by the main window
+        self.empty_box = ttk.Frame(self)
+        self.empty_box.pack()
+        self.empty = ttk.Label(self.empty_box, text='', foreground=theme.TEXT_MUTED)
+        self.empty.pack(side='left')
+        self.go_scan_btn = ttk.Button(self.empty_box, text='Go to Scan',
+                                      command=lambda: self.on_go_scan and self.on_go_scan())
 
         nav = ttk.Frame(self); nav.pack(fill='x', pady=(theme.PAD, 0))
         self.prev_btn = ttk.Button(nav, text='Previous', command=lambda: self.turn(-1))
@@ -108,9 +114,13 @@ class DevicesTab(ttk.Frame):
             self.tree.insert('', 'end', iid=str(d['id']), tags=(d['status'],),
                              values=(d['name'], d['ip'], kind, d['status'],
                                      'yes' if d['managed'] else 'no'))
+        self.go_scan_btn.pack_forget()
         if total == 0:
+            from gui import guide_content
             self.empty.config(text='No devices match your search.' if text else
-                              'No devices yet. Run a scan or click Add.')
+                              guide_content.EMPTY['devices'])
+            if not text and self.on_go_scan is not None:
+                self.go_scan_btn.pack(side='left', padx=(theme.PAD, 0))
         else:
             self.empty.config(text='')
         self.page_label.config(text=f'Page {self.page} of {pages}  ({total} devices)')
@@ -151,6 +161,7 @@ class DevicesTab(ttk.Frame):
     def show_unavailable(self, reason=''):
         """The list could not be read: show no rows at all (never old rows as if current)."""
         self.tree.delete(*self.tree.get_children())
+        self.go_scan_btn.pack_forget()
         self.empty.config(text='Database unavailable: the device list cannot be shown right now. '
                                'It is refreshed automatically when the connection is back.')
         self.page_label.config(text='')
@@ -252,37 +263,60 @@ class DevicesTab(ttk.Frame):
             return
         DeviceDialog(self, self.store, d, self._saved)
 
+    def selected_ids(self):
+        """Every selected device id (in list order); says so when none is selected."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo('Select a device', 'Click a device in the list first.')
+            return []
+        return [int(i) for i in sel]
+
     def delete(self):
-        did = self.selected_id()
-        if self.read_only or did is None or not database_ready(self):
+        ids = self.selected_ids() if not self.read_only else []
+        if not ids or not database_ready(self):
             return
         try:
-            d = self.store.get_device(did)
+            devices = [self.store.get_device(did) for did in ids]
         except DATABASE_ERRORS as err:
             report_error(self, err)
             messagebox.showerror('Cannot delete', f'Nothing was deleted. {err}')
             return
-        if d is None:
+        devices = [d for d in devices if d is not None]
+        if not devices:
             messagebox.showinfo('Device gone', 'This device is no longer registered.')
             self.refresh()
             return
-        if messagebox.askyesno('Delete device', f"Delete {d['name']} ({d['ip']})?"):
+        names = ', '.join(f"{d['name']} ({d['ip']})" for d in devices)
+        if not confirm('Delete device' if len(devices) == 1 else 'Delete devices',
+                       delete_text(devices),
+                       'Delete device' if len(devices) == 1 else f'Delete {len(devices)} devices',
+                       parent=self, danger=True):
+            log_event('devices', f'Delete of {names} cancelled. Nothing was deleted.')
+            return
+        deleted = []
+        for d in devices:
             log_event('devices', f"Deleting {d['name']} ({d['ip']})...")
             try:
-                self.store.delete_device(did)
+                self.store.delete_device(d['id'])
             except DATABASE_ERRORS as err:
                 report_error(self, err)
+                done = (f" Deleted before the error: {', '.join(x['name'] for x in deleted)}."
+                        if deleted else '')
                 log_event('devices', f"Delete of {d['name']} FAILED. "
-                                     f"{outcome_text(err, 'Nothing was deleted.')} {err}", 'error')
+                                     f"{outcome_text(err, 'Nothing was deleted.')} {err}{done}",
+                          'error')
+                who = f"{d['name']}: " if len(devices) > 1 else ''
                 messagebox.showerror('Delete failed',
-                                     f"{outcome_text(err, 'Nothing was deleted.')} {err}")
+                                     f"{who}{outcome_text(err, 'Nothing was deleted.')} "
+                                     f"{err}{done}")
+                if deleted:
+                    self._saved()
                 return
+            deleted.append(d)
             log_event('devices', f"Delete of {d['name']} ({d['ip']}) SUCCESSFUL (its history "
                                  f"is kept).", 'ok', tags=['change'], device=d['name'],
                       ip=d['ip'])
-            self._saved()
-        else:
-            log_event('devices', f"Delete of {d['name']} cancelled. Nothing was deleted.")
+        self._saved()
 
     def _saved(self):
         self.refresh()
@@ -317,9 +351,12 @@ class DeviceDialog(tk.Toplevel):
                 ('Type', self.type_box)]
         if detected:
             rows.append(('', ttk.Label(self, text=detected + '.', foreground=theme.TEXT_MUTED)))
+        self.managed_box = ttk.Checkbutton(self, text='Managed (we can log in)',
+                                           variable=self.vars['managed'])
+        from gui.components.tooltip import tip
+        tip(self.managed_box, 'managed')
         rows += [('Status', self.status_label),
-                ('', ttk.Checkbutton(self, text='Managed (we can log in)',
-                                     variable=self.vars['managed'])),
+                ('', self.managed_box),
                 ('Login username', ttk.Entry(self, textvariable=self.vars['username'], width=30)),
                 ('Login password', ttk.Entry(self, textvariable=self.vars['password'],
                                              show='*', width=30))]
@@ -332,12 +369,32 @@ class DeviceDialog(tk.Toplevel):
                                                            columnspan=2, sticky='w')
         btns = ttk.Frame(self); btns.grid(row=len(rows) + 1, column=0, columnspan=2,
                                           sticky='e', pady=(theme.PAD, 0))
-        ttk.Button(btns, text='Cancel', command=self.destroy).pack(side='right')
+        ttk.Button(btns, text='Cancel', command=self.close).pack(side='right')
         ttk.Button(btns, text='Save', style='Accent.TButton',
                    command=self.save).pack(side='right', padx=4)
+        self._initial = self._values()
+        self.protocol('WM_DELETE_WINDOW', self.close)
+        self.bind('<Escape>', lambda e: self.close())
         place_window(self, parent)                  # sized for its content, centered
         self.transient(parent.winfo_toplevel())
         self.grab_set()
+
+    def _values(self):
+        return {k: var.get() for k, var in self.vars.items()}
+
+    def has_unsaved(self):
+        return self._values() != self._initial
+
+    def close(self):
+        """Cancel / Esc / the X: ask first when something was typed or changed."""
+        if self.has_unsaved() and not confirm(
+                'Unsaved changes', 'You have unsaved changes. Discard them?', 'Discard',
+                cancel_text='Stay', parent=self, danger=True,
+                log=('devices', f"Discarding the {'edit' if self.device else 'new device'} "
+                                f"form")):
+            return False
+        self.destroy()
+        return True
 
     def save(self):
         v = {k: var.get() for k, var in self.vars.items()}
@@ -359,6 +416,11 @@ class DeviceDialog(tk.Toplevel):
             return
         if not self._type_change_confirmed(name, v['type']):
             return                                   # the dialog stays open, nothing saved
+        if self.device and ip != self.device['ip']:
+            if not confirm('Change IP address', ip_change_text(name, self.device['ip'], ip),
+                           'Change IP', parent=self,
+                           log=('devices', f"{name}: IP change {self.device['ip']} -> {ip}")):
+                return                               # the dialog stays open, nothing saved
         # A new device starts as up (the monitor corrects it); an edit keeps the monitor's.
         data = {'name': name, 'ip': ip, 'type': v['type'], 'managed': bool(v['managed'])}
         if not self.device:
@@ -424,6 +486,29 @@ class DeviceDialog(tk.Toplevel):
         self.on_saved()
 
 
+def delete_text(devices):
+    """The delete question: what disappears, and what is kept (a delete is a soft delete)."""
+    if len(devices) == 1:
+        d = devices[0]
+        head = f"Delete {d['name']} ({d['ip']})?"
+        it, its = d['name'], 'its'
+    else:
+        head = f'Delete these {len(devices)} devices?\n' + ''.join(
+            f"\n   {d['name']} ({d['ip']})" for d in devices)
+        it, its = 'They', 'their'
+    return (f'{head}\n\n{it} will be removed from the device list, the topology map (with '
+            f'{its} links), Configure and the status monitor.\n\n'
+            f'{its.capitalize()} history (logs, events) and backup files are kept, and so is '
+            f'the saved login (hidden). A later scan or Add with the same IP can restore '
+            f'{"it" if len(devices) == 1 else "them"}.')
+
+
+def ip_change_text(name, old_ip, new_ip):
+    return (f"Change {name}'s IP from {old_ip} to {new_ip}?\n\n"
+            f'The monitor, Configure and the saved login will use the new IP. Make sure the '
+            f'device really has this address, or NetCommand cannot reach it.')
+
+
 CHANGE_FIELDS = (('name', 'name'), ('ip', 'IP'), ('type', 'type'), ('managed', 'managed'))
 
 
@@ -456,34 +541,9 @@ def type_change_text(name, detected, new_type):
 
 
 def ask_type_change(parent, title, text):
-    """A modal question with the buttons 'Yes, change it' and 'Cancel'. True for yes.
-    (Tests replace it.)"""
-    answer = {'yes': False}
-    win = tk.Toplevel(parent)
-    win.title(title)
-    win.configure(padx=theme.PAD * 2, pady=theme.PAD * 2, background=theme.BG)
-    win.resizable(False, False)
-    ttk.Label(win, text=text, wraplength=420, justify='left').pack(anchor='w')
-
-    def choose(yes):
-        answer['yes'] = yes
-        win.destroy()
-    btns = ttk.Frame(win)
-    btns.pack(anchor='e', pady=(theme.PAD * 2, 0))
-    ttk.Button(btns, text='Cancel', command=lambda: choose(False)).pack(side='right')
-    ttk.Button(btns, text='Yes, change it', style='Accent.TButton',
-               command=lambda: choose(True)).pack(side='right', padx=4)
-    win.protocol('WM_DELETE_WINDOW', lambda: choose(False))
-    win.bind('<Escape>', lambda e: choose(False))
-    place_window(win, parent)
-    win.transient(parent.winfo_toplevel())
-    win.grab_set()
-    win.wait_window()
-    try:
-        parent.grab_set()                            # the Edit dialog is modal again
-    except tk.TclError:
-        pass
-    return answer['yes']
+    """The shared confirmation with the buttons 'Yes, change it' and 'Cancel'. True for
+    yes. (Tests replace it.)"""
+    return confirm(title, text, 'Yes, change it', parent=parent)
 
 
 class RestoreDialog(tk.Toplevel):

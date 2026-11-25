@@ -109,7 +109,15 @@ class ListEditor(ttk.Frame):
         return item
 
     def remove(self):
-        for iid in sorted(self.tree.selection(), key=lambda i: -self.tree.index(i)):
+        chosen = self.tree.selection()
+        if len(chosen) > 1:                       # one row: no question; several: ask first
+            from gui.components.dialogs import confirm
+            if not confirm(f'Remove {self.title}',
+                           f'Remove {len(chosen)} rows from {self.title}? Nothing has been '
+                           f'sent to any device yet.', f'Remove {len(chosen)} rows', parent=self,
+                           log=('configure', f'Removing {len(chosen)} rows from {self.title}')):
+                return
+        for iid in sorted(chosen, key=lambda i: -self.tree.index(i)):
             del self.items[self.tree.index(iid)]
         self.show()
 

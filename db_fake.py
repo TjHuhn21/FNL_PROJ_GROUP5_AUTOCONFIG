@@ -23,6 +23,7 @@ def reset():
     _devices.clear(); _logins.clear(); _links.clear()
     _logs.clear(); _findings.clear(); _events.clear()
     _console.clear()
+    _user_settings.clear()
     for k in _next:
         _next[k] = 1
 
@@ -313,6 +314,15 @@ def get_links():
 # ---------------------------------------------------------------- Console history
 # Same contract as db.py: append-only (there is no way to change or remove an entry).
 _console = []
+_user_settings = {}                 # (user_key, name) -> value (memory only)
+
+
+def get_user_setting(user_key, name):
+    return _user_settings.get((str(user_key), str(name)))
+
+
+def set_user_setting(user_key, name, value):
+    _user_settings[(str(user_key), str(name))] = str(value)
 
 
 def add_console_events(rows):

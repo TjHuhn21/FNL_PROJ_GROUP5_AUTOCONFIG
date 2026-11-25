@@ -70,11 +70,35 @@ def fit_to_screen(root, width=1200, height=720):
     root.minsize(min(900, w), min(560, h))
 
 
+def close_sign_in_question(window):
+    """(message, confirm_text, danger) asked before the sign-in window closes:
+    a request still being sent, a verification code waiting, an account form being
+    filled in, or else the plain "Close NetCommand?"."""
+    from gui.auth_window import CODE_SCREENS
+    current = getattr(window, 'current', None)
+    if getattr(window, 'busy', False):
+        return ('A request is still being sent to the NetCommand server (signing in, '
+                'creating an account or sending a code). Close NetCommand anyway?',
+                'Close anyway', True)
+    if current in CODE_SCREENS:
+        return ('A verification code was sent to your e-mail and has not been entered yet. '
+                'If you close now you will have to start again (and wait for a new code). '
+                'Close NetCommand?', 'Close anyway', True)
+    if current and current.startswith('register'):
+        filled = any(str(var.get()).strip() for name, var in getattr(window, 'vars', {}).items()
+                     if name.startswith('reg_'))
+        if filled:
+            return ('The new account form is filled in but not sent. Close NetCommand and '
+                    'discard it?', 'Discard and close', True)
+    return 'Close NetCommand?', 'Close', False
+
+
 def sign_in(client):
     """The sign-in window. Returns the AuthSession, or None if the window was closed."""
     import customtkinter as ctk
     from gui import theme
     from gui.auth_window import SignInWindow
+    from gui.components.dialogs import confirm
     root = ctk.CTk()
     root.title('NetCommand - sign in')
     theme.apply(root)
@@ -84,8 +108,16 @@ def sign_in(client):
     def signed_in(session):
         result['session'] = session
         root.destroy()
-    SignInWindow(root, client, signed_in,
-                 server_text=f'Server: {client.base_url}').pack(fill='both', expand=True)
+    window = SignInWindow(root, client, signed_in, server_text=f'Server: {client.base_url}')
+    window.pack(fill='both', expand=True)
+
+    def close():
+        """The X button (or Alt+F4): ask first."""
+        message, button, danger = close_sign_in_question(window)
+        if confirm('Close NetCommand?', message, button, parent=root, danger=danger,
+                   log=('app', 'Closing the sign-in window')):
+            root.destroy()
+    root.protocol('WM_DELETE_WINDOW', close)
     root.mainloop()
     return result.get('session')
 
@@ -117,6 +149,61 @@ def window_title(demo, startup_problem, access, mock_lab=''):
 
 
 APPLY_POLL_MS = 200          # how often a postponed close checks whether an SSH Apply ended
+GC_EVERY_MS = 5000           # the workbench collects garbage itself, on the Tk thread
+
+
+def collect_on_main_thread(root, every_ms=GC_EVERY_MS):
+    """Python's automatic garbage collection can run in ANY thread (an SSH worker, the
+    monitor). If it frees a Tk object there (a StringVar, a font, an image left in a
+    reference cycle), Tcl aborts the whole program. So while the workbench is open the
+    automatic collection is off and the window collects every few seconds on its own
+    (main) thread. Returns a function that turns the automatic collection back on."""
+    import gc
+    was_enabled = gc.isenabled()
+    gc.disable()
+    state = {'job': None}
+
+    def tick():
+        gc.collect()
+        try:
+            state['job'] = root.after(every_ms, tick)
+        except Exception:
+            state['job'] = None
+    state['job'] = root.after(every_ms, tick)
+
+    def restore():
+        if was_enabled:
+            gc.enable()
+    return restore
+
+
+def confirm_leaving(root, refs, verb):
+    """Ask before closing or signing out (verb 'close' / 'sign out'). True = go ahead.
+
+    Running work (a scan, a configuration Apply, a review) is named first: [Wait] or
+    [Close anyway]. Then unsaved settings (the Configure form): [Discard] or [Stay].
+    Otherwise the plain question: "Close NetCommand?" / "Sign out of NetCommand?".
+    Every answer is written to the Console."""
+    from gui import activity
+    from gui.components.dialogs import confirm
+    what = 'Close' if verb == 'close' else 'Sign out'
+    busy = activity.running()
+    if busy:
+        text = ' '.join(busy) + (f'\n\n{what} now may leave the work unfinished (a device '
+                                 f'half-configured, a scan or review lost).')
+        if not confirm(f'{what} NetCommand?', text, f'{what} anyway', cancel_text='Wait',
+                       parent=root, danger=True, log=('app', f'{what} while work is running')):
+            return False
+        return True
+    configure = (refs or {}).get('configure')
+    unsaved = getattr(configure, 'has_unsaved', lambda: False)()
+    if unsaved:
+        return confirm('Unsaved changes', 'You have unsaved changes in the Configure settings '
+                                          '(entered but not applied). Discard them?',
+                       'Discard', cancel_text='Stay', parent=root, danger=True,
+                       log=('app', f'{what}: discarding the unsaved Configure settings'))
+    question = 'Close NetCommand?' if verb == 'close' else 'Sign out of NetCommand?'
+    return confirm(question, question, what, parent=root, log=('app', what))
 
 
 def dev_reset_locks(client):
@@ -149,8 +236,18 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
     window_state.place(root)                 # the remembered size and place, or a good first one
     window_state.remember(root)
     outcome = {'value': CLOSED, 'done': False, 'deferred': None, 'after_apply': None,
-               'apply_wait': False}
+               'apply_wait': False, 'asked': False}
     account = None
+    holder = {}                              # the workbench refs (once built)
+
+    def may_leave(verb):
+        """Asked once per close / sign-out (a postponed one is not asked again)."""
+        if outcome['asked']:
+            return True
+        if not confirm_leaving(root, holder.get('refs'), verb):
+            return False
+        outcome['asked'] = True
+        return True
     # Every normal way out of the workbench checks restore_window.block_shutdown first: while
     # a restore (safety backup, replacement or rollback verification) runs, NetCommand stays
     # open and the worker is left alone. There is deliberately no force-quit.
@@ -193,7 +290,11 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
             root.destroy()
 
         def sign_out():
-            if restore_window.block_shutdown(root) or apply_blocks(sign_out, 'sign out'):
+            if restore_window.block_shutdown(root):
+                return
+            if not outcome['after_apply'] and not may_leave('sign out'):
+                return
+            if apply_blocks(sign_out, 'sign out'):
                 return
             log_event('app', 'Signing out...')
             end_server_session(client, session)
@@ -238,7 +339,11 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
             finish(SIGNED_OUT)
 
         def close_window():
-            if restore_window.block_shutdown(root) or apply_blocks(close_window, 'close'):
+            if restore_window.block_shutdown(root):
+                return
+            if not outcome['after_apply'] and not may_leave('close'):
+                return
+            if apply_blocks(close_window, 'close'):
                 return
             log_event('app', 'Closing NetCommand (signing out)...')
             end_server_session(client, session)
@@ -248,6 +353,9 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
     refs = build_main_window(root, store, demo, startup_problem=startup_problem,
                              access=access, account=account, console_backend=console_backend(),
                              dev_lock_reset=dev_lock_reset)
+    holder['refs'] = refs
+    # the first sign-in of this user: "Take a quick tour?" (not modal; never blocks the app)
+    root.after(800, refs['guide'].maybe_welcome)
     from gui import theme as _theme
     _theme.watch_dpi(root)                   # another monitor / scaling: sizes follow
     if session is not None:
@@ -256,7 +364,11 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
     else:                                                # demo / sample mode: no session
 
         def close_demo():
-            if restore_window.block_shutdown(root) or apply_blocks(close_demo, 'close'):
+            if restore_window.block_shutdown(root):
+                return
+            if not outcome['after_apply'] and not may_leave('close'):
+                return
+            if apply_blocks(close_demo, 'close'):
                 return
             root.destroy()
         root.protocol('WM_DELETE_WINDOW', close_demo)
@@ -280,7 +392,11 @@ def run_workbench(store, demo, startup_problem, access=None, client=None, sessio
         log_event('monitor', 'Background status monitor started (devices are checked for '
                              'up/down).')
         root.bind('<Destroy>', lambda e: stop.set() if e.widget is root else None, add='+')
-    root.mainloop()
+    restore_gc = collect_on_main_thread(root)
+    try:
+        root.mainloop()
+    finally:
+        restore_gc()
     restore_window.workbench_closed()
     return outcome['value']
 

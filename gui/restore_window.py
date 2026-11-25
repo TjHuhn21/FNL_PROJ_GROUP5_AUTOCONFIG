@@ -480,8 +480,13 @@ class RestoreWindow(tk.Toplevel):
                                         f'{self.ip}.', parent=self)
             return
         ident = pre.identity or {}
-        if not messagebox.askyesno(TITLE, (
-                f'Restore this backup to the device?\n\n'
+        from gui.components.dialogs import confirm
+        from gui.timefmt import format_timestamp_text
+        taken = format_timestamp_text(getattr(pre.selection, 'created_utc', ''), seconds=False)
+        name = self.device.hostname or self.ip
+        if not confirm(TITLE, (
+                f'Restore {name} to the backup from {taken or "(unknown date)"}? The current '
+                f'configuration will be replaced.\n\n'
                 f'Device: {self.device.hostname or "?"} {self.ip}\n'
                 f'Serial {ident.get("serial")}, platform {ident.get("platform")}\n'
                 f'Backup: {os.path.basename(pre.selection.path)}\n\n'
@@ -489,7 +494,9 @@ class RestoreWindow(tk.Toplevel):
                 f'configuration, then replace the running configuration with a '
                 f'{minutes}-minute rollback timer, verify it and confirm it. Any failure is '
                 f'rolled back. The startup configuration is not changed.\n\n'
-                f'Once the replacement has started it cannot be interrupted.'), parent=self):
+                f'Once the replacement has started it cannot be interrupted.'),
+                f'Restore {name}', parent=self, danger=True,
+                log=('backups', f'Restore of {self.ip}')):
             return
         if not claim(self.ip):
             messagebox.showerror(TITLE, f'A check or restore is already running for '

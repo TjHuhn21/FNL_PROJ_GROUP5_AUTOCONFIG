@@ -105,6 +105,50 @@ def no_real_serial_ports(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def collect_garbage_on_the_main_thread():
+    """Window tests leave Tk objects (variables, fonts, images) in reference cycles. If
+    Python's garbage collector later frees them from another thread (an SSH or monitor
+    worker of a following test), Tcl aborts the whole test run. Collect them here, on
+    the main thread, after every test."""
+    yield
+    import gc
+    gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def answered_confirmations(monkeypatch):
+    """The shared confirmation dialog (gui/components/dialogs.confirm) never opens in a
+    test. When the test replaced messagebox.askyesno (the older way tests answer
+    questions), that answers; otherwise the answer is yes, as it was before the question
+    existed. Every question is recorded in dialogs.ASKED (title, message, options).
+    The welcome tour is not offered by itself (tests of the tour start it), and nothing
+    is 'still running' from another test."""
+    monkeypatch.setenv('NETCOMMAND_TOUR', 'off')
+    try:
+        from tkinter import messagebox
+        from gui import activity
+        from gui.components import dialogs
+    except Exception:                       # no tkinter here: nothing can ask
+        yield None
+        return
+    original = messagebox.askyesno
+    asked = []
+
+    def answer(title, message, **options):
+        asked.append((title, message, options))
+        if options.get('kind') != 'confirm':
+            return None                     # a notice: nothing to answer
+        if messagebox.askyesno is not original:
+            return bool(messagebox.askyesno(title, message))
+        return True
+    monkeypatch.setattr(dialogs, '_runner', answer)
+    monkeypatch.setattr(dialogs, 'ASKED', asked, raising=False)
+    activity.reset()
+    yield asked
+    activity.reset()
+
+
+@pytest.fixture(autouse=True)
 def no_unanswered_login_dialog(monkeypatch):
     """The SSH login dialog is modal: opened in a test without an answer it would wait
     forever. Tests that reach it must replace login_dialog.ask_device_login themselves;

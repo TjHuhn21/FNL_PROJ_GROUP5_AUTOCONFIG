@@ -189,6 +189,8 @@ class BackupCatalogueWindow(tk.Toplevel):
         if self.busy or not entries:
             return
         self.busy = True
+        from gui import activity
+        activity.start('backups', f'{len(entries)} backup(s) are still being verified.')
         for b in (self.refresh_btn, self.verify_btn, self.verify_all_btn, self.select_btn):
             b.state(['disabled'])
         self.status.config(text=f'Verifying {len(entries)} backup(s)...')
@@ -200,6 +202,7 @@ class BackupCatalogueWindow(tk.Toplevel):
 
         def done(results, error):
             self.busy = False
+            activity.finish('backups')
             for b in (self.refresh_btn, self.verify_all_btn):
                 b.state(['!disabled'])
             if error is not None:

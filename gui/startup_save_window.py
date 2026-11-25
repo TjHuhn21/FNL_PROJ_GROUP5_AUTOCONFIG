@@ -232,7 +232,8 @@ class StartupSaveWindow(tk.Toplevel):
                                         f'{self.ip}.', parent=self)
             return
         ident = plan.identity
-        if not messagebox.askyesno(TITLE, (
+        from gui.components.dialogs import confirm
+        if not confirm(TITLE, (
                 f'Save the restored configuration to the startup configuration?\n\n'
                 f'Device: {self.device.hostname or "?"} {self.ip}\n'
                 f'Serial {ident.get("serial")}, platform {ident.get("platform")}\n'
@@ -241,7 +242,9 @@ class StartupSaveWindow(tk.Toplevel):
                 f'pre-save-startup backup in the backup folder, then OVERWRITTEN with '
                 f'"write memory". This makes the restored configuration persistent: the '
                 f'device uses it after a reload. Nothing else is changed, and the device is '
-                f'not reloaded.\n\nOnce started, this cannot be interrupted.'), parent=self):
+                f'not reloaded.\n\nOnce started, this cannot be interrupted.'),
+                'Save to startup', parent=self, danger=True,
+                log=('backups', f'Save to startup on {self.ip}')):
             return
         if not W.claim(self.ip):
             messagebox.showerror(TITLE, f'A check, restore or save is already running for '

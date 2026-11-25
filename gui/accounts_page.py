@@ -23,6 +23,7 @@ from tkinter import messagebox, ttk
 from desktop_auth.api_client import ApiError
 from gui import background, theme
 from gui.auth_window import mask_email
+from gui.components.dialogs import confirm as ask
 from gui.event_log import log_event
 from gui.timefmt import format_time
 from gui.components.tables import setup_table
@@ -57,6 +58,8 @@ STATUS_TEXT = {'pending_approval': 'pending approval', 'pending_verification':
                'rejected': 'rejected'}
 ADMIN_CONFIRM = ('Give {email} full admin access? Admins can approve, disable, and change roles '
                  'of other accounts.')
+APPROVE_CONFIRM = ('Approve {email} as {role}? The account can sign in right away with the '
+                   '{role} permissions.')
 
 
 def lock_text(user):
@@ -255,13 +258,16 @@ class AccountsPage(ttk.Frame):
     def _me(self):
         return mask_email(getattr(self.account.session, 'email', '') or '')
 
-    def _act(self, user, verb, call, changes, confirm=None, title=None):
+    def _act(self, user, verb, call, changes, confirm=None, title=None, button=None,
+             danger=False):
         """Run one account action after an optional confirmation. changes: the before ->
-        after text, logged to the Console (masked e-mails) and shown here (full e-mail)."""
+        after text, logged to the Console (masked e-mails) and shown here (full e-mail).
+        button: the confirm button's text (default: the verb)."""
         email = user.get('email', str(user['id']))
-        if confirm and not messagebox.askyesno(title or f'{verb} account', confirm,
-                                               parent=self):
+        if confirm and not ask(title or f'{verb} account', confirm, button or verb,
+                               parent=self, danger=danger):
             self.say(f'{verb}: cancelled. Nothing was changed.')
+            log_event('accounts', f'{verb} {mask_email(email)} cancelled. Nothing was changed.')
             return
         log_event('accounts', f'{verb} {mask_email(email)}...')
 
@@ -286,11 +292,13 @@ class AccountsPage(ttk.Frame):
         if role not in ROLES:
             self.say('Choose a role.', error=True)
             return
-        confirm = ADMIN_CONFIRM.format(email=user.get('email', user['id'])) \
-            if role == 'admin' else None
+        email = user.get('email', user['id'])
+        confirm = ADMIN_CONFIRM.format(email=email) if role == 'admin' else \
+            APPROVE_CONFIRM.format(email=email, role=role)
         self._act(user, 'Approve', lambda token, uid: client.approve_user(token, uid, role),
                   f'role {NO_ROLE} -> {role}; status pending_approval -> active',
-                  confirm=confirm, title='Approve as admin')
+                  confirm=confirm, title='Approve as admin' if role == 'admin' else 'Approve account',
+                  button=f'Approve as {role}')
 
     def reject(self):
         user = self._selected_or_say()
@@ -299,7 +307,7 @@ class AccountsPage(ttk.Frame):
         self._act(user, 'Reject', self.account.client.reject_user,
                   'status pending_approval -> rejected',
                   confirm=f"Reject the account {user.get('email', user['id'])}? It will not be "
-                          f"able to sign in.")
+                          f"able to sign in.", button='Reject account', danger=True)
 
     def change_role(self):
         """Change the selected account's role to the one in the dropdown, after a
@@ -325,7 +333,7 @@ class AccountsPage(ttk.Frame):
         client = self.account.client
         self._act(user, 'Change role', lambda token, uid: client.change_role(token, uid, new),
                   f'role {old} -> {new}; signed out everywhere', confirm=question,
-                  title='Change role')
+                  title='Change role', button=f'Change role to {new}', danger=new == 'admin')
 
     def disable(self):
         user = self._selected_or_say()
@@ -334,7 +342,8 @@ class AccountsPage(ttk.Frame):
         self._act(user, 'Disable', self.account.client.disable_user,
                   'status active -> disabled; signed out everywhere',
                   confirm=f"Disable the account {user.get('email', user['id'])}? It is signed "
-                          f"out everywhere and can no longer sign in.")
+                          f"out everywhere and can no longer sign in.",
+                  button='Disable account', danger=True)
 
     def enable(self):
         user = self._selected_or_say()
@@ -343,7 +352,7 @@ class AccountsPage(ttk.Frame):
         self._act(user, 'Enable', self.account.client.enable_user,
                   f"status disabled -> active (role {user.get('role') or NO_ROLE})",
                   confirm=f"Enable the account {user.get('email', user['id'])}? It can sign in "
-                          f"again as {user.get('role') or 'its role'}.")
+                          f"again as {user.get('role') or 'its role'}.", button='Enable account')
 
     def reopen(self):
         """A rejected account waits for approval again (no role until approved)."""
@@ -353,7 +362,7 @@ class AccountsPage(ttk.Frame):
         self._act(user, 'Re-open', self.account.client.reopen_user,
                   'status rejected -> pending_approval',
                   confirm=f"Re-open {user.get('email', user['id'])} as pending? It waits for "
-                          f"approval again; nothing is deleted.")
+                          f"approval again; nothing is deleted.", button='Re-open as pending')
 
     def unlock(self):
         """Clear the selected account's lock after failed device logins (temporary or
@@ -370,10 +379,11 @@ class AccountsPage(ttk.Frame):
         if not user.get('security_lock'):
             self.say(f"{user.get('email', user['id'])} is not locked.")
             return
-        if not messagebox.askyesno('Unlock account',
-                                   f"Unlock {user.get('email', user['id'])}? Its failed device "
-                                   f'login count and lockout count are reset.', parent=self):
+        if not ask('Unlock account', f"Unlock {user.get('email', user['id'])}? Its failed device "
+                                     f'login count and lockout count are reset.',
+                   'Unlock account', parent=self):
             self.say('Not unlocked.')
+            log_event('security', f"Unlock of {mask_email(user.get('email', ''))} cancelled.")
             return
         client, me = self.account.client, mask_email(getattr(self.account.session, 'email', ''))
         target = mask_email(user.get('email', ''))

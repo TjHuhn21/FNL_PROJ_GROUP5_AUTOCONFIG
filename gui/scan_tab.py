@@ -5,8 +5,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import validation
-from gui import theme
-from gui.components.dialogs import place_window
+from gui import activity, theme
+from gui.components.dialogs import confirm, place_window
 from gui.db_status import database_ready, report_error
 from gui.device_login_guard import (SUCCESS, DeviceLoginGuard, outcome_of_scan_error,
                                     warning_text)
@@ -57,6 +57,9 @@ class ScanTab(ttk.Frame):
         self.history = []
         self.on_activity = None                  # called after each entry (Overview refresh)
         self._scan_seed = ''
+        self._neighbours_confirmed = False      # the neighbour-login warning was accepted
+        self._results_approved = False          # the results shown were approved (saved)
+        self.approving = False                  # an approval is being saved (no second one)
 
         ttk.Label(self, text='Scan the network', style='Title.TLabel').pack(anchor='w')
         ttk.Label(self, text='Type the device login and its management IP (Seed IP), then '
@@ -94,7 +97,8 @@ class ScanTab(ttk.Frame):
                             variable=self.save_login, style='Form.TCheckbutton'),
             ttk.Checkbutton(opts, text='Also log in to CDP/LLDP neighbours with this login\n'
                             '(sends the login to every neighbour; off = seed device only)',
-                            variable=self.login_neighbours, style='Form.TCheckbutton')]
+                            variable=self.login_neighbours, style='Form.TCheckbutton',
+                            command=self._neighbours_ticked)]
         for box in self.option_boxes:
             box.pack(anchor='w', pady=1)
 
@@ -104,6 +108,7 @@ class ScanTab(ttk.Frame):
         self.tree = ttk.Treeview(self, columns=[c[0] for c in cols], show='headings',
                                  selectmode='extended', style='Data.Treeview')
         setup_table(self.tree, cols)
+        self.tree.bind('<<TreeviewSelect>>', self._selection_changed, add='+')
 
         # The button bar is packed at the bottom BEFORE the table, so a short window
         # shrinks the table instead of squeezing the Approve button out of sight.
@@ -113,6 +118,7 @@ class ScanTab(ttk.Frame):
         self.approve_btn = ttk.Button(bar, text='Approve selected', style='Accent.TButton',
                                       command=self.approve)
         self.approve_btn.pack(side='right')
+        self.approve_btn.state(['disabled'])     # nothing to approve until a scan found devices
         # Shown next to the button when approval is blocked, so it is never a silent no-op
         self.block_note = ttk.Label(bar, style='Sample.TLabel', padding=(8, 3),
                                     text=BLOCK_NOTE)
@@ -140,17 +146,22 @@ class ScanTab(ttk.Frame):
                 messagebox.showerror('Seed IP', problem)
                 return
             neighbours = bool(self.login_neighbours.get())
-            if neighbours and not messagebox.askyesno('Log in to neighbours?',
-                                                      NEIGHBOUR_WARNING, icon='warning'):
+            if neighbours and not self._neighbours_confirmed and not self._ask_neighbours():
                 log_event('scan', 'Scan cancelled (the neighbour login was not confirmed). '
                                   'Nothing was scanned.', 'warn')
                 return
+        if self.found and not self._results_approved and not confirm(
+                'Discard scan results', f'Discard the current unapproved scan results '
+                                        f'({len(self.found)} devices)? They were never saved.',
+                'Discard and scan', parent=self, log=('scan', 'Discarding unapproved results')):
+            return
         log_event('scan', 'Loading the sample network...' if demo else
                   f"Scanning from seed {seed}{' (also logging in to neighbours)' if neighbours else ''}...")
         self.scanning = True
         self._scan_seed = seed
         self._scan_is_demo = demo
         self.scan_btn.state(['disabled'])
+        activity.start('scan', f"A scan from {seed or 'the sample network'} is still running.")
         self.status.config(text='Scanning... this can take a minute.' if not demo
                            else 'Loading sample data...')
         threading.Thread(target=run_scan, daemon=True,
@@ -166,6 +177,7 @@ class ScanTab(ttk.Frame):
             return
         self.scanning = False
         self.scan_btn.state(['!disabled'])
+        activity.finish('scan')
         if msg[0] == 'error':
             self.clear_results()                  # never leave the previous scan's devices
             self.status.config(text='Scan failed.')
@@ -193,6 +205,24 @@ class ScanTab(ttk.Frame):
         self.approve_btn.state(['disabled'])
         self.block_note.pack_forget()
 
+    def _ask_neighbours(self):
+        """The neighbour-login warning (once: when the box is ticked, or at the first scan)."""
+        self._neighbours_confirmed = confirm(
+            'Log in to neighbours?', NEIGHBOUR_WARNING, 'Send the login to neighbours',
+            parent=self, danger=True, log=('scan', 'Logging in to CDP/LLDP neighbours'))
+        return self._neighbours_confirmed
+
+    def _neighbours_ticked(self):
+        if self.login_neighbours.get() and not self._neighbours_confirmed:
+            if not self._ask_neighbours():
+                self.login_neighbours.set(0)            # not confirmed: off again
+
+    def _selection_changed(self, _event=None):
+        """Approve selected is only offered while something is selected."""
+        if self.approving or (self.found_is_sample and not self.sample_store):
+            return
+        self.approve_btn.state(['!disabled'] if self.tree.selection() else ['disabled'])
+
     def _remember(self, entry):
         """Add one entry to this session's scan history (kept to the last 20)."""
         entry['when'] = datetime.now()
@@ -202,6 +232,8 @@ class ScanTab(ttk.Frame):
 
     def show_found(self, devices, links, sample=False):
         self.found, self.found_links = list(devices), list(links)
+        self._results_approved = False
+        self.approving = False                   # new results: approving them is allowed
         self.found_is_sample = bool(sample) or any(d.get('sample') for d in self.found)
         self.tree.delete(*self.tree.get_children())
         label = 'SAMPLE' if self.found_is_sample else 'scan'
@@ -238,7 +270,25 @@ class ScanTab(ttk.Frame):
         if self.approve_btn.instate(['disabled']) and self.found_is_sample and not self.sample_store:
             messagebox.showinfo('Sample devices', SAMPLE_BLOCKED)
 
+    def _approval_question(self, picked):
+        """'Save 5 devices to the database?' with the new and already registered ones."""
+        new, known = [], []
+        for d in picked:
+            existed = (not (d.get('sample') and not self.sample_store)
+                       and self.store.get_device_by_ip(d['ip']) is not None)
+            (known if existed else new).append(d)
+        n = len(picked)
+        text = f"Save {n} device{'' if n == 1 else 's'} to the database?\n"
+        if new:
+            text += f'\nNew ({len(new)}): ' + ', '.join(f"{d['name']} ({d['ip']})" for d in new)
+        if known:
+            text += (f'\nAlready registered, updated with this scan ({len(known)}): '
+                     + ', '.join(f"{d['name']} ({d['ip']})" for d in known))
+        return text
+
     def approve(self):
+        if self.approving:                       # a second click while saving: ignored
+            return
         picked = [self.found[int(i)] for i in self.tree.selection()]
         if not picked:
             messagebox.showinfo('Nothing selected', 'Select at least one device.')
@@ -264,6 +314,12 @@ class ScanTab(ttk.Frame):
         # first (read-only) and let the user decide per device.
         deleted = []
         try:
+            n = len(picked)
+            if not confirm('Approve devices', self._approval_question(picked),
+                           f"Save {n} device{'' if n == 1 else 's'}", parent=self):
+                self.status.config(text='Approval cancelled. Nothing was saved.')
+                log_event('scan', 'Approval cancelled. Nothing was saved.')
+                return
             for d in picked:
                 # A sample device is never looked up in a real database (no SQL at all for it).
                 if not (d.get('sample') and not self.sample_store):
@@ -284,6 +340,24 @@ class ScanTab(ttk.Frame):
         self._save_approved(picked, user, password, save_login, {})
 
     def _save_approved(self, picked, user, password, save_login, plan):
+        """Save the approved devices (the Approve button is off meanwhile, so a double click
+        cannot save them twice)."""
+        if plan is None:
+            self._save_approved_now(picked, user, password, save_login, plan)
+            return
+        self.approving = True
+        self.approve_btn.state(['disabled'])
+        try:
+            self._save_approved_now(picked, user, password, save_login, plan)
+        finally:
+            # back on a moment later: a click queued while saving finds it still off
+            self.after(300, self._approval_done)
+
+    def _approval_done(self):
+        self.approving = False
+        self._selection_changed()
+
+    def _save_approved_now(self, picked, user, password, save_login, plan):
         """Save the approved devices. plan: {ip: {'restore': bool, 'credentials': 'keep' |
         'replace', 'device_id': id}} for IPs of deleted devices; None = the user cancelled."""
         if plan is None:
@@ -387,6 +461,7 @@ class ScanTab(ttk.Frame):
                                  f"{how} SUCCESSFUL.", 'ok', tags=['change'], device=d['name'],
                       ip=d['ip'])
         self._remember({'kind': 'approval', 'count': n})
+        self._results_approved = True
         messagebox.showinfo('Approved', message)
         if self.on_approved:
             self.on_approved()
@@ -452,8 +527,10 @@ class ScanRestoreDialog(tk.Toplevel):
         chosen = [row for row in self.rows if row['restore'].get()]
         if chosen:
             names = ', '.join(row['gone']['name'] for row in chosen)
-            if not messagebox.askyesno('Restore deleted devices',
-                                       f'Restore {names}?', parent=self):
+            if not confirm('Restore deleted devices', f'Restore {names}? They get back their '
+                                                      f'history (logs and events).',
+                           f'Restore {len(chosen)} device{"" if len(chosen) == 1 else "s"}',
+                           parent=self):
                 return
         plan = {row['found']['ip']: {'restore': bool(row['restore'].get()),
                                      'credentials': row['choice'].get() or 'keep',

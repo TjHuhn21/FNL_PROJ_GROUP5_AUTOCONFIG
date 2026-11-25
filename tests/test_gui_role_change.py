@@ -107,7 +107,11 @@ def test_approving_sets_the_chosen_role_and_admin_asks_first(root, backend, monk
     assert asked == ['Give justine@example.com full admin access? Admins can approve, '
                      'disable, and change roles of other accounts.']
     assert backend.repo.get_user(pending)['status'] == 'pending_approval'    # declined
-    page.role.set('operator')                                # no question for operator
+    page.role.set('operator')                                # every approval asks (shared dialog)
+    page.approve()
+    assert asked[-1].startswith('Approve justine@example.com as operator?')
+    assert backend.repo.get_user(pending)['status'] == 'pending_approval'    # declined again
+    monkeypatch.setattr(messagebox, 'askyesno', lambda t, text, **k: asked.append(text) or True)
     page.approve()
     user = backend.repo.get_user(pending)
     assert (user['status'], user['role']) == ('active', 'operator')

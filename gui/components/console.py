@@ -381,6 +381,13 @@ class OperationsConsole(tk.Frame):
         nothing is deleted from the database (the Console history stays saved and the
         Logs page shows it). On the stored-data tabs only the view is emptied."""
         tab = self._current_tab()
+        from gui.components.dialogs import confirm
+        what = {CONFIG_TAB: 'the Config log view', EVENTS_TAB: 'the Status events view'}.get(
+            tab, 'the Console screen')
+        if not confirm('Clear', f'Clear {what}? Saved logs are not deleted: the Logs page still '
+                                f'shows everything.', 'Clear screen', parent=self,
+                       log=('app', f'Clearing {what}')):
+            return False
         if tab in (CONFIG_TAB, EVENTS_TAB):
             t = self.config_text if tab == CONFIG_TAB else self.events_text
             t.configure(state='normal')

@@ -16,7 +16,8 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import ttk, messagebox
 
-from gui import theme
+from gui import activity, theme
+from gui.components.dialogs import inform
 from gui.db_status import database_ready, report_error
 from gui.event_log import log_event
 from gui.timefmt import format_datetime
@@ -124,9 +125,17 @@ class FindingsTab(ttk.Frame):
         self.after(POLL_MS, self.check_queue)
 
     def run(self):
-        if self.read_only or self.busy or not database_ready(self):
+        if self.read_only:
+            return
+        if self.busy:                                # never two reviews at once
+            log_event('findings', 'Run review refused: a review is already running.', 'warn')
+            inform('Review already running', 'A review is already running. Wait for it to '
+                                             'finish; its results are shown here.', parent=self)
+            return
+        if not database_ready(self):
             return
         log_event('findings', 'Running the configuration review...')
+        activity.start('findings', 'A configuration review is still running.')
         self._start('Reading configurations and reviewing...', _review_worker,
                     self.collect, self.store, self.sample_store)
 
@@ -171,6 +180,7 @@ class FindingsTab(ttk.Frame):
                 pass
             return
         self.busy = False
+        activity.finish('findings')
         if not self.read_only:
             self.run_btn.state(['!disabled'])
         self.stored_btn.state(['!disabled'])

@@ -54,6 +54,16 @@ CREATE TABLE IF NOT EXISTS status_events (
   FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+-- Small per-user settings (the welcome tour was completed, the getting-started checklist).
+-- Existing databases: run schema_update_user_settings.sql once.
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_key    VARCHAR(190) NOT NULL,
+  name        VARCHAR(64)  NOT NULL,
+  value       VARCHAR(255) NOT NULL,
+  updated_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_key, name)
+) ENGINE=InnoDB;
+
 -- The saved Console history: append-only (the triggers refuse every UPDATE and DELETE).
 -- Existing databases: run schema_update_console_log.sql once.
 CREATE TABLE IF NOT EXISTS console_log (

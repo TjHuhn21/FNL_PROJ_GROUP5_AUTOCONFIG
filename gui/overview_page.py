@@ -228,13 +228,18 @@ class Tooltip:
 
 class OverviewPage(tk.Frame):
     def __init__(self, parent, open_page, store=None, can_open=None, scan_history=None,
-                 source_note='', last_review=None):
+                 source_note='', last_review=None, checklist_flags=None,
+                 on_hide_checklist=None):
         """open_page(key) switches to another page; can_open(key) says whether the
         signed-in role may open it (quick actions are offered only for those);
         scan_history() returns the Scan page's session history; last_review() the
-        Findings page's newest review of this session (or None)."""
+        Findings page's newest review of this session (or None).
+        checklist_flags() -> {'topology': viewed?, 'hidden': dismissed?} for the
+        getting-started checklist; on_hide_checklist() remembers that it was dismissed."""
         super().__init__(parent, background=theme.SURFACE)
         self.open_page, self.store = open_page, store
+        self.checklist_flags = checklist_flags or (lambda: {})
+        self.on_hide_checklist = on_hide_checklist or (lambda: None)
         self.can_open = can_open or (lambda key: True)
         self.scan_history = scan_history or (lambda: [])
         self.last_review = last_review or (lambda: None)
@@ -276,6 +281,13 @@ class OverviewPage(tk.Frame):
         body = tk.Frame(page, background=theme.SURFACE)
         body.pack(fill='both', expand=True, padx=16, pady=(6, 12))
         self.body = body
+
+        # ---- getting started (a new installation): shown until every step is done or it
+        # is dismissed; each step is ticked off when it has really happened
+        self.checklist = tk.Frame(body, background=theme.INFO_SOFT, highlightthickness=1,
+                                  highlightbackground=theme.BORDER, padx=14, pady=10)
+        self.checklist_rows = {}
+        self.checklist_done = {}
 
         # ---- cards
         cards = tk.Frame(body, background=theme.SURFACE)
@@ -527,6 +539,10 @@ class OverviewPage(tk.Frame):
 
     # ------------------------------------------------------------ drawing
     def _show(self, d):
+        try:
+            self._show_checklist(d)
+        except Exception:                          # never crash the home page for the guide
+            self.checklist.pack_forget()
         c = self.cards
         if d['devices'] == 0:
             c['devices']['value'].config(text='0')
@@ -587,6 +603,56 @@ class OverviewPage(tk.Frame):
                                 _short(e.get('detail'), 40)),
                                (e['kind'],) if e['kind'] in ('up', 'down') else ())
                               for e in d['recent_events']], NONE_YET['status'])
+
+    def checklist_state(self, d):
+        """{step: done?} for the getting-started checklist, from real data only."""
+        flags = self.checklist_flags() or {}
+        history = list(self.scan_history() or [])
+        scanned = any(h['kind'] == 'scan' and not h.get('failed') for h in history)
+        return {'scan': scanned or d['devices'] > 0,
+                'approve': d['devices'] > 0,
+                'topology': bool(flags.get('topology')),
+                'review': d['review_saved_at'] is not None or bool(self.last_review())}
+
+    def _show_checklist(self, d):
+        from gui import guide_content as G
+        done = self.checklist_state(d)
+        self.checklist_done = done
+        hidden = bool((self.checklist_flags() or {}).get('hidden'))
+        if hidden or all(done.values()):
+            self.checklist.pack_forget()
+            return
+        frame = self.checklist
+        for child in frame.winfo_children():
+            child.destroy()
+        head = tk.Frame(frame, background=theme.INFO_SOFT)
+        head.pack(fill='x')
+        tk.Label(head, text=G.GETTING_STARTED_TITLE, font=theme.mono(8, 'bold'),
+                 background=theme.INFO_SOFT, foreground=theme.INFO).pack(side='left')
+        hide = tk.Label(head, text='Hide', font=theme.FONT_SMALL, cursor='hand2',
+                        background=theme.INFO_SOFT, foreground=theme.ACCENT)
+        hide.pack(side='right')
+        hide.bind('<Button-1>', lambda e: self.hide_checklist())
+        self.checklist_rows = {}
+        steps = tk.Frame(frame, background=theme.INFO_SOFT)          # one grid: Go lines up
+        steps.pack(fill='x')
+        for n, (key, label, page) in enumerate(G.GETTING_STARTED, 1):
+            mark = '☑' if done[key] else '☐'
+            text = tk.Label(steps, text=f'{mark}  {n}) {label}', font=theme.FONT,
+                            background=theme.INFO_SOFT, anchor='w',
+                            foreground=theme.TEXT_MUTED if done[key] else theme.TEXT)
+            text.grid(row=n, column=0, sticky='w', pady=(4, 0))
+            if not done[key] and self.can_open(page):
+                ttk.Button(steps, text='Go', command=lambda p=page: self.open_page(p)).grid(
+                    row=n, column=1, sticky='w', padx=(12, 0), pady=(4, 0))
+            self.checklist_rows[key] = text
+        if not frame.winfo_manager():
+            frame.pack(fill='x', pady=(0, 10), before=self._cards_frame)
+
+    def hide_checklist(self):
+        self.on_hide_checklist()
+        self.checklist.pack_forget()
+        log_event('overview', 'Getting-started checklist hidden.')
 
     def _status_indicator(self, up, down):
         """The big status figure: '▲ 5' (green), '▼ 5' (red), both side by side when

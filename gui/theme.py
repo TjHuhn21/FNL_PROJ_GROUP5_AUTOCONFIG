@@ -285,6 +285,14 @@ def _styles(root):
                           ('active', ACCENT_HOVER)],
               bordercolor=[('disabled', ACCENT_DISABLED), ('focus', ACCENT_HOVER)],
               foreground=[('disabled', CREAM)])
+    # Dangerous actions in confirmations (delete, apply, reject, disable): muted red
+    style.configure('Danger.TButton', font=FONT_BOLD, foreground=WHITE, background=DANGER,
+                    bordercolor=DANGER, lightcolor=DANGER, darkcolor=DANGER)
+    style.map('Danger.TButton',
+              background=[('disabled', DANGER_SOFT), ('pressed', '#8A2F23'),
+                          ('active', '#8A2F23')],
+              bordercolor=[('disabled', DANGER_SOFT), ('focus', TEXT)],
+              foreground=[('disabled', TEXT_MUTED)])
     # Larger form controls (inherit everything else from TLabel / TCheckbutton /
     # Accent.TButton, so colors and states stay the same)
     style.configure('Form.TLabel', font=FONT_FORM)

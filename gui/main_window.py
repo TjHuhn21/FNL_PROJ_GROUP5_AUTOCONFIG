@@ -34,6 +34,7 @@ from gui.db_status import DatabaseStatus, report_error
 from gui.device_login_guard import DeviceLoginGuard
 from gui.devices_tab import DevicesTab
 from gui.findings_tab import FindingsTab
+from gui.guide import CHECKLIST_HIDDEN, TOPOLOGY_VIEWED, Guide
 from gui.logs_tab import LogsTab
 from gui.overview_page import OverviewPage
 from gui.scan_tab import ScanTab
@@ -84,6 +85,53 @@ SOURCE_FALLBACK = '●  sample mode · database unavailable at startup'
 
 
 DEV_LOCK_RESET_TEXT = 'DEV: lock reset on restart'
+
+
+def add_tooltips(refs):
+    """Short hover texts (gui/guide_content.TOOLTIPS) on the buttons and fields whose
+    meaning is not obvious. Pages that are not built for this role are skipped."""
+    from gui.components.tooltip import tip
+    tip(refs.get('help_button'), 'help')
+    scan = refs.get('scan')
+    if scan is not None:
+        tip(scan.entries.get('Seed IP'), 'seed_ip')
+        for box, key in zip(scan.option_boxes, ('demo_scan', 'save_login', 'neighbours')):
+            tip(box, key)
+        tip(scan.approve_btn, 'approve')
+    devices = refs.get('devices')
+    if devices is not None:
+        tip(devices.backups_btn, 'backups')
+    conf = refs.get('configure')
+    if conf is not None:
+        tip(conf.apply_btn, 'apply')
+        tip(conf.clear_form_btn, 'clear_form')
+        for editor, labels in ((conf.trunk_editor, {'Native VLAN': 'native_vlan',
+                                                    'encapsulation dot1q': 'dot1q'}),
+                               (conf.security_editor, {'Learn MACs (sticky)': 'sticky',
+                                                       'Max MAC addresses': 'max_mac',
+                                                       'On violation': 'violation'})):
+            for widget in _labelled(editor):
+                key = labels.get(str(widget.cget('text')).strip())
+                if key:
+                    tip(widget, key)
+    findings = refs.get('findings')
+    if findings is not None:
+        tip(findings.run_btn, 'run_review')
+        tip(findings.send_btn, 'send_to_configure')
+    accounts = refs.get('accounts')
+    if accounts is not None:
+        tip(getattr(accounts, 'role_box', None), 'approve_as')
+
+
+def _labelled(widget):
+    """Every label and check box under widget (their text names the field)."""
+    out, stack = [], [widget]
+    while stack:
+        w = stack.pop()
+        stack.extend(w.winfo_children())
+        if w.winfo_class() in ('TLabel', 'TCheckbutton'):
+            out.append(w)
+    return out
 
 
 def build_main_window(root, store, demo_store=False, startup_problem=None, access=None,
@@ -159,6 +207,12 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         refs['dev_label'] = ctk.CTkLabel(header, text=DEV_LOCK_RESET_TEXT,
                                          font=theme.mono(9, 'bold'), text_color=theme.WARNING)
         refs['dev_label'].grid(row=0, column=5, padx=(0, 12))
+    # ? Help: restart the tour, help for this page, keyboard shortcuts (gui/guide.py)
+    refs['help_button'] = ctk.CTkButton(
+        header, text='?', font=theme.mono(11, 'bold'), height=26, width=30, corner_radius=13,
+        fg_color=theme.SURFACE_2, hover_color=theme.BORDER, text_color=theme.ACCENT,
+        command=lambda: refs['guide'].menu(refs['help_button']))
+    refs['help_button'].grid(row=0, column=6, padx=(0, 12))
     ctk.CTkFrame(root, height=1, corner_radius=0, fg_color=theme.BORDER).grid(
         row=1, column=0, columnspan=2, sticky='ew')
 
@@ -354,11 +408,18 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
     refs['logs'] = LogsTab(host, store, scope_users=scope)
     if allowed('setup'):                    # not even built for roles that may not use it
         refs['setup'] = SetupTab(host, log=log_event, backend=console_backend)
+    # the new-user guide (tour, help) for this user: their server account id, else 'demo'
+    user_key = getattr(getattr(account, 'session', None), 'user_id', None) or 'demo'
+    refs['guide'] = Guide(root, refs, store, user_key)
     refs['dashboard'] = OverviewPage(
         host, lambda key: show_page(key), store=store, can_open=allowed,
         scan_history=lambda: refs['scan'].history,
         last_review=lambda: refs['findings'].last_review,
-        source_note='Sample mode: the data is kept in memory.' if demo_store else '')
+        source_note='Sample mode: the data is kept in memory.' if demo_store else '',
+        checklist_flags=lambda: {'topology': refs['guide'].flag(TOPOLOGY_VIEWED),
+                                 'hidden': refs['guide'].flag(CHECKLIST_HIDDEN)},
+        on_hide_checklist=lambda: refs['guide'].set(CHECKLIST_HIDDEN))
+    refs['devices'].on_go_scan = (lambda: show_page('scan')) if allowed('scan') else None
     if access is not None:
         refs['devices'].set_read_only(not access.can(EDIT_DEVICES))
         refs['findings'].set_read_only(not access.can(RUN_REVIEW))
@@ -629,6 +690,9 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         restore_console(key)
         if key in on_show:
             on_show[key]()
+        if key == 'topology' and not refs['guide'].flag(TOPOLOGY_VIEWED):
+            refs['guide'].set(TOPOLOGY_VIEWED)       # the getting-started checklist ticks it
+            overview_stale()
         update_status()
 
     refs['nav'] = Rail(root, pages, show_page)
@@ -657,6 +721,8 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         log_event('app', f'Sign-in SUCCESSFUL: {mask_email(account.session.email)} '
                          f'({access.title}).', 'ok')
     log_event('app', 'NetCommand workbench started.')
+    root.bind_all('<F1>', lambda e: refs['guide'].page_help(), add='+')
+    add_tooltips(refs)
     show_page(FIRST_PAGE)
     root.after(50, place_dividers)
     root.after(80, adapt_layout)

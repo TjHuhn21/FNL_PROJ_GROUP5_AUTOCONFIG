@@ -225,8 +225,9 @@ def test_apply_to_several_devices_one_after_the_other(env):
     conf.apply_fn = fake_apply(calls, fail={'10.0.0.3'}, delay=0.02)
     conf.apply()
     title, message = env['confirms'][-1]
-    assert title == 'Apply to devices' and 'Configure 3 device(s)' in message
-    assert 'CORE  (10.0.0.2)  -  5 commands' in message and 'R1: switch settings cannot' in message
+    assert title == 'Apply to devices' and 'Apply configuration to 3 devices?' in message
+    assert 'CORE (switch, 10.0.0.2): 5 commands' in message and \
+        'R1: switch settings cannot' in message and 'A backup is saved first' in message
     assert conf.busy and not conf.stop_btn.instate(['disabled'])
     assert pump(root, lambda: not conf.busy)
     assert [c['host'] for c in calls] == ['10.0.0.2', '10.0.0.3', '10.0.0.4']
