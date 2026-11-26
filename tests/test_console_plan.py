@@ -36,7 +36,10 @@ def detected(port):
 
 
 def request(result=None, **values):
+    """A request as typed; the 'required field' rule is tested separately
+    (test_required_fields_follow_the_detection), so incomplete requests are allowed here."""
     values.setdefault('key_size', 2048)
+    values.setdefault('required', False)
     req, errors = validate_request(result=result, **values)
     assert not errors, errors
     return req
@@ -97,7 +100,8 @@ def test_below_privilege_15_missing_lines_are_unknown():
     r, _ = detected('SIM2')
     r = copy.deepcopy(r)
     from console.detect import _read_config, _Runner
-    answers = {detect.SHOW_DOMAIN: '', detect.SHOW_SSH_CONFIG: '', detect.SHOW_AAA: ''}
+    answers = {detect.SHOW_DOMAIN: '', detect.SHOW_SSH_CONFIG: '', detect.SHOW_AAA: '',
+               detect.SHOW_GATEWAY: ''}
 
     class Session:
         def send_show(self, command, timeout=None):
@@ -113,6 +117,7 @@ def test_below_privilege_15_missing_lines_are_unknown():
     c = r.config
     assert not c.domain_known and not c.ssh_lines_known and not c.aaa_known
     assert c.aaa_new_model is None and not c.local_users_known
+    assert not c.gateway_known                 # an empty search below 15 proves nothing
     assert any('below privilege level 15' in l for l in r.limitations)
 
 
@@ -229,13 +234,19 @@ def test_ios_xe_uses_its_domain_syntax_and_key_sizes():
 
 
 # ------------------------------------------------------------------ accounts
-def test_existing_username_is_never_replaced():
+def test_existing_username_is_kept_unless_change_password_is_chosen():
     r, _ = detected('SIM2')
-    plan = build_plan(r, new_user(r, name='labadmin'))
+    plan = build_plan(r, new_user(r, name='labadmin'))              # "Keep existing"
     item = plan.item('user')
-    assert item.status == CONFLICT and item.commands == []
+    assert item.status == CONFIGURED and item.commands == []
     assert not any(t.startswith('username') for t in texts(plan))
-    assert 'labadmin (privilege 15)' in item.current
+    assert 'labadmin (privilege 15)' in item.current and 'kept' in item.explanation
+    changed = build_plan(r, new_user(r, name='labadmin', change_password=True))
+    assert texts(changed).count(f'username labadmin privilege 15 secret {PASSWORD_PLACEHOLDER}') \
+        == 1                                       # the TYPED password, as a placeholder only
+    assert changed.item('user').commands[0].kind == P.MODIFY
+    assert next(s for s in changed.steps if s.step_id == 'user').title == \
+        'Change the password of labadmin'
 
 
 def test_existing_admin_is_reported():
@@ -384,7 +395,11 @@ def test_every_mock_scenario_plans_without_errors(port):
     ({'hostname': 'a' * 70}, 'hostname'),
     ({'domain_name': 'bad domain'}, 'domain_name'),
     ({'domain_name': '-x.local'}, 'domain_name'),
-    ({'username': '9user', 'password': PASSWORD, 'confirm': PASSWORD}, 'username'),
+    ({'username': 'bad.user', 'password': PASSWORD, 'confirm': PASSWORD}, 'username'),
+    ({'username': 'u' * 33, 'password': PASSWORD, 'confirm': PASSWORD}, 'username'),
+    ({'username': 'admin', 'password': '$1$B3rU$k.snkyAbc', 'confirm': '$1$B3rU$k.snkyAbc'},
+     'password'),
+    ({'username': 'admin', 'password': 'p' * 26, 'confirm': 'p' * 26}, 'password'),
     ({'username': 'admin user', 'password': PASSWORD, 'confirm': PASSWORD}, 'username'),
     ({'username': 'admin'}, 'password'),
     ({'username': 'admin', 'password': PASSWORD, 'confirm': 'other'}, 'password'),
@@ -425,7 +440,25 @@ def test_request_never_holds_a_password():
     fields = set(SetupRequest.__dataclass_fields__)
     assert fields == {'hostname', 'domain_name', 'username', 'password_set', 'key_size',
                       # the management address and saving (added on request): no secrets
-                      'mgmt_interface', 'mgmt_ip', 'mgmt_mask', 'gateway', 'save'}
+                      'mgmt_interface', 'mgmt_ip', 'mgmt_mask', 'gateway', 'save',
+                      # "Change password" for an existing account: a yes/no only
+                      'change_password'}
+
+
+def test_required_fields_follow_the_detection():
+    r, _ = detected('SIM48')                       # brand-new router: Router, nothing set
+    _req, errors = validate_request(key_size=2048, result=r)
+    assert {'hostname', 'domain_name', 'username'} <= set(errors)
+    assert 'Required' in errors['hostname']
+    r2, _ = detected('SIM2')                       # R2: a domain and an admin already exist
+    _req, errors = validate_request(key_size=2048, result=r2)
+    assert not errors
+    assert P.existing_admins(r2) == ['labadmin']
+
+
+def test_a_hash_is_never_accepted_as_a_password():
+    for value in ('$1$B3rU$k.snkyAbcd', 'x$9$abcd$efgh'):
+        assert 'not an encrypted secret' in P.check_password(value, value)
 
 
 # ------------------------------------------------------------------ staleness

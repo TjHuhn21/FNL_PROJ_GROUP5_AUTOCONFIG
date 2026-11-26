@@ -39,8 +39,6 @@ SETUP = ('\r\n         --- System Configuration Dialog ---\r\n\r\n'
 REFUSED_STATES = {
     'confirm': ('\r\nProceed with reload? [confirm]', UNSAFE_OUTPUT),
     'yes/no question': ('\r\n% Do you really want to replace them? [yes/no]: ', UNSAFE_OUTPUT),
-    'password prompt': ('\r\nPassword: ', UNSAFE_OUTPUT),
-    'login prompt': ('\r\nUser Access Verification\r\n\r\nUsername: ', UNSAFE_OUTPUT),
     'unknown question': ('\r\nDo you want to continue? (y/n)', UNEXPECTED_PROMPT),
     'boot loader': ('\r\nrommon 1 > ', UNEXPECTED_PROMPT),
     'switch boot loader': ('\r\nswitch: ', UNEXPECTED_PROMPT),
@@ -201,6 +199,22 @@ def test_a_silent_console_with_the_confirmation_sends_exactly_one_enter_first(wi
     assert wire.device.lines[0] == ''                     # the one, confirmed Enter
     assert wire.device.lines[1] == 'terminal width 511'
     s.disconnect()
+
+
+@pytest.mark.parametrize('text', ['\r\nPassword: ',
+                                  '\r\nUser Access Verification\r\n\r\nUsername: '])
+def test_a_console_login_prompt_needs_the_console_login_fields(wire, text):
+    """The console asks for its own login: without the console login fields nothing is
+    sent and the port is closed; with them, the login is typed (Username: / Password:)."""
+    wire.on_open = text
+    s = session()
+    pf = s.listen()
+    assert not pf.refused and pf.needs is None
+    with pytest.raises(ConsoleError) as err:
+        s.connect()
+    assert err.value.kind == link.AUTH and 'Console login' in str(err.value)
+    assert all(q.bytes_written == 0 for q in FakeSerial.instances)
+    assert not the_port().is_open
 
 
 @pytest.mark.parametrize('name', list(REFUSED_STATES))

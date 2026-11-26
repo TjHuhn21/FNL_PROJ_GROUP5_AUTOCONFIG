@@ -117,6 +117,9 @@ _PASSWORD_PROMPT = re.compile(r'assword\s*:', re.IGNORECASE)
 _LOGIN_REFUSED = re.compile(r'% ?(Bad passwords|Login invalid|Authentication failed|Access denied)'
                             r'|Login incorrect', re.IGNORECASE)
 _PROMPT = re.compile(r'^[\w.\-/()]+[>#]\s*$')
+ENABLE_REFUSED = ('The device refused the enable password ("% Access denied" / "% Bad '
+                  'secrets"): privileged mode was not entered. Check the enable password and '
+                  'connect again.')
 
 # ---------------------------------------------------------------- configuration exchanges
 MASK = '********'
@@ -145,6 +148,22 @@ SAFE_EXCEPTIONS = ('no shutdown',)
 # (ConsoleSession.allow_save / save_config). Never through send_config_line.
 SAVE_COMMAND = 'write memory'
 SAVE_TIMEOUT = 120               # seconds: writing NVRAM can be slow on old devices
+# The ONLY device questions NetCommand answers by itself, and only during the step that
+# expects them (console.steps.PlanStep.answers): (pattern on the question's last line,
+# what is typed). Any other question stops the run and is shown to the operator.
+MODULUS_QUESTION = re.compile(r'How many bits in the modulus', re.IGNORECASE)
+REPLACE_KEYS_QUESTION = re.compile(r'Do you really want to replace them\?', re.IGNORECASE)
+CONFIRM_QUESTION = re.compile(r'\[confirm\]\s*$', re.IGNORECASE)
+DESTINATION_QUESTION = re.compile(r'Destination filename \[startup-config\]\?', re.IGNORECASE)
+MAX_ANSWERS = 3                  # answers per line, at most (never a loop of questions)
+
+
+def answer_for(last_line, answers):
+    """What to type for this question (from answers: [(pattern, text)]), or None."""
+    for pattern, text in answers or ():
+        if pattern.search(last_line or ''):
+            return text
+    return None
 
 
 def check_config_line(line, allowed=None):
@@ -200,6 +219,21 @@ def mask_text(text, secrets):
         if value:
             text = text.replace(value, MASK)
     return text
+
+
+_SECRET_WORDS = re.compile(
+    r'(?<![\w,:/-])(secret|password|key-string|community|pre-shared-key|authentication-key|'
+    r'message-digest-key[ \t]+\d+[ \t]+md5)((?:[ \t]+\d{1,2})?)[ \t]+(?!\*{8})\S+',
+    re.IGNORECASE)
+
+
+def masked_reply(text):
+    """A device reply for the Console log: the VALUE after every secret / password /
+    key-string / community (and similar) replaced by ******** - the type number stays:
+    "username admin privilege 15 secret 5 ********". Other words are left alone (so
+    "crypto key generate rsa" stays readable). Trimmed."""
+    return _SECRET_WORDS.sub(lambda m: f'{m.group(1)}{m.group(2)} {MASK}',
+                             str(text or '')).replace('\r', '').strip()
 
 
 def classify_reply(text):
@@ -268,9 +302,14 @@ _PRESS_RETURN = re.compile(r'^press return to get started\s*[.!]?$', re.IGNORECA
 _SETUP_DIALOG = re.compile(r'would you like to enter the initial configuration dialog\?\s*'
                            r'\[yes/no\]\s*:?$', re.IGNORECASE)
 _LOGIN_NAME = re.compile(r'^(username|user name|login)\s*:$', re.IGNORECASE)
+# a new device that found no configuration server: "Would you like to terminate autoinstall?
+# [yes]:" - answered "yes" (it stops looking for a configuration on the network)
+_AUTOINSTALL = re.compile(r'terminate autoinstall\?\s*\[yes(/no)?\]\s*:?$', re.IGNORECASE)
+CONSOLE_AUTOINSTALL = 'autoinstall'
 # how the first byte was allowed (ConnectResult.verification)
 VERIFIED, OPERATOR_CONFIRMED, STARTUP_ACTION = 'verified', 'operator_confirmed', 'startup_action'
 PRESS_RETURN_ACTION, DECLINE_SETUP_ACTION = 'press_return', 'decline_setup'
+TERMINATE_AUTOINSTALL_ACTION = 'terminate_autoinstall'
 
 
 def console_state(text):
@@ -292,6 +331,8 @@ def console_state(text):
         return CONSOLE_BOOT_LOADER, None
     if _SETUP_DIALOG.search(last):
         return CONSOLE_SETUP_DIALOG, None
+    if _AUTOINSTALL.search(last):
+        return CONSOLE_AUTOINSTALL, None
     if _PRESS_RETURN.match(last):
         return CONSOLE_PRESS_RETURN, None
     if _LOGIN_NAME.match(last):
@@ -313,13 +354,15 @@ _PREFLIGHT_TEXT = {
     CONSOLE_PRESS_RETURN: 'Known startup prompt detected: "Press RETURN to get started".',
     CONSOLE_SETUP_DIALOG: ('Known startup question detected: the device asks whether to enter '
                            'its initial configuration dialog.'),
+    CONSOLE_AUTOINSTALL: ('Known startup question detected: the device asks whether to '
+                          'terminate autoinstall.'),
+    CONSOLE_USERNAME: 'The console asks for a login (Username:).',
+    CONSOLE_PASSWORD: 'The console asks for a password.',
 }
 # refused states: (ConsoleError kind, message)
 _REFUSED = {
     CONSOLE_QUESTION: (UNSAFE_OUTPUT, 'The device is waiting for an answer to a question or '
                                       'confirmation.'),
-    CONSOLE_PASSWORD: (UNSAFE_OUTPUT, 'The device is waiting at a password prompt.'),
-    CONSOLE_USERNAME: (UNSAFE_OUTPUT, 'The device is waiting at a login prompt.'),
     CONSOLE_BOOT_LOADER: (UNEXPECTED_PROMPT, 'The device is in its boot loader (ROMMON / '
                                              'switch:), not running IOS. Stop and ask the '
                                              'instructor; do not type commands there.'),
@@ -349,7 +392,8 @@ class Preflight:
         """What the operator must give before the first byte: 'confirm_idle', a startup
         action, or None (a verified prompt, or refused)."""
         return {CONSOLE_SILENT: 'confirm_idle', CONSOLE_PRESS_RETURN: PRESS_RETURN_ACTION,
-                CONSOLE_SETUP_DIALOG: DECLINE_SETUP_ACTION}.get(self.state)
+                CONSOLE_SETUP_DIALOG: DECLINE_SETUP_ACTION,
+                CONSOLE_AUTOINSTALL: TERMINATE_AUTOINSTALL_ACTION}.get(self.state)
 
     @property
     def message(self):
@@ -362,14 +406,23 @@ class Preflight:
         return f'Preflight(state={self.state!r}, prompt={self.prompt!r})'
 
 
-def gate(preflight, confirm_idle=False, startup_action=None):
+def gate(preflight, confirm_idle=False, startup_action=None, has_login=False):
     """None when the first byte may be written for this preflight, else the ConsoleError
     saying why not. confirm_idle must be exactly True (a ticked checkbox); startup_action
-    must name the startup prompt that was actually detected."""
+    must name the startup prompt that was actually detected. A console waiting at its
+    login (Username: / Password:) needs the console login fields (has_login)."""
     state = preflight.state
     if state in _REFUSED:
         kind, text = _REFUSED[state]
         return ConsoleError(kind, preflight.message)
+    if state in (CONSOLE_USERNAME, CONSOLE_PASSWORD):
+        return None if has_login else ConsoleError(
+            AUTH, _PREFLIGHT_TEXT[state] + ' Type the console username and password in '
+                                           '"Console login", then connect again. Nothing was '
+                                           'sent.')
+    if state == CONSOLE_AUTOINSTALL and startup_action != TERMINATE_AUTOINSTALL_ACTION:
+        return ConsoleError(APPROVAL_REQUIRED, _PREFLIGHT_TEXT[state] + ' Approve answering '
+                                               '"yes" to continue.')
     if state == CONSOLE_SILENT and confirm_idle is not True:
         return ConsoleError(CONFIRMATION_REQUIRED, _PREFLIGHT_TEXT[state] + ' Tick "' +
                             IDLE_CONFIRMATION + '" only after checking it yourself.')
@@ -651,9 +704,10 @@ class ConsoleSession:
         APPROVAL_REQUIRED leave it open with nothing written, for another connect()."""
         with self._lock:
             preflight = self._listen_locked()
-            problem = gate(preflight, confirm_idle, startup_action)
+            problem = gate(preflight, confirm_idle, startup_action,
+                           has_login=bool(self._username or self._password))
             if problem is not None:
-                if preflight.refused:
+                if preflight.refused or problem.kind == AUTH:
                     self._close_port()
                 raise problem
             try:
@@ -703,14 +757,25 @@ class ConsoleSession:
         if preflight.state == CONSOLE_PROMPT:
             return preflight.prompt                     # nothing to write: already logged in
         press_return_allowed = False
+        sent_user = sent_password = False
+        answered_setup = answered_autoinstall = False
         if preflight.state == CONSOLE_SETUP_DIALOG:
             self._say('warn', 'Answering "no" to the initial configuration dialog (approved).')
             reply = self._login_exchange('no')
             notices.insert(0, SETUP_DIALOG_ANSWERED)
-            press_return_allowed = True
+            press_return_allowed = answered_setup = True
+        elif preflight.state == CONSOLE_AUTOINSTALL:
+            self._say('warn', 'Answering "yes" to "terminate autoinstall?" (approved).')
+            reply = self._login_exchange('yes')
+            press_return_allowed = answered_autoinstall = True
+        elif preflight.state == CONSOLE_USERNAME:       # the console asks for its login
+            sent_user = True
+            reply = self._login_exchange(self._username)
+        elif preflight.state == CONSOLE_PASSWORD:
+            sent_password = True
+            reply = self._login_exchange(self._password, secrets=(self._password,))
         else:                                           # silent (confirmed) / Press RETURN
             reply = self._login_exchange('')
-        sent_user = sent_password = False
         for _round in range(8):
             state, prompt = console_state(reply)
             low = reply.lower()
@@ -726,6 +791,19 @@ class ConsoleSession:
                 press_return_allowed = False
                 reply = self._login_exchange('')
                 continue
+            # the known startup questions that can follow each other on a new device (after
+            # the setup dialog: autoinstall; after either: Press RETURN), each answered once
+            if state == CONSOLE_SETUP_DIALOG and answered_autoinstall and not answered_setup:
+                self._say('warn', 'Answering "no" to the initial configuration dialog.')
+                answered_setup = press_return_allowed = True
+                notices.insert(0, SETUP_DIALOG_ANSWERED)
+                reply = self._login_exchange('no')
+                continue
+            if state == CONSOLE_AUTOINSTALL and answered_setup and not answered_autoinstall:
+                self._say('warn', 'Answering "yes" to "terminate autoinstall?".')
+                answered_autoinstall = press_return_allowed = True
+                reply = self._login_exchange('yes')
+                continue
             if state == CONSOLE_USERNAME and self._username and not sent_user:
                 sent_user = True
                 reply = self._login_exchange(self._username)
@@ -740,7 +818,7 @@ class ConsoleSession:
                                                                         sent_password) else
                                    'The device refused the console login (wrong username or '
                                    'password).')
-            if state in (CONSOLE_SETUP_DIALOG, CONSOLE_PRESS_RETURN):
+            if state in (CONSOLE_SETUP_DIALOG, CONSOLE_PRESS_RETURN, CONSOLE_AUTOINSTALL):
                 self._preflight = Preflight(state)         # ask the operator; port stays open
                 raise gate(self._preflight)
             if state in _REFUSED:
@@ -978,7 +1056,7 @@ class ConsoleSession:
             out = self._call(self._guarded(lambda c: c.send_command(
                 text, read_timeout=timeout or self.command_timeout)),
                 (timeout or self.command_timeout) + 5)
-            self._say('info', f'{len(str(out).splitlines())} line(s) received.')
+            self._say('reply', masked_reply(out))
             return out
 
     def enable(self):
@@ -998,11 +1076,11 @@ class ConsoleSession:
                 self._call(self._guarded(lambda c: c.enable()), self.command_timeout)
             except ConsoleError as err:
                 if err.kind in (OTHER, UNEXPECTED_PROMPT, TIMEOUT):
-                    raise ConsoleError(AUTH, 'The device refused the enable password.') from None
+                    raise ConsoleError(AUTH, ENABLE_REFUSED) from None
                 raise
             prompt = self._prompt_now()
             if not prompt.endswith('#'):
-                raise ConsoleError(AUTH, 'The device refused the enable password.')
+                raise ConsoleError(AUTH, ENABLE_REFUSED)
             return prompt
 
     def _enable_bare(self):
@@ -1041,10 +1119,12 @@ class ConsoleSession:
             self._in_config = reply.state == PROMPT and '(config' in (reply.prompt or '')
             return reply
 
-    def send_config_line(self, line, expect=None, timeout=None, secrets=None):
+    def send_config_line(self, line, expect=None, timeout=None, secrets=None, answers=()):
         """ONE line of the approved plan, in configuration mode. secrets: {placeholder:
         value}, substituted only when the line is written and masked in the reply.
-        expect: informational (the caller compares ConfigReply.prompt with it)."""
+        expect: informational (the caller compares ConfigReply.prompt with it).
+        answers: the known questions this line may raise and what to type (see
+        answer_for); any other question ends the exchange unanswered."""
         template = check_config_line(line, self._allowed)
         values = dict(secrets or {})
         text = template
@@ -1059,7 +1139,7 @@ class ConsoleSession:
             self._secrets = tuple(v for v in values.values() if v)
             try:
                 self._say('command', template)
-                return self._exchange(text, timeout or CONFIG_TIMEOUT)
+                return self._exchange(text, timeout or CONFIG_TIMEOUT, answers)
             finally:
                 self._secrets = ()
 
@@ -1075,9 +1155,10 @@ class ConsoleSession:
         with self._lock:
             self._save_allowed = bool(allowed)
 
-    def save_config(self, timeout=None):
-        """`write memory`, at the privileged prompt, only after allow_save(True). A question
-        or any other prompt is never answered (the session closes, as for every exchange).
+    def save_config(self, timeout=None, answers=()):
+        """`write memory`, at the privileged prompt, only after allow_save(True). Only the
+        known save questions in answers ([confirm], Destination filename) are answered;
+        any other question ends the exchange (the session closes, as for every exchange).
         ConfigReply; the caller verifies the startup configuration with show commands."""
         with self._lock:
             if not getattr(self, '_save_allowed', False):
@@ -1086,7 +1167,7 @@ class ConsoleSession:
             if self._in_config:
                 raise ConsoleError(REFUSED, 'Still in configuration mode; nothing was sent.')
             self._say('command', SAVE_COMMAND)
-            return self._exchange(SAVE_COMMAND, timeout or SAVE_TIMEOUT)
+            return self._exchange(SAVE_COMMAND, timeout or SAVE_TIMEOUT, answers)
 
     def end_config(self, timeout=None):
         """'end', then Netmiko learns the (possibly renamed) prompt again."""
@@ -1100,11 +1181,12 @@ class ConsoleSession:
                 self._call(self._guarded(lambda c: c.set_base_prompt()), self.command_timeout)
             return reply
 
-    def _exchange(self, text, seconds):
+    def _exchange(self, text, seconds, answers=()):
         """Write one line and read until the reply ends (a prompt, a question, a password
-        or boot-loader prompt). Reads and writes the port directly. A reply that is not a
-        prompt closes the session at once: nothing is ever answered. Secret values are
-        masked before the text leaves this method. Caller holds self._lock."""
+        or boot-loader prompt). Reads and writes the port directly. A question listed in
+        answers is answered (at most MAX_ANSWERS times, each logged); a reply that ends in
+        anything else that is not a prompt closes the session at once, unanswered. Secret
+        values are masked before the text leaves this method. Caller holds self._lock."""
         secrets = self._secrets
 
         def work(conn):
@@ -1114,6 +1196,7 @@ class ConsoleSession:
             self._check_unread(conn)
             channel.write_channel(text + conn.RETURN)
             buffer, deadline = '', time.monotonic() + seconds
+            answered, answered_at = 0, -1
             while True:
                 if self._cancelled.is_set():
                     raise ConsoleError(CANCELLED, 'Cancelled. The serial port was closed.')
@@ -1125,10 +1208,21 @@ class ConsoleSession:
                 if state is not None:
                     time.sleep(SETTLE)                     # a line may still be arriving
                     more = channel.read_buffer()
-                    if not more:
-                        return buffer
-                    buffer += more
-                    continue
+                    if more:
+                        buffer += more
+                        continue
+                    if state == QUESTION and answered < MAX_ANSWERS and \
+                            len(buffer) > answered_at:
+                        last = buffer.replace('\r', '').rstrip().split('\n')[-1].strip()
+                        reply = answer_for(last, answers)
+                        if reply is not None:
+                            answered, answered_at = answered + 1, len(buffer)
+                            self._say('info', f'Answered the device question "{last}" with '
+                                              f'"{reply or "<Enter>"}" (expected for this step).')
+                            channel.write_channel(reply + conn.RETURN)
+                            deadline = time.monotonic() + seconds
+                            continue
+                    return buffer
                 if time.monotonic() > deadline:
                     raise ConsoleError(TIMEOUT, f'The device did not finish answering within '
                                                 f'{int(seconds)} seconds; the console port was '
@@ -1136,8 +1230,9 @@ class ConsoleSession:
                                                 f'known.')
                 time.sleep(0.02)
 
-        raw = self._call(work, seconds + 10)
+        raw = self._call(work, seconds * (1 + (MAX_ANSWERS if answers else 0)) + 10)
         masked = mask_text(raw, secrets)
+        self._say('reply', masked_reply(masked))
         state, prompt = classify_reply(masked)
         if state != PROMPT:
             self._release()                                # never answered: port closed

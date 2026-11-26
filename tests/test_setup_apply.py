@@ -67,9 +67,11 @@ def test_apply_runs_step_by_step_and_shows_every_status(root):
     res = tab.apply_result
     assert res.outcome == A.SUCCESS
     rows = {i: tab.apply_tree.item(i, 'values')[1] for i in tab.apply_tree.get_children()}
-    assert set(rows.values()) == {'VERIFIED'} and 'aaa_unchanged' in rows
-    assert 'Every step was applied and VERIFIED' in tab.apply_summary.cget('text')
-    assert 'Nothing was saved' in tab.apply_summary.cget('text')
+    assert set(rows.values()) <= {'OK', 'SKIPPED'} and rows['aaa_unchanged'] == 'OK'
+    summary = tab.apply_summary.cget('text')
+    assert summary.startswith('SSH setup complete on Edge-R1. SSH: enabled (v2). '
+                              'Login: netadmin.')
+    assert 'Not saved: the settings are lost when the device restarts.' in summary
     assert 'username netadmin privilege 15 secret <SSH_PASSWORD>' in \
         tab.apply_commands.cget('text')
     # the page now shows the re-detected device, and the preview is out of date
@@ -154,7 +156,7 @@ def test_stop_takes_effect_between_steps_only(root):
     assert session.config_sent[-1] == 'end'                     # never cut in the middle
     assert not session._cancelled.is_set() and session.is_active()
     rows = {i: tab.apply_tree.item(i, 'values')[1] for i in tab.apply_tree.get_children()}
-    assert 'NOT RUN' in rows.values() and rows['hostname'] == 'VERIFIED'
+    assert 'NOT RUN' in rows.values() and rows['hostname'] == 'OK'
 
 
 def test_closing_the_page_during_apply_never_cuts_an_exchange(root):
@@ -170,15 +172,26 @@ def test_closing_the_page_during_apply_never_cuts_an_exchange(root):
     assert sent.count('configure terminal') == sent.count('end')
 
 
-def test_an_unanswered_question_is_shown_with_recovery(root):
+def test_the_known_key_size_question_is_answered(root):
     tab = previewed(root, 'SIM21', hostname='', domain='',
                     backend=MockConsoleBackend(delay=0, edge_cases=True))
     tab.session.console = {'modulus_question_on': 'crypto key generate rsa modulus 2048'}
     type_apply(tab)
     tab.apply_btn.invoke()
     settle(root, tab)
+    assert tab.phase == DETECTED and tab.apply_tree.item('rsa', 'values')[1] == 'OK'
+
+
+def test_an_unexpected_question_is_shown_with_recovery(root):
+    tab = previewed(root, 'SIM21', hostname='', domain='',
+                    backend=MockConsoleBackend(delay=0, edge_cases=True))
+    tab.session.console = {'modulus_question_on': 'crypto key generate rsa modulus 2048'}
+    next(s for s in tab.plan.steps if s.step_id == 'rsa').answers = ()   # not expected
+    type_apply(tab)
+    tab.apply_btn.invoke()
+    settle(root, tab)
     assert tab.phase == ERROR and tab.session is None            # the console was closed
-    assert tab.apply_tree.item('rsa', 'values')[1] == 'UNCERTAIN'
+    assert tab.apply_tree.item('rsa', 'values')[1] == 'NOT VERIFIED'
     assert 'How many bits in the modulus' in tab.apply_tree.item('rsa', 'values')[2]
     assert 'never answers device questions' in tab.apply_recovery.cget('text')
 

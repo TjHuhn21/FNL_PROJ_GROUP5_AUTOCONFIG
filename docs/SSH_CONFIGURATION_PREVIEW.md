@@ -126,10 +126,14 @@ marked, because nobody can log in there now).
 * **AAA.** AAA is never changed. With `aaa new-model`, logins follow AAA method lists,
   so the plan does not touch the VTY login and asks you to check the method list. If it is
   unknown whether AAA is on, the VTY login is not changed.
-* **No lockout.** `login local` is proposed only when a **new** privilege-15 account is
-  added in the same plan. An existing account is not enough: NetCommand cannot tell
-  whether you know its password, and switching the login would lock you out if you do
-  not.
+* **No lockout.** `login local` is proposed only when a privilege-15 account exists or is
+  added (or its password changed) in the same plan. With an existing account the page says
+  *"Existing user(s): admin. Leave empty to keep using them."* - you need to know its
+  password; the console line itself is not changed, so a mistake can always be fixed
+  through the console. Typing a username that already exists asks *"User admin already
+  exists. Change its password?"* [Change password] [Keep existing]. The password is always
+  the one TYPED (8-25 characters, no hash such as `$1$...`); nothing read from the device is
+  ever sent back.
 * **VTY ranges.** Each configured range (`line vty 0 4`, `line vty 5 15`, ...) is planned
   separately, with its own login and protocols. The number of VTY lines comes from
   `show line`; lines it reports that are not in the configuration that was read are
@@ -283,11 +287,15 @@ The first step that is not VERIFIED stops the run. Steps that depend on it (dire
 through others) are **BLOCKED**; the others are **NOT RUN**. Steps already VERIFIED stay
 in effect in the running configuration.
 
-**Stops, never answered (D1).** A question (`[yes/no]`, `[confirm]`, `How many bits in the
-modulus [512]:`...), a password prompt, a boot-loader prompt, a reply that never ends in a
-prompt (timeout), or a lost connection stops everything at once. Nothing is typed in
-reply (no `no`, no Enter): the console port is closed and the result says what the device
-asked and what to do at the console. Partial output from a timeout is never used.
+**Known questions answered, everything else stops (D1).** Each step lists the questions
+it may answer (`PlanStep.answers`): the RSA step answers *"How many bits in the modulus"*
+with the chosen size and *"Do you really want to replace them?"* with `yes`; the save step
+answers `[confirm]` and *"Destination filename [startup-config]?"* with Enter. Each answer
+is logged. Any other question, a password prompt, a boot-loader prompt, a reply that never
+ends in a prompt (timeout), or a lost connection stops everything at once: nothing is
+typed in reply, the console port is closed and the result says what the device asked and
+what to do at the console. Partial output from a timeout is never used. Any reply line
+starting with `%` that is not one of IOS's informational lines fails the step.
 
 **Output that arrives in between (phase 5.1.5).** Before anything is written to the
 console - each configuration line, `end`, `enable`, and every command Netmiko sends with

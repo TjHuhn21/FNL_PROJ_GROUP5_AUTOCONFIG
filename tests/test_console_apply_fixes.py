@@ -142,9 +142,10 @@ def test_m1_unexpected_prompt_is_uncertain_and_closed_without_typing():
     assert statuses(res)['rsa'] == A.BLOCKED
 
 
-def test_m1_a_question_still_closes_without_an_answer():
+def test_m1_an_unexpected_question_still_closes_without_an_answer():
     s, r, req, plan = mock_prepared('SIM21', hostname='', domain='')
     s.console = {'modulus_question_on': RSA_LINE}
+    next(x for x in plan.steps if x.step_id == 'rsa').answers = ()   # not one this step expects
     cli = s.cli
     res = go(s, r, req, plan)
     assert statuses(res)['rsa'] == UNCERTAIN and cli.pending is not None
@@ -174,6 +175,7 @@ def page(root, port='SIM8', backend=None):
     from test_setup_preview import fill, ready
     tab = ready(root, port, backend=backend or MockConsoleBackend(delay=0))
     fill(tab, password=PW)
+    tab.save_var.set(False)        # (saving is ticked by default; not what these tests check)
     tab.preview()
     tab.apply_vars['password'].set(PW)
     tab.apply_vars['confirm'].set(PW)
@@ -749,6 +751,7 @@ def test_h1_end_to_end_the_step_finishes_then_the_console_closes(monkeypatch, bo
         tab.detect()
         pump_until(root, lambda: not tab.busy, 10)
         fill(tab, password=PW)
+        tab.save_var.set(False)    # (saving is ticked by default; not what this test checks)
         tab.preview()
         tab.apply_vars['password'].set(PW)
         tab.apply_vars['confirm'].set(PW)

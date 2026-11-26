@@ -41,14 +41,20 @@ decides what happens next, and the page says which case applies:
 | The page shows | What it means | What you do |
 |---|---|---|
 | **Normal prompt detected (verified by NetCommand)** | The device printed its `>` or `#` prompt. | Nothing: NetCommand connects. |
-| **Console silent; manual confirmation required** | An idle console prints nothing until it receives a key, so NetCommand cannot see whether the device is at a prompt or waiting for an answer. | Check the device yourself in a terminal program (PuTTY, Tera Term), close the terminal, then tick *"I checked the console in a terminal and confirmed that the device is at a normal IOS `>` or `#` prompt."* and click **Continue**. The box is never ticked for you. This is **your** check, not NetCommand's: if the device is really waiting at a question, the Enter sent next would answer it. |
-| **Known startup prompt detected** - "Press RETURN to get started" | The device has just started (or a console session ended). | Click **Press Enter to start the console session** (one Enter). |
-| **Known startup prompt detected** - the initial configuration dialog | A new or erased device asks *"Would you like to enter the initial configuration dialog? [yes/no]"*. | Policy: NetCommand answers **no** only when you click **Answer "no" and continue** (this skips the setup wizard and changes no configuration), then presses Enter once at the *"Press RETURN to get started"* that follows. It never answers "yes". |
-| **Unsafe or unknown state; connection refused** | A question or `[confirm]`, a password or login prompt, the boot loader (ROMMON / `switch:`), configuration mode, unreadable output, output still streaming, or anything not recognised. | Nothing was sent and the port was closed. Resolve it at the console in a terminal program, then connect again. |
+| Console silent | An idle console prints nothing until it receives a key. | Nothing: NetCommand sends Enter and reads the prompt (logged). No reply at all: *"No response. Check the cable is in the CONSOLE port, the COM port, and the speed."* |
+| "Press RETURN to get started" | The device has just started (or a console session ended). | Nothing: NetCommand sends Enter (logged). |
+| *"Would you like to enter the initial configuration dialog? [yes/no]"* | A new or erased device. | Nothing: NetCommand answers **no** (skips the setup wizard, changes nothing), then Enter at the "Press RETURN" that follows. It never answers "yes" here. |
+| *"Would you like to terminate autoinstall? [yes]"* | A new device found no configuration server. | Nothing: NetCommand answers **yes** (logged). |
+| `Username:` / `Password:` (console login) | The console line asks for a login. | Type the console username and password in **Console login** before connecting; without them nothing is sent and the port is closed. |
+| **Unsafe or unknown state; connection refused** | Any other question or `[confirm]`, the boot loader (ROMMON / `switch:`), configuration mode, unreadable output, output still streaming, or anything not recognised. | Nothing was sent and the port was closed. Resolve it at the console in a terminal program, then connect again. |
 
-**Cancel** (or **Cancel and close the port**) while the page waits for your decision closes
-the port: nothing has been sent. After connecting, the message says whether NetCommand
-verified the prompt or relied on your confirmation.
+The connected status reads, for example, **Connected: R1# (privileged mode)**. The old
+behaviour (you decide each startup prompt and confirm a silent console yourself) is still
+available to developers through `SetupTab.auto_startup = False`. If the port is busy
+(PuTTY or Tera Term open), the page says *"COM3 is in use by another program..."*.
+Leaving the Setup page or closing NetCommand while connected asks first and closes the
+port. Every command sent and every reply (passwords and secrets masked) is logged to the
+Console.
 
 The same open port is then used for everything (it is never closed and reopened in between),
 and NetCommand logs in itself: only the console's own username and password prompts are
@@ -63,7 +69,15 @@ these commands, one after the other, without blocking the window:
 `show ip ssh`, `show crypto key mypubkey rsa`, `show running-config | include username`,
 `show running-config | section line vty`, `show line`, `show ip interface brief`,
 `show running-config | include ip domain`, `show running-config | include ip ssh`,
-`show running-config | include aaa`.
+`show running-config | include aaa`,
+`show running-config | include ip default-gateway|ip route 0.0.0.0 0.0.0.0`, and on
+switches `show vlan brief`.
+
+The results then show **What SSH needs**, each line OK / MISSING (or UNKNOWN when it could
+not be read): a hostname other than Router/Switch, a domain name, a local user with
+privilege 15, an RSA key of 2048 bits or more, SSH version 2, VTY `login local` +
+`transport input ssh`, a management IP on an "up" interface, and a default gateway. The
+device type (router / switch) can be corrected in section 4, after a confirmation.
 
 While it runs, the other buttons are disabled and **Cancel** stops it (and disconnects).
 You can run detection again while connected. How the answers are interpreted is
@@ -136,9 +150,27 @@ from the preview, nothing is sent. It then runs the steps one at a time: each in
 table shows every step as VERIFIED, FAILED, UNCERTAIN, BLOCKED (needs a step that did not
 pass) or NOT RUN. The first step that does not pass stops the run.
 
-* **Questions are never answered.** If the device asks something (for example whether to
-  replace RSA keys), Apply stops, closes the console port and tells you what was asked.
-  Resolve it at the console yourself, then connect and detect again.
+* **Only known questions are answered**, each logged: the RSA key size (*"How many bits in
+  the modulus"*: the size you chose), *"Do you really want to replace them?"*: `yes` (only
+  in the RSA step), and while saving `[confirm]` / *"Destination filename
+  [startup-config]?"*: Enter. **Any other question** stops Apply, closes the console port
+  and shows what was asked.
+* **Any `%` error** from the device (`% Invalid input`, `% Incomplete command`,
+  `% Invalid Password length`, `... overlaps with ...`) fails that step and stops the run,
+  with the device's exact message. IOS's informational `%` lines during key generation are
+  not errors.
+* Before anything is sent: *"Apply 9 steps to R1 through the console?"* [Apply] [Cancel].
+  At the end: one summary line, e.g. *"SSH setup complete on R1. SSH: enabled (v2). Login:
+  admin. Management IP: 192.168.1.1 on Gi0/0 (up). Saved to startup-config."* The step
+  table shows OK / FAILED / SKIPPED (already present) / NOT RUN. A management interface that
+  is switched on but down is a warning, not a failure ("check that a cable is connected";
+  for Vlan1 "connect at least one port in VLAN 1").
+* **6 Test SSH over the network** (after a successful Apply with a management IP): logs in
+  to the management IP with the new or existing account and says "SSH login OK" or the
+  exact problem. It does not count toward the failed-login lockout; it is logged.
+* **7 Register the device**: after a successful test, *"Add R1 (192.168.1.1, router) to
+  Devices as managed, and save this login (encrypted)?"* [Add] [Not now]. An IP or name
+  that is already registered is refused.
 * **Stop after the current step** stops between steps, never in the middle of a command.
   Closing NetCommand (or signing out) during Apply works the same way: NetCommand stays
   open until the current step has finished, closes the console port, and then closes.

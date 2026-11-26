@@ -31,6 +31,7 @@ def detected(port):
 def plan_for(port, username='', **values):
     r = detected(port)
     pw = PASSWORD if username else ''
+    values.setdefault('required', False)      # incomplete requests: see test_console_plan
     req, errors = validate_request(username=username, password=pw, confirm=pw, key_size=2048,
                                    result=r, **values)
     assert not errors, list(errors)
@@ -187,10 +188,14 @@ def test_rsa_replies_and_questions():
     rsa = full_plan().step('rsa')
     assert outcome(rsa, {SHOW_RSA: KEY},
                    reply='% Please define a domain-name first.') == FAILED
-    assert outcome(rsa, {SHOW_RSA: KEY}, reply='% You already have RSA keys defined named '
-                   'Edge-R1.lab.local.\n% Do you really want to replace them? [yes/no]: ') == \
-        UNCERTAIN
-    assert 'Do you really want to replace them' in rsa.questions
+    # the size and "replace them?" questions are ANSWERED by this step (logged), so only the
+    # show commands decide; each answer is fixed: the chosen size, "yes"
+    from console import link
+    answers = dict((p.pattern, a) for p, a in rsa.answers)
+    assert answers[link.MODULUS_QUESTION.pattern] == '2048'
+    assert answers[link.REPLACE_KEYS_QUESTION.pattern] == 'yes'
+    assert link.answer_for('How many bits in the modulus [512]:', rsa.answers) == '2048'
+    assert link.answer_for('Proceed with reload? [confirm]', rsa.answers) is None   # not ours
 
 
 # ------------------------------------------------------------------ SSH after the keys
@@ -231,8 +236,7 @@ def test_login_local_depends_on_the_new_verified_account():
     plan = plan_for('SIM16', username='netadmin')
     login = plan.step('vty_login[5 15]')
     assert login.requires == ('user',)
-    assert 'NEW account netadmin is VERIFIED' in login.preconditions[0]
-    assert 'an existing account is not enough' in login.preconditions[0]
+    assert 'account netadmin is VERIFIED' in login.preconditions[0]
     assert plan.step('vty_transport[5 15]').requires == ('ssh_ready', 'vty_login[5 15]')
     assert not readiness(plan.steps, {'user': UNCERTAIN})['vty_login[5 15]'][0]
     assert not readiness(plan.steps, {'user': FAILED})['vty_login[5 15]'][0]
@@ -242,10 +246,17 @@ def test_login_local_depends_on_the_new_verified_account():
     assert outcome(login, {SHOW_VTY: vty.replace('login local', 'login')}) == FAILED
 
 
-def test_no_login_step_without_a_new_account():
+def test_an_existing_admin_is_used_for_login_local():
     plan = plan_for('SIM16')                         # existing admin labadmin only
+    login = plan.step('vty_login[5 15]')
+    assert login.requires == ()                      # the kept account: nothing to wait for
+    assert 'existed at detection' in login.preconditions[0]
+    assert plan.step('vty_transport[5 15]').requires == ('ssh_ready', 'vty_login[5 15]')
+
+
+def test_no_login_step_without_any_admin_account():
+    plan = plan_for('SIM48')                         # brand-new router: no account at all
     assert not any(s.step_id.startswith('vty_login') for s in plan.steps)
-    assert plan.step('vty_transport[5 15]').requires == ('ssh_ready',)
 
 
 # ------------------------------------------------------------------ AAA invariant

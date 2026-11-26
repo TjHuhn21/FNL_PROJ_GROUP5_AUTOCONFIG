@@ -58,9 +58,9 @@ TOUR_STEPS = [
              'is saved first, and every change is checked afterwards.'},
     {'key': 'setup', 'target': 'page', 'page': 'setup', 'needs': 'setup',
      'title': 'Setup',
-     'text': 'For a brand-new switch or router: connect the console cable, detect the device, '
-             'and let NetCommand enable SSH and a management IP, so it can be scanned and '
-             'configured over the network. No PuTTY needed.'},
+     'text': 'For a new switch or router: plug in the console cable and click Connect, type a '
+             'name, an SSH username and password and a management IP, then click Set up SSH. '
+             '"Use in Scan page" then fills in the Scan page for you. No PuTTY needed.'},
     {'key': 'findings', 'target': 'page', 'page': 'findings', 'needs': 'findings',
      'title': 'Findings',
      'text': 'Click Run review to check the saved configurations for problems (security, '
@@ -159,10 +159,13 @@ PAGE_HELP = {
         'title': 'Setup',
         'what': 'First setup of a brand-new device through the console cable: SSH, a login, '
                 'and a management IP, so the device can be scanned over the network.',
-        'steps': ['Connect the console cable and click Refresh Ports.',
-                  'Choose the port and click Connect, then Detect Device.',
-                  'Fill in the settings and click Preview SSH Configuration.',
-                  'Type the confirmation phrase and click Apply SSH Configuration.'],
+        'steps': ['Plug in the console cable, choose its COM port and click Connect (the '
+                  'device is read by itself).',
+                  'Fill in the device name, the SSH username and password (once), and the '
+                  'management IP address.',
+                  'Click Set up SSH and confirm. Keep the cable plugged in until it says Done.',
+                  'Click "Use in Scan page": the Seed IP, username and password are filled in '
+                  'there for you.'],
         'errors': [('No ports listed', 'Check the USB console cable and its driver, then '
                     'click Refresh Ports.'),
                    ('The device does not answer', 'Press Enter in the device session, check '

@@ -251,19 +251,25 @@ class _Runner:
         raise _Stop(UNCERTAIN, f'the prompt is "{again.prompt}", expected "{expected}"; nothing '
                                f'more was sent', console='unknown')
 
-    def _send(self, rec, line, before, after, markers, timeout=None, secrets=None):
-        """One configuration line. A reply carrying a known IOS failure message is a
+    def _send(self, rec, line, before, after, markers, timeout=None, secrets=None, answers=()):
+        """One configuration line. A reply carrying a known IOS failure message, or any
+        other line starting with "%" that is not one of IOS's informational lines, is a
         rejection (checked BEFORE the prompt: a rejected `hostname` leaves the old prompt);
-        otherwise the reply must end at `after`."""
+        otherwise the reply must end at `after`. answers: the known questions this line
+        may raise (console.link.answer_for)."""
         self.out.commands_sent.append(line)
         rec.commands.append(line)
+        kwargs = {'answers': answers} if answers else {}
         reply = self.session.send_config_line(line, expect=after, timeout=timeout,
-                                              secrets=secrets)
+                                              secrets=secrets, **kwargs)
         rec.reply += reply.text.rstrip() + '\n'
-        if reply.state == PROMPT and markers:
+        if reply.state == PROMPT:
             body, _logs = detect.strip_log_lines(reply.text)
-            if any(m in body for m in markers):
+            if markers and any(m in body for m in markers):
                 raise _Rejected(_first_error(body, markers), reply.prompt, (before, after))
+            error = percent_error(body)
+            if error:
+                raise _Rejected(error, reply.prompt, (before, after))
         self._expect(rec, reply, after, logged=True)
         return reply
 
@@ -302,7 +308,7 @@ class _Runner:
             after = f'{new_host}({sub})#' if c.mode else f'{new_host}(config)#'
             reply = self._send(rec, c.text, before, after, markers,
                                timeout=RSA_TIMEOUT if step.step_id == 'rsa' else CONFIG_TIMEOUT,
-                               secrets=secrets)
+                               secrets=secrets, answers=getattr(step, 'answers', ()))
         except _Rejected as rej:
             self._after_rejection(rec, rej)
         self._end(rec, new_host)
@@ -418,13 +424,21 @@ class _Runner:
                                    'saved')
         self.out.commands_sent.append(SAVE_COMMAND)
         rec.commands.append(SAVE_COMMAND)
-        reply = self.session.save_config()
+        answers = getattr(step, 'answers', ())
+        reply = self.session.save_config(answers=answers) if answers else \
+            self.session.save_config()
         rec.reply += reply.text.rstrip() + '\n'
         if reply.state == PROMPT:
             body, _logs = detect.strip_log_lines(reply.text)
             if any(m in body for m in step.failure_replies):
                 raise _Stop(FAILED, 'the device did not save: '
                                     + _first_error(body, step.failure_replies), console='exec')
+            error = percent_error(body)
+            if error:
+                raise _Stop(FAILED, f'the device did not save: {error}', console='exec')
+            if '[OK]' not in body:
+                rec.reasons.append('"write memory" did not print [OK]; the saved configuration '
+                                   'is checked below')
         self._expect(rec, reply, f'{self.host}#', logged=True)
         return reply.text
 
@@ -520,6 +534,23 @@ def _sub_mode(mode):
     if not mode:
         return None
     return 'config-if' if mode.startswith('interface ') else 'config-line'
+
+
+# "%" lines IOS prints that are NOT errors (key generation progress, notices)
+INFORMATIONAL_PERCENT = ('% Generating', '% The key modulus size', '% You already have RSA keys',
+                         '% Do you really want to replace', '% Key pair was generated',
+                         '% Please wait', '%SSH-', '%SYS-', '%LINK-', '%LINEPROTO-')
+
+
+def percent_error(text):
+    """The first reply line that starts with "%" and is not informational (IOS's way of
+    saying a command failed: % Invalid input, % Incomplete command, % Invalid Password
+    length, % ... overlaps with ...), or None. The echoed command line itself is ignored."""
+    for raw in (text or '').replace('\r', '').split('\n'):
+        line = raw.strip()
+        if line.startswith('%') and not line.startswith(INFORMATIONAL_PERCENT):
+            return line
+    return None
 
 
 def _first_error(text, markers):

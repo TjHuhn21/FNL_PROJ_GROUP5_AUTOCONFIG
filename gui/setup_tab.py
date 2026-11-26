@@ -38,6 +38,7 @@ Passwords are typed into masked fields, handed to the session once, and the fiel
 emptied as soon as the connection attempt starts. They are never saved, logged or shown.
 """
 import queue
+import re
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -50,7 +51,8 @@ from console import link
 from console.link import (BAUD_RATES, CANCELLED, DEFAULT_BAUD, IDLE_CONFIRMATION,
                           ConsoleError, ConsoleSession, check_baudrate)
 from console.plan import (CONFLICT, DEFAULT_KEY_SIZE, PREVIEW_NOTICE, STATUS_TEXT, UNKNOWN,
-                          build_plan, key_sizes, plan_is_stale, validate_request)
+                          account_exists, build_plan, existing_admins, key_sizes,
+                          plan_is_stale, required_fields, ssh_checklist, validate_request)
 from console.ports import discover_ports
 import validators
 from gui import background, theme
@@ -128,6 +130,31 @@ VERIFICATION_TEXT = {
                               '(NetCommand did not verify it).'),
     link.STARTUP_ACTION: 'Connected after the startup action you approved.',
 }
+AUTO_STARTUP_TEXT = {
+    'confirm_idle': 'the console was silent: sending Enter and reading the prompt.',
+    link.PRESS_RETURN_ACTION: '"Press RETURN to get started": sending Enter.',
+    link.DECLINE_SETUP_ACTION: '"initial configuration dialog? [yes/no]": answering "no" '
+                               '(skips the setup wizard; nothing is configured).',
+    link.TERMINATE_AUTOINSTALL_ACTION: '"terminate autoinstall? [yes]": answering "yes".',
+}
+NO_RESPONSE = ('No response on {port}. Check the cable is in the CONSOLE port, the COM port, '
+               'and the speed ({baud} baud; most Cisco devices use 9600).')
+BAUD_CHOICES = (9600, 19200, 38400, 57600, 115200)
+HOW_TO_USE = ('How to use:\n'
+              '1.  Plug the console cable into the device\'s CONSOLE port, choose its COM port '
+              'below and click Connect. (Leave the other fields empty unless the device asks '
+              'for a password.)\n'
+              '2.  NetCommand reads the device and shows what it is.\n'
+              '3.  Type a device name, an SSH username and password, and the IP address the '
+              'device should get, then click Set up SSH.\n'
+              '4.  Click "Use in Scan page": the Scan page is filled in for you.')
+# a router's management interface: a physical Ethernet port (not Embedded-Service-Engine,
+# Loopback, Tunnel, NVI, Serial...)
+MGMT_PHYSICAL = re.compile(r'^(GigabitEthernet|FastEthernet|Ethernet|TenGigabitEthernet)\d',
+                           re.IGNORECASE)
+NO_MGMT_WARNING = ('Without a management IP, SSH can\'t reach this device over the network '
+                   '(the setup still works through the console).')
+CHANGE_PASSWORD_TITLE = 'User already exists'
 NO_PORTS = ('No serial ports were found. Plug in the console cable (USB console cable or '
             'USB-to-serial adapter), check that its driver is installed, then click '
             'Refresh Ports.')
@@ -136,16 +163,61 @@ SSH_LATER = ('Detection only reads the device. An SSH setup can be previewed bel
 STEPS_NOTE = ('Each command as a step: what it needs first and how it is checked afterwards '
               'with read-only show commands. Previewing runs nothing; Apply (section 5) runs '
               'these steps in this order, one at a time.')
-APPLY_NOTICE = ('Apply sends the commands of the preview above through the console, one step '
-                'at a time, and checks each with show commands before the next. A management IP '
-                'address is set only if you typed one, and the configuration is saved (write '
-                'memory) only if you ticked "Save to startup-config": then as the last step, '
-                'after every other step is verified. No network SSH login is tried. Device '
-                'questions are never answered: Apply stops and tells you.')
-APPLY_STATUS_TEXT = {**ssh_apply.STATUS_TEXT, 'running': 'RUNNING...', 'pending': 'waiting'}
+APPLY_NOTICE = ('Apply sends the commands of the preview above through the console, one '
+                'command at a time (waiting for the prompt after each), and checks each step with '
+                'show commands before the next. Any "%" error from the device stops it and shows '
+                'the device\'s exact message. Only the known questions are answered (the RSA key '
+                'size, "replace the keys? yes", "[confirm]" and the startup-config file name); '
+                'any other question stops Apply and is shown. Saving (write memory) runs last, '
+                'after every other step is verified.')
+# the step table: OK / FAILED / SKIPPED (already present) / NOT RUN (Apply stopped earlier);
+# NOT VERIFIED when a step ran but its check could not prove it
+APPLY_STATUS_TEXT = {'verified': 'OK', 'failed': 'FAILED', 'uncertain': 'NOT VERIFIED',
+                     'blocked': 'NOT RUN', 'not run': 'NOT RUN', 'skipped': 'SKIPPED',
+                     'running': 'RUNNING...', 'pending': 'waiting'}
 APPLY_COLORS = {'verified': theme.SUCCESS_SOFT, 'failed': theme.DANGER_SOFT,
                 'uncertain': theme.WARNING_SOFT, 'blocked': theme.SURFACE_2,
-                'not run': theme.SURFACE, 'running': theme.ACCENT_SOFT, 'pending': theme.SURFACE}
+                'not run': theme.SURFACE, 'running': theme.ACCENT_SOFT, 'pending': theme.SURFACE,
+                'skipped': theme.INFO_SOFT}
+# plan items that are information only (never a step of their own)
+INFO_ITEMS = ('ssh_settings', 'ssh_other', 'aaa', 'save', 'management')
+NOT_SAVED_TEXT = 'Not saved: the settings are lost when the device restarts.'
+
+
+def short_interface(name):
+    """'GigabitEthernet0/0' -> 'Gi0/0' (as IOS abbreviates it); others unchanged."""
+    for long, short in (('TenGigabitEthernet', 'Te'), ('GigabitEthernet', 'Gi'),
+                        ('FastEthernet', 'Fa'), ('Ethernet', 'Et')):
+        if (name or '').startswith(long):
+            return short + name[len(long):]
+    return name or ''
+
+
+def final_summary(res, plan, request, result):
+    """One sentence for the end of an Apply, e.g. "SSH setup complete on R1. SSH: enabled
+    (v2). Login: admin. Management IP: 192.168.1.1 on Gi0/0 (up). Saved to
+    startup-config." The run's own message when it did not complete."""
+    if res is None or res.outcome != ssh_apply.SUCCESS:
+        return res.message if res is not None else ''
+    final = res.final_detection or result
+    host = (final.device.hostname if final is not None else None) or plan.hostname or 'the device'
+    parts = [f'SSH setup complete on {host}.']
+    if final is not None and final.ssh.enabled is not None:
+        version = str(final.ssh.version or '')
+        parts.append('SSH: enabled' + (f' (v{version[0]})' if version else '') + '.'
+                     if final.ssh.enabled else 'SSH: NOT enabled.')
+    login = request.username if request and request.username else \
+        ', '.join(existing_admins(final)) if final is not None else ''
+    if login:
+        parts.append(f'Login: {login}.')
+    if request and request.mgmt_ip:
+        iface = next((i for i in (final.interfaces if final is not None else [])
+                      if i.name == request.mgmt_interface), None)
+        state = f' ({iface.protocol if iface.status == "up" else iface.status})' if iface else ''
+        parts.append(f'Management IP: {request.mgmt_ip} on '
+                     f'{short_interface(request.mgmt_interface)}{state}.')
+    parts.append('Saved to startup-config.' if res.saved else NOT_SAVED_TEXT)
+    return ' '.join(parts)
 NO_NEW_PREVIEW = ('No new preview was made: detection did not finish (the console session ended '
                   'or was cancelled), so the configuration is not fully known. Connect again, '
                   'then use "Detect Again and Preview".')
@@ -206,9 +278,16 @@ def describe_error(err, secrets=()):
 
 
 class SetupTab(ttk.Frame):
-    def __init__(self, parent, log=None, backend=None):
-        """log(source, message, level): the operations console (never given a password)."""
+    # the known startup prompts and a silent console are handled by themselves (logged);
+    # False: the operator decides each one (phase 5.1.6 behaviour)
+    auto_startup = True
+
+    def __init__(self, parent, log=None, backend=None, store=None, on_registered=None):
+        """log(source, message, level): the operations console (never given a password).
+        store: where a set-up device is registered (step 7); on_registered() afterwards."""
         super().__init__(parent)
+        self.store, self.on_registered = store, on_registered
+        self._log_queue = queue.Queue()          # log lines from worker threads
         self.backend = backend or RealConsoleBackend()
         self._log_fn = log
         self.phase = DISCONNECTED
@@ -239,22 +318,53 @@ class SetupTab(ttk.Frame):
         page.configure(padding=theme.PAD)
         self.page = page
         ttk.Label(page, text='Initial Setup', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(page, text='Connect to a new device through its console cable and find out '
-                             'what it is and whether it can use SSH. ' + SSH_LATER,
+        ttk.Label(page, text='Set up SSH on a new Cisco router or switch through its console '
+                             'cable, so the Scan page can reach it over the network.',
                   style='Form.TLabel', foreground=theme.TEXT_SOFT, wraplength=820,
                   justify='left').pack(anchor='w', pady=(2, theme.PAD))
+        tk.Label(page, text=HOW_TO_USE, font=theme.FONT, background=theme.INFO_SOFT,
+                 foreground=theme.TEXT, justify='left', anchor='w', padx=12, pady=8,
+                 wraplength=900).pack(fill='x', pady=(0, theme.PAD))
         if getattr(self.backend, 'mode_note', None):
             self.mode_banner = ttk.Label(page, text=self.backend.mode_note, style='Sample.TLabel',
                                          padding=(10, 5), wraplength=820, justify='left')
             self.mode_banner.pack(fill='x', pady=(0, theme.PAD))
         else:
             self.mode_banner = None
+        self.quick_flow = False              # True: Connect came from the simple screen
+        self.skip_apply_confirm = False      # the simple screen asked already
+        self.on_use_in_scan = None           # set by the main window
+        # 1 the console connection (always shown), then the simple steps 2-4; the detailed
+        # sections (every check, every command, every option) are under "Advanced"
         self._build_connection(page)
-        self._build_detection(page)
-        self._build_results(page)
-        self._build_preview(page)
-        self._build_apply(page)
+        self.advanced = ttk.Frame(page)
+        self._build_detection(self.advanced)
+        self._build_results(self.advanced)
+        self._build_preview(self.advanced)
+        self._build_apply(self.advanced)
+        from gui.setup_quick import QuickPanel
+        self.quick = QuickPanel(self, page)
+        # the detailed sections stay built (the simple steps drive them) but are not shown:
+        # the Console at the bottom logs every command and reply for troubleshooting
+        self.advanced_btn = ttk.Button(page, text='Advanced: show every detail ▸',
+                                       command=self.toggle_advanced)
         self._apply_state()
+        self.after(150, self._log_tick)
+
+    def connect_clicked(self):
+        """The Connect button: connect, then the device is read by itself (simple steps)."""
+        if hasattr(self, 'quick'):
+            self.quick.connect()
+        else:
+            self.connect()
+
+    def toggle_advanced(self):
+        if self.advanced.winfo_manager():
+            self.advanced.pack_forget()
+            self.advanced_btn.configure(text='Advanced: show every detail ▸')
+        else:
+            self.advanced.pack(fill='x', after=self.advanced_btn)
+            self.advanced_btn.configure(text='Advanced: hide the details ▾')
 
     # ================================================================ layout
     def _heading(self, parent, text):
@@ -287,7 +397,7 @@ class SetupTab(ttk.Frame):
         speed.grid(row=2, column=1, columnspan=2, sticky='w', padx=theme.PAD, pady=4)
         self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD))
         self.baud_box = ttk.Combobox(speed, textvariable=self.baud_var, state='readonly',
-                                     values=[str(b) for b in BAUD_RATES], width=8,
+                                     values=[str(b) for b in BAUD_CHOICES], width=8,
                                      font=theme.FONT_FORM)
         self.baud_box.pack(side='left')
         ttk.Label(speed, text='Most Cisco devices use 9600.', foreground=theme.TEXT_MUTED).pack(
@@ -297,6 +407,10 @@ class SetupTab(ttk.Frame):
         login.pack(fill='x', pady=(theme.PAD, 0))
         ttk.Label(login, text='Console login (only if the device asks for one; it is not saved)',
                   style='Form.TLabel').grid(row=0, column=0, columnspan=3, sticky='w')
+        ttk.Label(login, text='A new device asks for nothing: leave these empty. Fill them in '
+                              'only if the device shows "Username:" / "Password:" on the '
+                              'console.', foreground=theme.TEXT_MUTED, wraplength=820,
+                  justify='left').grid(row=6, column=0, columnspan=3, sticky='w', pady=(4, 0))
         self.user_var, self.password_var = tk.StringVar(), tk.StringVar()
         self.enable_var = tk.StringVar()
         self.use_enable = tk.IntVar(value=0)
@@ -309,8 +423,9 @@ class SetupTab(ttk.Frame):
             entry.grid(row=2, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
             self.entries[label] = entry
         self.enable_box = ttk.Checkbutton(
-            login, text='Use privileged mode (enable) for detection - type the enable password, '
-                        'or leave it empty for a factory device that has none',
+            login, text='Use privileged mode (enable) - needed to set up SSH (ticked for you '
+                        'when you click Connect). Enable password: leave it empty for a new '
+                        'device that has none',
             variable=self.use_enable, style='Form.TCheckbutton', command=self._apply_state)
         self.enable_box.grid(row=3, column=0, columnspan=3, sticky='w', pady=(theme.PAD, 0))
         ttk.Label(login, text='Enable password').grid(row=4, column=0, sticky='w', pady=(4, 0))
@@ -322,7 +437,7 @@ class SetupTab(ttk.Frame):
         bar = ttk.Frame(page)
         bar.pack(fill='x', pady=(theme.PAD * 1.5, 0))
         self.connect_btn = ttk.Button(bar, text='Connect', style='Large.Accent.TButton',
-                                      command=self.connect)
+                                      command=self.connect_clicked)
         self.connect_btn.pack(side='left')
         self.disconnect_btn = ttk.Button(bar, text='Disconnect', command=self.disconnect)
         self.disconnect_btn.pack(side='left', padx=theme.PAD)
@@ -423,8 +538,15 @@ class SetupTab(ttk.Frame):
         self.disconnect_btn.configure(text='Cancel' if s in (CONNECTING, DETECTING, AWAITING)
                                       else 'Disconnect')
         text, color = STATE_TEXT[s]
-        if s in (CONNECTED, DETECTED, DETECTING) and self.session is not None:
-            text += f' ({self.session.port}, {self.session.baudrate} baud)'
+        if s in (CONNECTED, DETECTED, DETECTING, APPLYING) and self.session is not None:
+            prompt = getattr(self, 'connected_prompt', None)
+            if self.result is not None and self.result_live and self.result.device.hostname:
+                prompt = f'{self.result.device.hostname}{(prompt or "#")[-1]}'
+            if prompt:                     # "Connected: R1# (privileged mode)"
+                mode = 'privileged mode' if prompt.endswith('#') else 'user mode'
+                text = f'Connected: {prompt} ({mode})' + (
+                    '' if s == CONNECTED else f' - {STATE_TEXT[s][0].split(" - ", 1)[-1]}')
+            text += f'  ·  {self.session.port}, {self.session.baudrate} baud'
         self.status_label.configure(text=text, foreground=color)
         self.status_dot.configure(foreground=color)
         if s == DETECTING:
@@ -450,6 +572,8 @@ class SetupTab(ttk.Frame):
                 able(entry, not self.busy)
             for box in self.approval_boxes:
                 able(box, not self.busy)
+        if hasattr(self, 'quick'):
+            self.quick.update_state()
 
     def _can_apply(self):
         plan = self.plan
@@ -475,6 +599,52 @@ class SetupTab(ttk.Frame):
                 self._log_fn('setup', message, level)
             except Exception:
                 pass
+
+    def _threadsafe_log(self, message, level='info', **extra):
+        """From a worker thread: kept until the Tk thread writes it (_flush_log)."""
+        self._log_queue.put((message, level, extra))
+
+    def _session_log(self, port):
+        """The console session's own log (every command, the device's masked replies, the
+        known questions answered), for the operations Console. Called from worker threads."""
+        def log(kind, text):
+            text = str(text or '')
+            if kind == 'command':
+                self._threadsafe_log(f'{port} > {text}', 'info', command=text)
+            elif kind == 'reply':
+                if text:
+                    first = text.splitlines()[-1] if text.strip() else ''
+                    self._threadsafe_log(f'{port} < {len(text.splitlines())} line(s), '
+                                         f'ending "{first[:80]}"', 'info', detail=text)
+            else:
+                self._threadsafe_log(f'{port}: {text}',
+                                     {'ok': 'ok', 'warn': 'warn', 'error': 'error'}.get(kind,
+                                                                                        'info'))
+        return log
+
+    def _flush_log(self):
+        while True:
+            try:
+                message, level, extra = self._log_queue.get_nowait()
+            except queue.Empty:
+                return
+            if self._log_fn:
+                try:
+                    self._log_fn('setup', message, level, **extra)
+                except TypeError:                     # a logger without the extra fields
+                    self._log(message, level)
+                except Exception:
+                    pass
+
+    def _log_tick(self):
+        """Write what the worker threads logged (every 150 ms while the page exists)."""
+        if not self._alive():
+            return
+        self._flush_log()
+        try:
+            self.after(150, self._log_tick)
+        except tk.TclError:
+            pass
 
     # ================================================================ ports
     def on_page_shown(self):
@@ -566,22 +736,45 @@ class SetupTab(ttk.Frame):
 
         self._show_preflight(None)
 
+        auto = self.auto_startup
+        say = self._threadsafe_log
+        session_log = self._session_log(port.device)
+
         def work():
             extra = {'enable_without_password': True} if bare_enable else {}
             session = backend.open_session(port.device, baud, username, password,
-                                           enable_password, log=None, **extra)
+                                           enable_password, log=session_log, **extra)
             self._pending = session
             if closed.is_set():
                 raise ConsoleError(CANCELLED, 'Cancelled.')
             try:
-                # phase 5.1.6: open and LISTEN only; nothing is written before the decision
+                # phase 5.1.6: open and LISTEN first; nothing is written before the decision
                 preflight = session.listen()
                 if preflight.refused:
                     session.disconnect()
                     return session, None, preflight
-                if preflight.needs is not None:          # the operator decides first
+                if preflight.needs is not None and not auto:   # the operator decides first
                     return session, None, preflight
-                return session, session.connect(), preflight
+                # the known startup prompts are handled (each logged): Press RETURN -> Enter,
+                # setup dialog -> "no", terminate autoinstall -> "yes", a silent console ->
+                # Enter (then the prompt is read; no reply: "No response...")
+                for _round in range(4):
+                    need = preflight.needs
+                    if need is None:
+                        return session, session.connect(), preflight
+                    say(f'{port.device}: {AUTO_STARTUP_TEXT[need]}', 'warn')
+                    try:
+                        kwargs = {'confirm_idle': True} if need == 'confirm_idle' else \
+                            {'startup_action': need}
+                        return session, session.connect(**kwargs), preflight
+                    except ConsoleError as err:
+                        if err.kind != link.APPROVAL_REQUIRED:   # another startup prompt next
+                            if err.kind == link.TIMEOUT and need == 'confirm_idle':
+                                raise ConsoleError(link.TIMEOUT, NO_RESPONSE.format(
+                                    port=port.device, baud=baud)) from None
+                            raise
+                        preflight = session.listen()
+                return session, None, preflight
             finally:
                 if closed.is_set():                     # the page was closed meanwhile
                     session.cancel()
@@ -667,6 +860,7 @@ class SetupTab(ttk.Frame):
 
     def _connected(self, res, err, secrets):
         self._pending = None
+        self._flush_log()
         if not self._alive():
             if res:
                 res[0].cancel()
@@ -692,9 +886,10 @@ class SetupTab(ttk.Frame):
             return
         self._show_preflight(preflight if preflight.state == link.CONSOLE_PROMPT else None)
         self.session = session
-        lines = [f'Connected to {result.port} at {result.baudrate} baud. Device prompt: '
-                 f'{result.prompt}' + (' (privileged mode).' if result.privileged else
-                                        ' (user mode).')]
+        self.connected_prompt = result.prompt
+        lines = [f'Connected: {result.prompt} ' + ('(privileged mode)' if result.privileged else
+                                                    '(user mode)') +
+                 f' on {result.port} at {result.baudrate} baud.']
         lines += [n for n in result.notices if 'answered "no"' in n and 'skipped' in n]
         verification = getattr(result, 'verification', link.VERIFIED)
         lines.append(VERIFICATION_TEXT.get(verification, ''))
@@ -704,6 +899,8 @@ class SetupTab(ttk.Frame):
         self._log(f'Connected to {result.port} ({result.prompt}).', 'ok')
         if self.result is not None:
             self._mark_historical()
+        if self.quick_flow:                     # the simple screen: detect right away
+            self.after(10, self.detect)
 
     # ================================================================ detection
     def detect(self):
@@ -779,6 +976,8 @@ class SetupTab(ttk.Frame):
                                'below are partial.')
             return
         self.set_state(DETECTED, 'Detection finished. Nothing was changed on the device.', 'ok')
+        if self.quick_flow:
+            self.quick.detected()
 
     def _session_lost(self, message):
         """The session ended by itself (timeout, cable pulled): release it."""
@@ -930,6 +1129,11 @@ class SetupTab(ttk.Frame):
             ('Login required on VTY lines', login),
             ('Local accounts', ', '.join(s.local_usernames) if s.local_usernames else None),
         ], key='ssh')
+        self._checklist(parent, result)
+        if result.vlans:
+            self._section(parent, 'VLANs (show vlan brief)', [
+                (f'VLAN {vid} {name}', ports or 'no ports') for vid, name, ports in result.vlans
+                if vid < 1002], key='vlans')
 
         self._interfaces(parent, result)
 
@@ -947,6 +1151,27 @@ class SetupTab(ttk.Frame):
         self._details(parent, result)
         ttk.Label(parent, text=SSH_LATER, foreground=theme.TEXT_MUTED).pack(
             anchor='w', pady=(theme.PAD, 0))
+
+    def _checklist(self, parent, result):
+        """What SSH needs, each OK / MISSING / UNKNOWN (console.plan.ssh_checklist)."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill='x', pady=(theme.PAD, 0))
+        ttk.Label(frame, text='What SSH needs', font=theme.FONT_FORM_BOLD).grid(
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
+        colors = {'OK': (theme.SUCCESS, theme.SUCCESS_SOFT),
+                  'MISSING': (theme.DANGER, theme.DANGER_SOFT),
+                  'UNKNOWN': (theme.TEXT_SOFT, theme.SURFACE_2)}
+        rows = {}
+        for n, (what, state, detail) in enumerate(ssh_checklist(result), start=1):
+            ttk.Label(frame, text=what, foreground=theme.TEXT_SOFT).grid(
+                row=n, column=0, sticky='w', padx=(0, theme.PAD * 3), pady=1)
+            fore, back = colors[state]
+            tk.Label(frame, text=state, font=theme.FONT_BOLD, foreground=fore, background=back,
+                     padx=8, pady=1, width=9).grid(row=n, column=1, sticky='w', pady=1)
+            ttk.Label(frame, text=detail, style='Form.TLabel').grid(
+                row=n, column=2, sticky='w', padx=(theme.PAD, 0), pady=1)
+            rows[what] = state
+        self.result_widgets['checklist'] = rows
 
     def _section(self, parent, title, rows, key):
         frame = ttk.Frame(parent)
@@ -1026,28 +1251,44 @@ class SetupTab(ttk.Frame):
                                        background=theme.ACCENT_SOFT, foreground=theme.ACCENT,
                                        padx=10, pady=5, anchor='w')
         self.preview_notice.pack(fill='x', pady=(0, theme.PAD))
-        ttk.Label(page, text='Enter only what you want to change or add; empty fields keep what '
-                             'the device has. NetCommand proposes commands for what is missing and '
-                             'explains each one. Nothing is sent to the device, and there is no '
-                             'way to apply the plan in this version.',
+        ttk.Label(page, text='Fill in what the device needs (marked "required" after detection); '
+                             'other empty fields keep what the device has. The preview shows only '
+                             'the commands that are missing, each with a short explanation, grouped '
+                             'into steps. Previewing sends nothing; Apply (section 5) sends them '
+                             'through the console, one step at a time.',
                   wraplength=820, justify='left', foreground=theme.TEXT_SOFT).pack(anchor='w')
+        kind_row = ttk.Frame(page)
+        kind_row.pack(fill='x', pady=(theme.PAD, 0))
+        ttk.Label(kind_row, text='Device type').pack(side='left')
+        self.type_var = tk.StringVar(value='')
+        self.type_box = ttk.Combobox(kind_row, textvariable=self.type_var, state='disabled',
+                                     values=('router', 'switch'), width=10, font=theme.FONT_FORM)
+        self.type_box.pack(side='left', padx=theme.PAD)
+        self.type_box.bind('<<ComboboxSelected>>', lambda e: self.change_device_type())
+        self.type_note = ttk.Label(kind_row, text='Detect the device first.',
+                                   foreground=theme.TEXT_MUTED)
+        self.type_note.pack(side='left')
         form = ttk.Frame(page)
         form.pack(fill='x', pady=(theme.PAD, 0))
         self.want = {k: tk.StringVar() for k in ('hostname', 'domain_name', 'username',
                                                  'password', 'confirm')}
-        self.preview_entries = {}
+        self.preview_entries, self.preview_labels = {}, {}
         fields = [('hostname', 'New hostname (optional)', False),
                   ('domain_name', 'Domain name (optional)', False),
                   ('username', 'New SSH username (optional)', False),
-                  ('password', 'Password for the new account', True),
+                  ('password', 'Password (8-25 characters)', True),
                   ('confirm', 'Password again', True)]
         for n, (key, label, masked) in enumerate(fields):
             row, col = divmod(n, 3)
-            ttk.Label(form, text=label).grid(row=row * 2, column=col, sticky='w', pady=(4, 0))
+            self.preview_labels[key] = ttk.Label(form, text=label)
+            self.preview_labels[key].grid(row=row * 2, column=col, sticky='w', pady=(4, 0))
             entry = ttk.Entry(form, textvariable=self.want[key], width=24, font=theme.FONT_FORM,
                               show='*' if masked else '')
             entry.grid(row=row * 2 + 1, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
             self.preview_entries[key] = entry
+        self.users_note = ttk.Label(page, text='', foreground=theme.TEXT_SOFT, wraplength=820,
+                                    justify='left')
+        self.users_note.pack(anchor='w', pady=(4, 0))
         ttk.Label(form, text='RSA key size (bits)').grid(row=2, column=2, sticky='w', pady=(4, 0))
         self.key_var = tk.StringVar(value=str(DEFAULT_KEY_SIZE))
         self.key_box = ttk.Combobox(form, textvariable=self.key_var, state='disabled', width=8,
@@ -1063,7 +1304,7 @@ class SetupTab(ttk.Frame):
         for key in ('mgmt_interface', 'mgmt_ip', 'mgmt_mask', 'gateway'):
             self.want[key] = tk.StringVar()
         ttk.Label(mgmt, text='Interface').grid(row=0, column=0, sticky='w', pady=(4, 0))
-        self.mgmt_box = ttk.Combobox(mgmt, textvariable=self.want['mgmt_interface'], width=22,
+        self.mgmt_box = ttk.Combobox(mgmt, textvariable=self.want['mgmt_interface'], width=44,
                                      state='readonly', font=theme.FONT_FORM, values=())
         self.mgmt_box.grid(row=1, column=0, sticky='w', padx=(0, theme.PAD * 2))
         self.preview_entries['mgmt_interface'] = self.mgmt_box
@@ -1077,7 +1318,10 @@ class SetupTab(ttk.Frame):
             entry.configure(validate='key', validatecommand=(ok, '%P'))  # digits and dots only
             entry.grid(row=1, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
             self.preview_entries[key] = entry
-        self.save_var = tk.BooleanVar(value=False)
+        self.mgmt_note = ttk.Label(page, text='', foreground=theme.WARNING, wraplength=820,
+                                   justify='left')
+        self.mgmt_note.pack(anchor='w', pady=(4, 0))
+        self.save_var = tk.BooleanVar(value=True)            # ticked by default
         ttk.Checkbutton(page, variable=self.save_var, style='Form.TCheckbutton',
                         text='Save to startup-config (write memory) as the last step, after '
                              'every step is verified, so the setup survives a restart').pack(
@@ -1099,26 +1343,128 @@ class SetupTab(ttk.Frame):
         self.redetect_btn.pack(side='left', padx=theme.PAD)
         self.preview_box = ttk.Frame(page)
         self.preview_box.pack(fill='x', expand=True, pady=(theme.PAD, 0))
-        ttk.Label(self.preview_box, text='No preview yet. Detect the device first.',
-                  foreground=theme.TEXT_MUTED, style='Form.TLabel').pack(anchor='w')
+        self.no_preview = ttk.Label(self.preview_box, text='No preview yet. Detect the device '
+                                                           'first.',
+                                    foreground=theme.TEXT_MUTED, style='Form.TLabel')
+        self.no_preview.pack(anchor='w')
         self.preview_widgets = {}
 
     def _fill_key_sizes(self):
+        """After a detection: key sizes, the management interface list, which fields are
+        required, the existing accounts and the device type."""
         sizes = [str(s) for s in key_sizes(self.result)]
         self.key_box.configure(values=sizes)
         if sizes and self.key_var.get() not in sizes:
             self.key_var.set(str(DEFAULT_KEY_SIZE) if str(DEFAULT_KEY_SIZE) in sizes else sizes[0])
-        # the management interface: only interfaces the detection found ('' = not set)
-        names = [i.name for i in (self.result.interfaces if self.result is not None else [])]
-        self.mgmt_box.configure(values=[''] + names)
-        if self.want['mgmt_interface'].get() not in names:
-            self.want['mgmt_interface'].set('')
+        self._fill_interfaces()
+        self._fill_requirements()
+        r = self.result
+        try:
+            if self.no_preview.winfo_exists():
+                self.no_preview.configure(text='No preview yet. Fill in the fields above and '
+                                               'click Preview SSH Configuration.')
+        except (AttributeError, tk.TclError):
+            pass
+        if r is not None:
+            self.detected_type = r.device.device_type          # this detection's own answer
+            self.type_var.set(r.device.device_type if r.device.device_type in
+                              ('router', 'switch') else '')
+            self.type_note.configure(text=('Detected from show version / the model / VLANs. '
+                                           'Change it only if this is wrong (you will be asked '
+                                           'to confirm).'))
+            self.type_box.configure(state='readonly')
         self._apply_state()
+
+    def _fill_interfaces(self):
+        """The management interface dropdown, from the detection: a router's physical
+        (Ethernet) interfaces, a switch's VLAN interfaces (Vlan1 first, chosen by default),
+        each shown with its current address and status."""
+        r = self.result
+        rows = list(r.interfaces) if r is not None else []
+        kind = r.device.device_type if r is not None else None
+        if kind == 'switch':
+            picked = [i for i in rows if i.name.lower().startswith('vlan')]
+            picked.sort(key=lambda i: (i.name.lower() != 'vlan1', i.name))
+        elif kind == 'router':
+            picked = [i for i in rows if MGMT_PHYSICAL.match(i.name)]
+        else:
+            picked = rows
+        picked = picked or rows                      # nothing matched: offer what was found
+        self._mgmt_names = {}
+        for i in picked:
+            text = f'{i.name}  ({i.ip or "no IP"}, {i.status or "?"})'
+            self._mgmt_names[text] = i.name
+        values = [''] + list(self._mgmt_names)
+        self.mgmt_box.configure(values=values)
+        current = self.want['mgmt_interface'].get()
+        names = set(self._mgmt_names.values())
+        if current not in names and current not in self._mgmt_names:
+            self.want['mgmt_interface'].set('')
+        if kind == 'switch' and not self.want['mgmt_interface'].get():
+            first = next((t for t, n in self._mgmt_names.items() if n.lower() == 'vlan1'), None)
+            if first:
+                self.want['mgmt_interface'].set(first)
+
+    def _mgmt_interface_name(self):
+        value = self.want['mgmt_interface'].get()
+        return getattr(self, '_mgmt_names', {}).get(value, value)
+
+    def _fill_requirements(self):
+        need = required_fields(self.result)
+        labels = {'hostname': 'New hostname', 'domain_name': 'Domain name',
+                  'username': 'New SSH username'}
+        for key, text in labels.items():
+            self.preview_labels[key].configure(
+                text=f'{text} (required)' if key in need else f'{text} (optional)',
+                foreground=theme.DANGER if key in need else theme.TEXT)
+        admins = existing_admins(self.result)
+        self.users_note.configure(
+            text=(f'Existing user(s): {", ".join(admins)}. Leave the username empty to keep '
+                  f'using them (you need to know the password).') if admins else
+            ('No privilege-15 account exists: type a username and password.'
+             if self.result is not None and self.result.config.local_users_known else ''))
+
+    def change_device_type(self):
+        """Correct the detected type (router / switch), after a confirmation."""
+        r = self.result
+        new = self.type_var.get()
+        if r is None or new == r.device.device_type:
+            return
+        from gui.components.dialogs import confirm
+        if not confirm('Change device type', f'NetCommand detected this device as a '
+                                             f'{r.device.device_type.upper()}. Treat it as a '
+                                             f'{new.upper()} instead? The management interface '
+                                             f'list and the gateway command change with it.',
+                       f'Treat as {new}', parent=self, danger=True,
+                       log=('setup', f'Device type change to {new}')):
+            self.type_var.set(r.device.device_type)
+            return
+        r.device.device_type = new
+        self._log(f'Device type set to {new} by the operator (detected: '
+                  f'{self.detected_type}).', 'warn')
+        self._fill_interfaces()
+        self._on_input_changed()
 
     def _read_request(self):
         """A SetupRequest from the form, or None (with the problems shown). The password
         fields are emptied here: the request only knows whether a password was given."""
         values = {k: v.get() for k, v in self.want.items()}
+        values['mgmt_interface'] = self._mgmt_interface_name()
+        change_password = False
+        username = values['username'].strip()
+        if username and account_exists(self.result, username):
+            # the typed account exists: change its password, or keep it as it is
+            from gui.components.dialogs import confirm
+            change_password = confirm(
+                CHANGE_PASSWORD_TITLE, f'User {username} already exists. Change its password?\n\n'
+                                       f'"Change password" gives it the password you typed. '
+                                       f'"Keep existing" leaves the account and its password '
+                                       f'as they are (SSH then uses its current password).',
+                'Change password', cancel_text='Keep existing', parent=self,
+                log=('setup', f'Changing the password of the existing user {username}'))
+            if not change_password:
+                values['username'] = values['password'] = values['confirm'] = ''
+                self.want['username'].set('')
         self.want['password'].set('')
         self.want['confirm'].set('')
         request, errors = validate_request(values['hostname'], values['domain_name'],
@@ -1127,12 +1473,14 @@ class SetupTab(ttk.Frame):
                                            mgmt_interface=values['mgmt_interface'],
                                            mgmt_ip=values['mgmt_ip'],
                                            mgmt_mask=values['mgmt_mask'],
-                                           gateway=values['gateway'], save=self.save_var.get())
+                                           gateway=values['gateway'], save=self.save_var.get(),
+                                           change_password=change_password)
         values.clear()
         if errors:
             self.preview_error.configure(text='\n'.join(errors.values()))
             return None
         self.preview_error.configure(text='')
+        self.mgmt_note.configure(text='' if request.mgmt_ip else NO_MGMT_WARNING)
         return request
 
     def preview(self):
@@ -1387,6 +1735,178 @@ class SetupTab(ttk.Frame):
         self.apply_commands = ttk.Label(page, text='', wraplength=900, justify='left',
                                         font=theme.mono(10), foreground=theme.TEXT_SOFT)
         self.apply_commands.pack(anchor='w', pady=(4, 0))
+        self._build_ssh_test(page)
+
+    # ================================================================ leaving the page
+    def connection_text(self):
+        """'COM3 (R1#)' while a console connection is open, else ''."""
+        session = self.session or (self._awaiting[0] if self._awaiting else None)
+        if session is None:
+            return ''
+        prompt = getattr(self, 'connected_prompt', None)
+        return f'{session.port}' + (f' ({prompt})' if prompt else '')
+
+    def confirm_leave(self):
+        """Another page is opened: while connected, ask, then close the console port.
+        While Apply runs, the page cannot be left (it stops between steps only)."""
+        from gui.components.dialogs import confirm, inform
+        if self.phase == APPLYING:
+            inform('Apply is running', 'The SSH configuration is being applied through the '
+                                       'console. Wait until it finishes (or click "Stop after '
+                                       'the current step") before leaving this page.',
+                   parent=self, level='warning')
+            return False
+        where = self.connection_text()
+        if not where or self.phase == DISCONNECTING:      # already closing: nothing to ask
+            return True
+        if not confirm('Close the console connection?',
+                       f'You are connected to {where}. Leave the Setup page and close the '
+                       f'console connection?', 'Disconnect and leave', cancel_text='Stay',
+                       parent=self, log=('setup', f'Leaving the Setup page (closing {where})')):
+            return False
+        if self._awaiting is not None:
+            self.abort_connect()
+        else:
+            self.disconnect()
+        return True
+
+    # ================================================================ 6  test SSH, 7  register
+    def _build_ssh_test(self, page):
+        """Shown after a successful Apply with a management IP: an SSH login over the network
+        with the new (or existing) account. It does not count toward the device login
+        lockout (it tests a newly set-up device); it is logged to the Console."""
+        box = self.ssh_test_box = ttk.Frame(page)
+        ttk.Separator(box).pack(fill='x', pady=(theme.PAD * 2, theme.PAD))
+        ttk.Label(box, text='6  Test SSH over the network', font=theme.font(12, 'bold')).pack(
+            anchor='w', pady=(0, theme.PAD))
+        self.ssh_test_target = ttk.Label(box, text='', style='Form.TLabel', wraplength=900,
+                                         justify='left')
+        self.ssh_test_target.pack(anchor='w')
+        form = ttk.Frame(box)
+        form.pack(fill='x', pady=(theme.PAD, 0))
+        self.ssh_test_user, self.ssh_test_pw = tk.StringVar(), tk.StringVar()
+        for col, (label, var, show_) in enumerate((('Username', self.ssh_test_user, ''),
+                                                   ('Password (not kept)', self.ssh_test_pw,
+                                                    '*'))):
+            ttk.Label(form, text=label).grid(row=0, column=col, sticky='w')
+            ttk.Entry(form, textvariable=var, width=22, show=show_, font=theme.FONT_FORM).grid(
+                row=1, column=col, sticky='w', padx=(0, theme.PAD * 2), ipady=2)
+        self.ssh_test_btn = ttk.Button(form, text='Test SSH login', style='Accent.TButton',
+                                       command=self.test_ssh)
+        self.ssh_test_btn.grid(row=1, column=2, sticky='w')
+        self.ssh_test_result = tk.Label(box, text='', font=theme.FONT_FORM_BOLD, anchor='w',
+                                        justify='left', wraplength=900, padx=10, pady=5,
+                                        background=theme.BG)
+        self.ssh_test_result.pack(fill='x', pady=(theme.PAD, 0))
+        self.ssh_test_target_ip = None
+
+    def _offer_ssh_test(self, res):
+        request = self.plan_request
+        if request is None or not request.mgmt_ip:
+            return
+        self.ssh_test_target_ip = request.mgmt_ip
+        host = (res.final_detection.device.hostname if res.final_detection else None) or \
+            self.plan.hostname
+        self.ssh_test_host = host
+        self.ssh_test_kind = (res.final_detection or self.result).device.device_type
+        self.ssh_test_target.configure(
+            text=f'Try an SSH login to {request.mgmt_ip} ({host}) from this PC with the new or '
+                 f'existing account. This does not count toward the failed-login lockout. The '
+                 f'PC needs an address in the same network (or a route to it).')
+        self.ssh_test_user.set(request.username or (existing_admins(
+            res.final_detection or self.result) or [''])[0])
+        self.ssh_test_result.configure(text='', background=theme.BG)
+        if not self.ssh_test_box.winfo_manager():
+            self.ssh_test_box.pack(fill='x', after=self.apply_commands)
+
+    def test_ssh(self):
+        ip = self.ssh_test_target_ip
+        user, password = self.ssh_test_user.get().strip(), self.ssh_test_pw.get()
+        if not ip:
+            return
+        if not user or not password:
+            self.ssh_test_result.configure(text='Type the username and password to test.',
+                                           background=theme.WARNING_SOFT,
+                                           foreground=theme.WARNING)
+            return
+        self.ssh_test_pw.set('')                     # the password exists only in this test
+        self.ssh_test_btn.state(['disabled'])
+        self.ssh_test_result.configure(text=f'Testing an SSH login to {ip}...',
+                                       background=theme.ACCENT_SOFT, foreground=theme.ACCENT)
+        self._log(f'Testing an SSH login to {ip} as {user} (a test: not counted toward the '
+                  f'lockout).')
+        from console import ssh_test
+
+        def work(pw=password):
+            try:
+                return ssh_test.test_ssh_login(ip, user, pw)
+            finally:
+                pw = None
+        # the password is kept only until the answer: to save it with the device (step 7)
+        background.run_async(self, work, lambda res, err, pw=password: self._ssh_tested(
+            ip, user, pw if res and res[0] else None, res, err))
+        password = None
+
+    def _ssh_tested(self, ip, user, password, res, err):
+        if not self._alive():
+            return
+        self.ssh_test_btn.state(['!disabled'])
+        ok, text = res if err is None else (False, describe_error(err))
+        self.ssh_test_result.configure(
+            text=text, background=theme.SUCCESS_SOFT if ok else theme.DANGER_SOFT,
+            foreground=theme.SUCCESS if ok else theme.DANGER)
+        self._log(f'Test SSH login to {ip} as {user}: {"SUCCESSFUL" if ok else "FAILED"}. {text}',
+                  'ok' if ok else 'error')
+        if self.quick_flow:
+            self.quick.tested(ok, text)
+        if ok:
+            self.offer_registration(ip, user, password)
+
+    def offer_registration(self, ip, user, password):
+        """Step 7: add the device to Devices (managed) with this login, saved encrypted, after
+        a confirmation. Duplicates (the same IP or name) are refused."""
+        store = self.store
+        host = getattr(self, 'ssh_test_host', None) or ip
+        kind = getattr(self, 'ssh_test_kind', None) or 'unknown'
+        if store is None:
+            return False
+        from gui.components.dialogs import confirm, inform
+        try:
+            existing = store.get_device_by_ip(ip)
+        except Exception as err:
+            self._log(f'Could not check the device list: {err}', 'error')
+            return False
+        if existing:
+            inform('Already registered', f'{ip} is already in Devices as {existing["name"]}. '
+                                         f'Nothing was added.', parent=self)
+            self._log(f'{host} ({ip}) is already registered as {existing["name"]}; not added '
+                      f'again.', 'warn')
+            return False
+        if not confirm('Add to Devices', f'Add {host} ({ip}, {kind}) to Devices as managed, and '
+                                         f'save this login (encrypted)?', 'Add',
+                       cancel_text='Not now', parent=self,
+                       log=('setup', f'Adding {host} ({ip}) to Devices')):
+            return False
+        from store_errors import DuplicateDeviceName
+        data = {'name': host, 'ip': ip, 'type': kind, 'managed': True, 'status': 'up',
+                'detected_type': kind}
+        try:
+            store.save_device(None, data, user, password)
+        except DuplicateDeviceName as err:
+            inform('Name already used', f'Nothing was added: {err}', parent=self, level='error')
+            self._log(f'{host} ({ip}) was not added: {err}', 'error')
+            return False
+        except Exception as err:
+            inform('Not added', f'Nothing was added: {err}', parent=self, level='error')
+            self._log(f'{host} ({ip}) was not added: {type(err).__name__}', 'error')
+            return False
+        finally:
+            password = None
+        self._log(f'{host} ({ip}, {kind}) added to Devices as managed; its login is saved '
+                  f'(encrypted): SUCCESSFUL.', 'ok')
+        if self.on_registered:
+            self.on_registered()
+        return True
 
     def _prepare_apply(self, plan):
         """A new preview: the Apply section shows its steps, approvals and confirmation."""
@@ -1402,7 +1922,8 @@ class SetupTab(ttk.Frame):
         for step in needed:
             var = tk.IntVar(value=0)
             box = ttk.Checkbutton(self.approval_frame, variable=var, style='Form.TCheckbutton',
-                                  text=f'I approve "{step.title}" ({step.command.text}): '
+                                  text=f'I approve "{step.title}" '
+                                       f'({step.command.text if step.command else link.SAVE_COMMAND}): '
                                        f'{step.approval_reason}')
             box.pack(anchor='w')
             self.approval_vars[step.step_id] = var
@@ -1431,7 +1952,14 @@ class SetupTab(ttk.Frame):
         for step in rows:
             tree.insert('', 'end', iid=step.step_id, tags=('pending',),
                         values=(step.title, APPLY_STATUS_TEXT['pending'], ''))
-        tree.configure(height=max(4, min(len(rows), 12)))
+        # what the device already has: shown as SKIPPED (already present), never sent
+        skipped = [i for i in (plan.items if plan.available else [])
+                   if i.status == 'configured' and not i.commands and i.key not in INFO_ITEMS]
+        for item in skipped:
+            tree.insert('', 'end', iid=f'skip:{item.key}', tags=('skipped',),
+                        values=(item.title, APPLY_STATUS_TEXT['skipped'],
+                                f'already present: {item.current}'[:300]))
+        tree.configure(height=max(4, min(len(rows) + len(skipped), 14)))
 
     def _set_row(self, step_id, status, text):
         tree = self.apply_tree
@@ -1441,6 +1969,8 @@ class SetupTab(ttk.Frame):
         tree.item(step_id, values=(title, APPLY_STATUS_TEXT.get(status, status),
                                    (text or '')[:300]),
                   tags=(status if status in APPLY_COLORS else 'pending',))
+        if self.quick_flow:
+            self.quick.step_progress(step_id, status)
 
     def apply_ssh(self):
         """Run the previewed plan (console.apply). The password fields are emptied now."""
@@ -1464,6 +1994,17 @@ class SetupTab(ttk.Frame):
             self.apply_error.configure(text='Nothing was sent:\n' + '\n'.join(
                 f'•  {p}' for p in problems))
             self._log('SSH apply refused before sending anything: ' + ' '.join(problems), 'warn')
+            return
+        from gui.components.dialogs import confirm as ask   # ("confirm" is the password again)
+        host = plan.hostname or 'the device'
+        n = len(plan.steps)
+        if not self.skip_apply_confirm and not ask('Apply SSH configuration',
+                       f'Apply {n} step{"" if n == 1 else "s"} to {host} through the console?\n\n'
+                       + '\n'.join(f'   {i}. {s.title}' for i, s in enumerate(plan.steps, 1)),
+                       'Apply', parent=self, danger=True,
+                       details='\n'.join(plan.lines()),
+                       log=('setup', f'SSH apply to {host} ({n} steps)')):
+            self.apply_error.configure(text='Apply cancelled. Nothing was sent.')
             return
         self.apply_error.configure(text='')
         self._apply_cancel = threading.Event()
@@ -1544,7 +2085,16 @@ class SetupTab(ttk.Frame):
                   ssh_apply.FAILURE: (theme.DANGER_SOFT, theme.DANGER),
                   ssh_apply.REFUSED: (theme.DANGER_SOFT, theme.DANGER)}
         back, fore = colors.get(res.outcome, (theme.WARNING_SOFT, theme.WARNING))
-        self.apply_summary.configure(text=res.message, background=back, foreground=fore)
+        summary = final_summary(res, self.plan, self.plan_request, self.result)
+        mgmt_down = [rec for rec in res.steps if rec.step_id == 'mgmt_up'
+                     and any('WARNING' in r for r in rec.reasons)]
+        if mgmt_down:
+            summary += '  ' + next(r for r in mgmt_down[0].reasons if 'WARNING' in r).split(
+                'WARNING: ', 1)[-1] + '.'
+        self.apply_summary.configure(text=summary, background=back, foreground=fore)
+        if res.outcome == ssh_apply.SUCCESS:
+            self._log(summary, 'ok')
+            self._offer_ssh_test(res)
         self.apply_recovery.configure(text='\n'.join(f'•  {r}' for r in res.recovery))
         self.apply_commands.configure(
             text=('Lines sent (the password is never shown):\n' +
@@ -1573,6 +2123,9 @@ class SetupTab(ttk.Frame):
         """Back to DETECTED only when the run left the console at its verified '#' prompt
         (console.apply leaves the session open only then). Otherwise the session is gone:
         the page goes to the error state, where Detect cannot run (M1)."""
+        if self.quick_flow:
+            self.quick.applied(self.apply_result,
+                               None if self.apply_result is not None else message)
         if session is not self.session:
             return
         res = self.apply_result

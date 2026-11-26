@@ -131,12 +131,32 @@ def test_real_driver_enable_password_prompt_is_never_answered(port):
     assert port.instances[-1].close_calls >= 1
 
 
-def test_real_driver_never_answers_a_question(port):
+def test_real_driver_answers_the_replace_question_of_the_rsa_step(port):
     s, dev = console(port, 'SIM20')
     s.connect(confirm_idle=True)
     dev.device.rsa_keys = False                              # keys appear after detection
     r, req, plan = planned(s)
     rsa = 'crypto key generate rsa modulus 2048'
+
+    def progress(step_id, status, text):
+        if (step_id, status) == ('rsa', 'running'):
+            dev.device.rsa_keys = True
+    res = go(s, r, req, plan, progress=progress)
+    assert res.step('rsa').status == VERIFIED
+    i = dev.lines.index(rsa)
+    assert dev.lines[i + 1] == 'yes'                         # answered, right after the line
+    assert any('Answered the device question' in text and '"yes"' in text
+               for _kind, text in s.logs)                    # and logged
+    s.disconnect()
+
+
+def test_real_driver_never_answers_an_unexpected_question(port):
+    s, dev = console(port, 'SIM20')
+    s.connect(confirm_idle=True)
+    dev.device.rsa_keys = False
+    r, req, plan = planned(s)
+    rsa = 'crypto key generate rsa modulus 2048'
+    next(x for x in plan.steps if x.step_id == 'rsa').answers = ()
 
     def progress(step_id, status, text):
         if (step_id, status) == ('rsa', 'running'):

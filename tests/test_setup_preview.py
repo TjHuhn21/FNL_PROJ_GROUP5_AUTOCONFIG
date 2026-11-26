@@ -33,6 +33,7 @@ def ready(root, port='SIM8', backend=None):
     tab.detect()
     settle(root, tab)
     assert tab.phase == DETECTED
+    tab.save_var.set(False)        # saving is ticked by default; these tests check the rest
     return tab
 
 
@@ -125,9 +126,14 @@ def test_preview_shows_status_commands_and_explanations(root):
 
 def test_conflicts_and_unknowns_are_listed(root):
     tab = ready(root, 'SIM12')
+    tab.preview()                          # SIM12 has no admin account: one is required
+    assert 'Required' in tab.preview_error.cget('text') and tab.plan is None
+    fill(tab, hostname='')
     tab.preview()
     text = tab.preview_widgets['attention'].cget('text')
-    assert 'Conflict detected - VTY protocols' in text and 'Conflict detected - VTY login' in text
+    assert 'Conflict detected - VTY protocols' in text
+    # "login local" without any account was a conflict; the account typed now fixes it
+    assert 'The new account fixes this' in tab.plan.item('vty_login').explanation
 
 
 def test_selecting_a_row_shows_its_full_explanation(root):
@@ -181,6 +187,7 @@ def test_passwords_are_masked_emptied_and_never_shown(root):
 # ------------------------------------------------------------------ staleness and refresh
 def test_disconnect_makes_the_preview_out_of_date(root):
     tab = ready(root)
+    fill(tab)                              # a factory device: hostname, domain, account required
     tab.preview()
     tab.disconnect()
     settle(root, tab)
@@ -195,6 +202,7 @@ def test_disconnect_makes_the_preview_out_of_date(root):
 
 def test_a_new_detection_makes_the_old_preview_out_of_date(root):
     tab = ready(root)
+    fill(tab)                              # a factory device: hostname, domain, account required
     tab.preview()
     tab.detect()
     settle(root, tab)

@@ -47,7 +47,8 @@ from console.link import (AUTH, CANCELLED, CONSOLE_BOOT_LOADER, CONSOLE_CONFIG_P
                           CONSOLE_PASSWORD, CONSOLE_PRESS_RETURN, CONSOLE_PROMPT,
                           CONSOLE_QUESTION, CONSOLE_SETUP_DIALOG, CONSOLE_SILENT,
                           CONSOLE_UNKNOWN, CONSOLE_USERNAME, NOT_CONNECTED, OPERATOR_CONFIRMED,
-                          OTHER, PASSWORD_PROMPT, PORT_UNAVAILABLE, PROMPT, REFUSED,
+                          MAX_ANSWERS, OTHER, PASSWORD_PROMPT, PORT_UNAVAILABLE, PROMPT,
+                          QUESTION, REFUSED, answer_for, masked_reply,
                           SETUP_DIALOG_ANSWERED, SETUP_DIALOG_NOTICE, STARTUP_ACTION, TIMEOUT,
                           UNEXPECTED_PROMPT, VERIFIED, SAVE_COMMAND, ConfigReply, ConnectResult,
                           ConsoleError,
@@ -74,6 +75,15 @@ _NEW_SWITCH = {'type': 'switch', 'ports': {'FastEthernet': 4, 'GigabitEthernet':
 _NEW_ROUTER = {'type': 'router', 'ports': {'GigabitEthernet': 2},
                'interfaces': {'GigabitEthernet0/0': {'ip': None, 'mask': None, 'shutdown': True,
                                                      'connected': True}}}
+# the real hardware the Initial Setup page was tested on (see SIM49 / SIM50)
+_R1_1941 = {'type': 'router', 'model': 'CISCO1941/K9', 'ports': {'GigabitEthernet': 2},
+            'interfaces': {'GigabitEthernet0/0': {'ip': None, 'mask': None, 'shutdown': True,
+                                                  'connected': True},
+                           'GigabitEthernet0/1': {'ip': None, 'mask': None, 'shutdown': True,
+                                                  'connected': False}}}
+_NEW_2960 = {'type': 'switch', 'model': 'WS-C2960-24TT-L',
+             'ports': {'FastEthernet': 24, 'GigabitEthernet': 2},
+             'interfaces': {'Vlan1': {'ip': None, 'mask': None, 'shutdown': True}}}
 _DOMAIN = 'ip domain-name lab.local'
 _ADMIN = 'username labadmin privilege 15 secret 5 $1$mock$hidden'
 _GLOBALS = [_DOMAIN, _ADMIN]
@@ -159,6 +169,19 @@ SCENARIOS = {
     'SIM48': _scenario('Router', _NEW_ROUTER, 'disabled',
                        'Simulated BRAND-NEW router: no IP address, nothing configured',
                        global_lines=[], line_config={'con 0': [], 'vty 0 4': ['login']}),
+    # the real CISCO1941 (IOS 15.4) "R1" after the first hardware test: an admin account with
+    # a type-5 secret, no domain, no RSA keys, VTY "login / transport input none", both
+    # Gigabit ports without an address and shut down, no console login
+    'SIM49': _scenario('R1', _R1_1941, 'disabled',
+                       'MOCK CISCO1941 R1 (as after the first hardware test)',
+                       global_lines=['username admin privilege 15 secret 5 '
+                                     '$1$B3rU$k.snkyMockHashNotReal0'],
+                       line_config={'con 0': [], 'vty 0 4': ['login', 'transport input none']}),
+    # a factory-new Catalyst 2960: hostname Switch, nothing configured, Vlan1 without address
+    'SIM50': _scenario('Switch', _NEW_2960, 'disabled',
+                       'MOCK Catalyst 2960, factory-new (nothing configured)',
+                       global_lines=[], line_config={'con 0': [], 'vty 0 4': ['login'],
+                                                     'vty 5 15': ['login']}, vty_count=16),
 }
 
 
@@ -372,7 +395,7 @@ class MockConsoleSession:
             preflight = self._listen_locked()
             problem = gate(preflight, confirm_idle, startup_action)
             if problem is not None:
-                if preflight.refused:
+                if preflight.refused or problem.kind == AUTH:
                     self.listened, self._preflight = False, None
                 raise problem
             notices = [SETUP_DIALOG_NOTICE]
@@ -437,7 +460,9 @@ class MockConsoleSession:
                 self.rommon = True
             if self.rommon:
                 return f'\nrommon {self.commands_run} > '
-            return self.cli.handle(text).output
+            out = self.cli.handle(text).output
+            self._log('reply', masked_reply(out))
+            return out
 
     def enable(self):
         with self._lock:
@@ -466,22 +491,37 @@ class MockConsoleSession:
             return self.cli.prompt()
 
     # ------------------------------------------------------------ configuration (phase 5.1.2)
-    def _reply(self, text, secrets=(), timeout=None):
+    def _reply(self, text, secrets=(), timeout=None, answers=()):
         """One line on the simulated console, judged like the real session's _exchange.
-        Not a prompt (question, password, boot loader): the session ends, nothing is
-        answered. No recognised end, or slower than the timeout: a timeout."""
+        A known question listed in answers is answered (like the real session, at most
+        MAX_ANSWERS times); anything else that is not a prompt (question, password, boot
+        loader) ends the session, unanswered. No recognised end, or slower than the
+        timeout: a timeout."""
         if self.rommon:
             out = f'{mask_text(text, secrets)}\nrommon {self.commands_run} > '
         else:
-            reply = self.cli.handle(text)
-            if timeout is not None and reply.delay_s > timeout:
-                self._lost(TIMEOUT, f'The device did not finish answering within {int(timeout)} '
-                                    f'seconds; the console port was closed. Whether the line '
-                                    f'took effect is not known.')
-            out = text + '\n' + reply.output
-            if not reply.raw:
-                out += '\n' + (self.forced_prompt or self.cli.prompt())
+            typed, out, answered = text, text + '\n', 0
+            while True:
+                reply = self.cli.handle(typed)
+                if timeout is not None and reply.delay_s > timeout:
+                    self._lost(TIMEOUT, f'The device did not finish answering within '
+                                        f'{int(timeout)} seconds; the console port was closed. '
+                                        f'Whether the line took effect is not known.')
+                out += reply.output
+                if not reply.raw:
+                    out += '\n' + (self.forced_prompt or self.cli.prompt())
+                    break
+                state, _p = classify_reply(out)
+                last = out.replace('\r', '').rstrip().split('\n')[-1].strip()
+                typed = answer_for(last, answers) if state == QUESTION else None
+                if typed is None or answered >= MAX_ANSWERS:
+                    break
+                answered += 1
+                self._log('info', f'Answered the device question "{last}" with '
+                                  f'"{typed or "<Enter>"}" (expected for this step).')
+                out += typed + '\n'
             out = mask_text(out, secrets)
+        self._log('reply', masked_reply(out))
         state, prompt = classify_reply(out)
         if state is None:
             self._lost(TIMEOUT, 'The device did not finish answering (no prompt was recognised); '
@@ -509,7 +549,7 @@ class MockConsoleSession:
             self._in_config = reply.state == PROMPT and '(config' in reply.prompt
             return reply
 
-    def send_config_line(self, line, expect=None, timeout=None, secrets=None):
+    def send_config_line(self, line, expect=None, timeout=None, secrets=None, answers=()):
         template = check_config_line(line, self._allowed)
         values = dict(secrets or {})
         text = template
@@ -552,7 +592,7 @@ class MockConsoleSession:
                     self.partial_output = mask_text(full[:len(full) // 2], values.values())
                 self._lost(TIMEOUT, f'The device on {self.port} stopped answering in time.')
             return self._reply(text, secrets=tuple(values.values()),
-                               timeout=timeout or 30)
+                               timeout=timeout or 30, answers=answers)
 
     def refresh_prompt(self, timeout=None):
         with self._lock:
@@ -563,7 +603,7 @@ class MockConsoleSession:
     def allow_save(self, allowed):
         self._save_allowed = bool(allowed)
 
-    def save_config(self, timeout=None):
+    def save_config(self, timeout=None, answers=()):
         """Like ConsoleSession.save_config: `write memory` only after allow_save(True)."""
         with self._lock:
             self._require()
@@ -578,7 +618,7 @@ class MockConsoleSession:
             if self._event_for(SAVE_COMMAND) == 'unplug_on':
                 self._lost(PORT_UNAVAILABLE, f'{self.port} stopped working (was the cable '
                                              f'unplugged?).')
-            return self._reply(SAVE_COMMAND, timeout=timeout or 120)
+            return self._reply(SAVE_COMMAND, timeout=timeout or 120, answers=answers)
 
     def end_config(self, timeout=None):
         with self._lock:

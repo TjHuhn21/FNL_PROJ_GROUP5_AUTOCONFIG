@@ -29,7 +29,7 @@ command was accepted: only its verification output can make it VERIFIED.
 import re
 from dataclasses import dataclass, field
 
-from console import detect
+from console import detect, link
 
 VERIFIED, FAILED, UNCERTAIN = 'verified', 'failed', 'uncertain'
 CONFIG, CHECK, SAVE = 'config', 'check', 'save'   # SAVE: write memory (console.apply)
@@ -88,6 +88,9 @@ class PlanStep:
     prompt: PromptExpectation = None
     failure_replies: tuple = ()
     questions: tuple = ()         # never answered automatically
+    # the known questions this step answers by itself: ((pattern, what is typed), ...) -
+    # see console.link.answer_for. Every answer is logged; any other question stops the run.
+    answers: tuple = ()
     verifications: list = field(default_factory=list)
     uncertain_when: tuple = GENERAL_UNCERTAIN
     disruptive: bool = False
@@ -246,6 +249,11 @@ def _interface_enabled_check(name):
             return UNCERTAIN, f'{name} is not listed'
         if row.status == 'administratively down':
             return FAILED, f'{name} is still administratively down'
+        if row.status == 'down' or row.protocol == 'down':        # switched on: a warning only
+            hint = (f'{name} is down: connect at least one port in VLAN '
+                    f'{name[4:] or "1"} to a working device' if name.lower().startswith('vlan')
+                    else f'Interface is down: check that a cable is connected to {name}')
+            return VERIFIED, f'{name} is switched on ({row.status}/{row.protocol}). WARNING: {hint}'
         return VERIFIED, f'{name} is switched on ({row.status}/{row.protocol})'
     return check
 
@@ -328,11 +336,16 @@ def build_steps(plan, result, request, ssh_key_label):
                 _domain_check(request.domain_name))],
             approval_required=ssh_running, approval_reason=rename_reason if ssh_running else ''))
     for c in by_setting.get('user', []):
+        changing = bool(getattr(request, 'change_password', False))
         ids['user'] = add(PlanStep(
-            'user', 'Create the new administrator account', CONFIG, c,
-            preconditions=[f'no account named {request.username} existed at detection '
-                           f'(accounts read at privilege 15)',
-                           'the password is supplied at execution time only (never stored)'],
+            'user', (f'Change the password of {request.username}' if changing else
+                     'Create the new administrator account'), CONFIG, c,
+            preconditions=[(f'{request.username} existed at detection and the operator chose '
+                            f'"Change password"' if changing else
+                            f'no account named {request.username} existed at detection '
+                            f'(accounts read at privilege 15)'),
+                           'the password is the one TYPED now, supplied at execution time only '
+                           '(never stored, never a value read from the device)'],
             prompt=config_prompt(), failure_replies=COMMON_FAILURE_REPLIES,
             verifications=[Verification(
                 detect.SHOW_USERNAMES, f'"username {request.username} privilege 15 secret ..."',
@@ -354,8 +367,10 @@ def build_steps(plan, result, request, ssh_key_label):
                 note='IOS prints progress lines ("% The key modulus size is ...", "% Generating '
                      '... keys") and can take up to a minute; a long reply time is expected.'),
             failure_replies=COMMON_FAILURE_REPLIES,
-            questions=('Do you really want to replace them', '[yes/no]',
-                       'How many bits in the modulus'),
+            # answered by itself: the key size, and "replace them? yes" (this step was
+            # chosen to create SSH's key); any other question stops the run
+            answers=((link.MODULUS_QUESTION, str(request.key_size)),
+                     (link.REPLACE_KEYS_QUESTION, 'yes')),
             verifications=[
                 Verification(detect.SHOW_RSA, f'a key named {ssh_key_label}',
                              'no RSA key at all, or a different size than requested',
@@ -370,8 +385,8 @@ def build_steps(plan, result, request, ssh_key_label):
                          'at detection.',
                          'Key size: many IOS releases do not print it; then it is not '
                          'confirmed.',
-                         'A replace question means a key already existed: it is never answered '
-                         'and the step is not verified.']))
+                         'If IOS asks for the key size or whether to replace existing keys, '
+                         'NetCommand answers (the size chosen / "yes") and logs it.']))
     for c in by_setting.get('ssh_version', []):
         requires = (ids['rsa'],) if 'rsa' in ids else ()
         ids['ssh_version'] = add(PlanStep(
@@ -401,8 +416,9 @@ def build_steps(plan, result, request, ssh_key_label):
             login_ids[lines] = add(PlanStep(
                 f'vty_login[{lines}]', f'Ask for a local account on vty {lines}', CONFIG, c,
                 requires=requires,
-                preconditions=[f'the NEW account {request.username} is VERIFIED (step user); '
-                               f'an existing account is not enough'],
+                preconditions=[f'the account {request.username} is VERIFIED (step user)'
+                               if 'user' in ids else
+                               'a privilege-15 account existed at detection (kept)'],
                 prompt=config_prompt(line=True), failure_replies=COMMON_FAILURE_REPLIES,
                 verifications=[Verification(
                     detect.SHOW_VTY, f'line vty {lines} shows "login local"',
@@ -486,10 +502,12 @@ def build_steps(plan, result, request, ssh_key_label):
             preconditions=['every step above is VERIFIED'],
             prompt=PromptExpectation('privileged exec', f'{host_after}#',
                                      note='"write memory" prints "Building configuration..." '
-                                          'and "[OK]"; a question is never answered.'),
+                                          'and "[OK]"; "[confirm]" / "Destination filename" '
+                                          'are answered with Enter, any other question stops.'),
             failure_replies=COMMON_FAILURE_REPLIES + ('%Error', 'Error writing',
                                                       'Overwrite the previous'),
-            questions=('[confirm]', '[yes/no]', 'Destination filename'),
+            questions=('[yes/no]',),
+            answers=((link.CONFIRM_QUESTION, ''), (link.DESTINATION_QUESTION, '')),
             verifications=checks, approval_required=True,
             approval_reason='it overwrites the configuration the device starts with',
             limitations=['Saving makes the changes permanent: they are used after every '

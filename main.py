@@ -203,7 +203,12 @@ def confirm_leaving(root, refs, verb):
                        'Discard', cancel_text='Stay', parent=root, danger=True,
                        log=('app', f'{what}: discarding the unsaved Configure settings'))
     question = 'Close NetCommand?' if verb == 'close' else 'Sign out of NetCommand?'
-    return confirm(question, question, what, parent=root, log=('app', what))
+    setup = (refs or {}).get('setup')
+    where = setup.connection_text() if setup is not None and \
+        hasattr(setup, 'connection_text') else ''
+    text = question + (f'\n\nThe console connection to {where} is still open; it will be '
+                       f'closed.' if where else '')
+    return confirm(question, text, what, parent=root, log=('app', what))
 
 
 def dev_reset_locks(client):

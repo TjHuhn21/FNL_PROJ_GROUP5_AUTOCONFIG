@@ -367,7 +367,8 @@ def test_controls_follow_the_state(root):
     assert tab.phase == CONNECTED
     assert disabled(tab.connect_btn) and disabled(tab.refresh_btn) and disabled(tab.port_box)
     assert not disabled(tab.detect_btn) and not disabled(tab.disconnect_btn)
-    assert 'Connected (COM4, 9600 baud)' in tab.status_label.cget('text')
+    assert 'Connected: R1# (privileged mode)' in tab.status_label.cget('text')
+    assert 'COM4, 9600 baud' in tab.status_label.cget('text')
 
 
 def test_successful_connection_uses_the_chosen_speed(root):
@@ -378,7 +379,7 @@ def test_successful_connection_uses_the_chosen_speed(root):
     settle(root, tab)
     session = tab.backend.sessions[0]
     assert (session.port, session.baudrate) == ('COM4', 19200)
-    assert 'Connected to COM4 at 19200 baud' in tab.message.cget('text')
+    assert 'on COM4 at 19200 baud' in tab.message.cget('text')
     # phase 5.1.6: listen (nothing written) comes first, then connect; both off the Tk thread
     assert session.calls[:2] == [('listen', False), ('connect', False)]
 
@@ -700,12 +701,11 @@ def test_mock_lab_connection_failures(root, port, words):
     tab.connect()
     settle(root, tab)
     if port == 'SIM6':
-        # phase 5.1.6: a device that never answers is a SILENT console: nothing is sent
-        # until the operator confirms; only then does the (simulated) timeout follow
-        assert tab.phase == setup_tab.AWAITING and tab.idle_confirm.get() == 0
-        tab.idle_box.invoke()                      # the operator ticks it
-        tab.continue_btn.invoke()
-        settle(root, tab)
+        # a device that never answers is a SILENT console: Enter is sent (logged), and with
+        # no reply the page says what to check
+        assert tab.phase == ERROR and 'No response on SIM6' in tab.message.cget('text')
+        assert 'CONSOLE port' in tab.message.cget('text')
+        return
     assert tab.phase == ERROR and words in tab.message.cget('text')
 
 
@@ -803,7 +803,9 @@ def test_credentials_are_never_saved(root, monkeypatch):
     tab = connected(root, make(root))
     tab.password_var.set(PASSWORD)
     import db_fake as store
-    assert not hasattr(tab, 'store')
+    # the page saves a device only in step 7, after a successful SSH test AND the
+    # operator's confirmation; here it was given no store at all
+    assert tab.store is None
     for name in ('save_login', 'set_device_login', 'upsert_device'):
         if hasattr(store, name):
             monkeypatch.setattr(store, name, lambda *a, **k: pytest.fail('saved something'))

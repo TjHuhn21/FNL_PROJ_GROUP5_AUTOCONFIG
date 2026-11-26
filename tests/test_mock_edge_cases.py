@@ -52,6 +52,7 @@ def detected(identifier, quirks=None):
 def plan_for(identifier, username='', **values):
     r, _ = detected(identifier)
     pw = PASSWORD if username else ''
+    values.setdefault('required', False)   # these cases test the DEVICE's prerequisite errors
     req, errors = validate_request(username=username, password=pw, confirm=pw, key_size=2048,
                                    result=r, **values)
     assert not errors, list(errors)
@@ -84,7 +85,8 @@ def test_every_edge_scenario_has_a_unique_identifier():
 
 def test_default_port_list_is_unchanged_and_edge_cases_are_opt_in():
     assert [p.device for p in MockConsoleBackend().discover_ports().ports] == list(SCENARIOS)
-    assert len(SCENARIOS) == 19              # SIM47 / SIM48: brand-new switch and router
+    assert len(SCENARIOS) == 21              # SIM47 / SIM48: brand-new switch and router;
+                                             # SIM49 / SIM50: the real 1941 R1 and a 2960
     edge = [p.device for p in MockConsoleBackend(edge_cases=True).discover_ports().ports]
     assert edge == list(SCENARIOS) + list(EDGE_SCENARIOS)
     with pytest.raises(ValueError):

@@ -62,9 +62,30 @@ def check_characters(text, what='This value'):
     return None
 
 
+# `username X ... secret|password VALUE` / `enable secret VALUE` with a VALUE typed in plain
+# text (no type number in front): IOS hashes it itself. A stored hash pasted there ("$1$...")
+# would be taken as the PLAINTEXT password (and refused as too long by IOS 15.4), so it is
+# refused here; plaintext account secrets are 1-25 characters on IOS 15.4.
+_SECRET_VALUE = re.compile(r'^\s*(username\s+\S+.*?|enable)\s+(secret|password)\s+(?!\d\s)(\S+)\s*$',
+                           re.IGNORECASE)
+SECRET_MAX = 25
+
+
 def check_cli_line(line):
     """The backend's last check on one command line before it is sent (apply_config)."""
-    return check_characters(line, 'A command')
+    problem = check_characters(line, 'A command')
+    if problem:
+        return problem
+    m = _SECRET_VALUE.match(line or '')
+    if m:
+        value = m.group(3)
+        if re.match(r'^\$\d+\$', value):
+            return ('Type a real password, not an encrypted secret: "' + m.group(2) + ' $..." '
+                    'would be taken as the plaintext password. Nothing was sent.')
+        if m.group(2).lower() == 'secret' and len(value) > SECRET_MAX:
+            return (f'The password is longer than {SECRET_MAX} characters; Cisco IOS refuses it '
+                    f'("% Invalid Password length"). Nothing was sent.')
+    return None
 
 
 # ---------------------------------------------------------------- IPv4 addresses and masks

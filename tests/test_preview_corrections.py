@@ -41,6 +41,7 @@ def detected(port):
 
 def plan_for(result, username='', **values):
     password = PASSWORD if username else ''
+    values.setdefault('required', False)      # incomplete requests: see test_console_plan
     req, errors = validate_request(username=username, password=password, confirm=password,
                                    key_size=2048, result=result, **values)
     assert not errors, list(errors)
@@ -277,11 +278,11 @@ def test_separate_ranges_keep_their_own_settings():
     assert 'Telnet will stop working' in plan.item('vty_transport').explanation
 
 
-def test_separate_ranges_without_a_new_account():
+def test_separate_ranges_with_the_existing_admin():
     r, _ = detected('SIM16')
-    plan = plan_for(r)
-    assert texts(plan) == ['transport input ssh']               # login not changed (M4)
-    assert plan.item('vty_login').status == ATTENTION
+    plan = plan_for(r)                     # the existing admin is kept and used by SSH
+    assert texts(plan) == ['login local', 'transport input ssh']
+    assert plan.item('vty_login').status == ATTENTION       # the line password is replaced
 
 
 def test_unknown_vty_capacity_is_reported_and_nothing_is_invented():
@@ -297,16 +298,16 @@ def test_unknown_vty_capacity_is_reported_and_nothing_is_invented():
 
 
 # ================================================================== M4: no lockout
-def test_existing_admin_alone_does_not_allow_login_local():
+def test_existing_admin_allows_login_local_and_no_admin_does_not():
     r, _ = detected('SIM2')
     r.vty.blocks[0].login, r.vty.blocks[0].has_password = 'line password', True
+    plan = plan_for(r)                     # "Existing user(s): labadmin. Leave empty to keep"
+    assert 'login local' in texts(plan)
+    assert 'labadmin' in plan.item('user').explanation
+    r.config.local_users = []              # no privilege-15 account: never login local
     plan = plan_for(r)
     assert 'login local' not in texts(plan)
-    explanation = plan.item('vty_login').explanation
-    assert 'labadmin' in explanation and 'cannot tell whether you know their passwords' in \
-        explanation
-    assert 'proposes changing the VTY login only together with a new account' in \
-        plan.item('user').explanation
+    assert 'no privilege-15 account' in plan.item('vty_login').explanation
 
 
 def test_a_new_account_allows_login_local():

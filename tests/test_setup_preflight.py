@@ -16,8 +16,11 @@ from gui.setup_tab import AWAITING, CONNECTED, DISCONNECTED, ERROR  # noqa: E402
 from mocklab.console import MockConsoleBackend, scenario_port  # noqa: E402
 
 
-def open_page(root, port):
+def open_page(root, port, auto=False):
+    """The page with the operator deciding each startup prompt (auto_startup False: the
+    phase 5.1.6 flow tested here); auto=True: the default, automatic handling."""
     tab = make(root, backend=MockConsoleBackend(delay=0, edge_cases=True))
+    tab.auto_startup = auto
     tab.refresh_ports()
     settle(root, tab)
     tab.port_var.set(next(p.label() for p in tab.ports if p.device == port))
@@ -108,8 +111,23 @@ def test_the_setup_dialog_policy_is_shown_and_needs_approval(root):
     assert tab.phase == CONNECTED and 'answered "no"' in tab.message.cget('text')
 
 
-@pytest.mark.parametrize('identifier', ['console-pending-confirm', 'console-pending-password',
-                                        'console-boot-loader', 'console-unknown'])
+@pytest.mark.parametrize('identifier', ['console-silent', 'startup-press-return',
+                                        'startup-setup-dialog'])
+def test_known_startup_prompts_are_handled_automatically_by_default(root, identifier):
+    tab = open_page(root, scenario_port(identifier), auto=True)
+    assert tab.phase == CONNECTED and tab._awaiting is None
+    assert 'Connected:' in tab.message.cget('text')
+
+
+def test_a_pending_console_password_needs_the_console_login(root):
+    tab = open_page(root, scenario_port('console-pending-password'), auto=True)
+    assert tab.phase == ERROR and tab.session is None
+    assert 'Console login' in tab.message.cget('text') and \
+        'Nothing was sent' in tab.message.cget('text')
+
+
+@pytest.mark.parametrize('identifier', ['console-pending-confirm', 'console-boot-loader',
+                                        'console-unknown'])
 def test_unsafe_states_are_refused(root, identifier):
     tab = open_page(root, scenario_port(identifier))
     assert tab.phase == ERROR and tab.session is None and tab._awaiting is None

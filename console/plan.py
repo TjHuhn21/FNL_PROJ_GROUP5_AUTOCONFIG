@@ -56,7 +56,7 @@ _SEVERITY = {CONFIGURED: 0, MISSING: 1, UNKNOWN: 2, ATTENTION: 3, UNSUPPORTED: 4
 # command kinds
 ADD, MODIFY = 'add', 'modify'
 
-_USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9._-]{0,31}$')
+_USERNAME = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
 _DOMAIN = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
                      r'(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$')
 # PASSWORD_MAX: Cisco IOS refuses longer `username ... secret` values, seen on a CISCO1941
@@ -65,6 +65,7 @@ _DOMAIN = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?
 PASSWORD_MIN, PASSWORD_MAX = 8, 25
 # an IOS-style stored hash: $1$ (MD5, type 5), $8$ (PBKDF2), $9$ (scrypt), $14$ ...
 HASH_LIKE = re.compile(r'^\$\d+\$')
+HASH_ANYWHERE = re.compile(r'\$(1|5|6|8|9|14)\$[A-Za-z0-9./]{2,}\$')   # a hash pasted in a value
 
 
 # ---------------------------------------------------------------- input
@@ -84,6 +85,9 @@ class SetupRequest:
     mgmt_mask: str = ''
     gateway: str = ''
     save: bool = False
+    # the typed username already exists and the operator chose "Change password": its
+    # secret is replaced with the TYPED password (never a value read from the device)
+    change_password: bool = False
 
 
 def key_sizes(result):
@@ -113,9 +117,9 @@ def check_password(password, confirm):
         return 'Use only letters, numbers and common symbols (no accents).'
     if '?' in password:
         return 'The password must not contain "?" (Cisco IOS treats it as a help request).'
-    if HASH_LIKE.match(password):
-        return ('The password must not look like a stored Cisco hash (such as "$1$..." or '
-                '"$9$..."); choose another one.')
+    if HASH_LIKE.match(password) or HASH_ANYWHERE.search(password):
+        return ('Type a real password, not an encrypted secret (it looks like a stored Cisco '
+                'hash such as "$1$..." or "$9$...").')
     return None
 
 
@@ -126,8 +130,8 @@ def check_management(interface, ip, mask, gateway, result=None):
     import validators as V
     interface, ip, mask, gateway = (V.clean(x) for x in (interface, ip, mask, gateway))
     errors = {}
-    if not (interface or ip or mask or gateway):
-        return errors, ''
+    if not (ip or mask or gateway):      # only an interface (e.g. the preselected Vlan1): no
+        return errors, ''                # management address is set (it is optional)
     names = [i.name for i in (result.interfaces if result is not None else [])]
     if not interface:
         errors['mgmt_interface'] = 'Choose the interface that gets the management address.'
@@ -148,6 +152,21 @@ def check_management(interface, ip, mask, gateway, result=None):
         problem = V.check_host_address(ip, dotted, 'The IP address')
         if problem:
             errors['mgmt_ip'] = problem
+        elif result is not None:                # another interface already in this subnet
+            import ipaddress
+            net = ipaddress.ip_network(f'{ip}/{dotted}', strict=False)
+            for other in result.interfaces:
+                if other.name == interface or not other.ip:
+                    continue
+                try:
+                    inside = ipaddress.ip_address(other.ip) in net
+                except ValueError:
+                    continue
+                if inside:
+                    errors['mgmt_ip'] = (f'{ip}/{net.prefixlen} overlaps {other.name} '
+                                         f'({other.ip}): IOS refuses two interfaces in the same '
+                                         f'subnet. Choose another address or that interface.')
+                    break
     if gateway:
         problem = V.check_ipv4(gateway)
         if not problem and not ({'mgmt_ip', 'mgmt_mask'} & set(errors)):
@@ -159,14 +178,108 @@ def check_management(interface, ip, mask, gateway, result=None):
     return errors, dotted
 
 
+def required_fields(result):
+    """{field: why} for the fields this device NEEDS before SSH can work (from the
+    detection): a hostname other than Router/Switch, a domain name when RSA keys must still
+    be created, and an account when no privilege-15 account exists."""
+    if result is None or result.ssh.status not in (SshCapability.SUPPORTED_ENABLED,
+                                                   SshCapability.SUPPORTED_DISABLED):
+        return {}                     # no plan can be made for it: nothing is required
+    need = {}
+    if result.device.hostname in DEFAULT_HOSTNAMES:
+        need['hostname'] = (f'Required: the device is still called "{result.device.hostname}", '
+                            f'and IOS will not create RSA keys with that name.')
+    cfg = result.config
+    if cfg.domain_known and not cfg.domain_name and result.ssh.rsa.present is False:
+        need['domain_name'] = ('Required: the device has no domain name, and IOS needs one to '
+                               'create the RSA keys (for example lab.local).')
+    if cfg.local_users_known and not any(u.privilege == NEW_USER_PRIVILEGE
+                                         for u in cfg.local_users):
+        need['username'] = ('Required: the device has no privilege-15 account, so SSH would have '
+                            'nobody to log in as. Type a username and password.')
+    return need
+
+
+OK, MISSING_TEXT, UNKNOWN_TEXT = 'OK', 'MISSING', 'UNKNOWN'
+
+
+def ssh_checklist(result):
+    """What SSH over the network needs, each [(what, 'OK' / 'MISSING' / 'UNKNOWN',
+    detail)], from the detection only (nothing is sent):
+    hostname, domain, a privilege-15 account, an RSA key of 2048 bits or more, SSH
+    version 2, VTY login local + transport ssh, a management IP on an "up" interface,
+    and a default gateway."""
+    if result is None:
+        return []
+    d, s, c, v = result.device, result.ssh, result.config, result.vty
+    rows = []
+
+    def add(what, state, detail):
+        rows.append((what, state, detail))
+    host = d.hostname
+    add('Hostname not "Router"/"Switch"', UNKNOWN_TEXT if not host else
+        (MISSING_TEXT if host in DEFAULT_HOSTNAMES else OK), host or 'not read')
+    add('Domain name', OK if c.domain_name else (MISSING_TEXT if c.domain_known else UNKNOWN_TEXT),
+        c.domain_name or ('none' if c.domain_known else 'not read'))
+    admins = existing_admins(result)
+    add('Local user with privilege 15', OK if admins else
+        (MISSING_TEXT if c.local_users_known else UNKNOWN_TEXT),
+        ', '.join(admins) or ('none' if c.local_users_known else 'not read'))
+    rsa = s.rsa
+    if rsa.present is None:
+        add('RSA key 2048+', UNKNOWN_TEXT, 'not read')
+    elif not rsa.present:
+        add('RSA key 2048+', MISSING_TEXT, 'no key')
+    elif rsa.modulus_bits and rsa.modulus_bits < 2048:
+        add('RSA key 2048+', MISSING_TEXT, f'{rsa.modulus_bits} bits (too small)')
+    else:
+        add('RSA key 2048+', OK, f'{rsa.modulus_bits} bits' if rsa.modulus_bits else
+            'present (size not shown)')
+    v2 = s.enabled is True and str(s.version or '').startswith('2')
+    add('SSH version 2', OK if v2 else (UNKNOWN_TEXT if s.enabled is None else MISSING_TEXT),
+        (f'enabled, version {s.version}' if s.enabled else 'disabled') if s.enabled is not None
+        else 'not read')
+    blocks = list(v.blocks or [])
+    good = [b for b in blocks if b.login == 'local' and (b.transport_input or []) == ['ssh']]
+    detail = '; '.join(f'vty {b.lines}: login {b.login or "?"} / transport '
+                       f'{" ".join(b.transport_input or []) or "not shown"}' for b in blocks)
+    add('VTY: login local + transport ssh', UNKNOWN_TEXT if v.configured is None else
+        (OK if blocks and len(good) == len(blocks) else MISSING_TEXT), detail or 'none')
+    up = [i for i in result.interfaces if i.ip and i.status == 'up' and i.protocol == 'up']
+    add('Management IP on an "up" interface', OK if up else
+        (MISSING_TEXT if result.interfaces else UNKNOWN_TEXT),
+        ', '.join(f'{i.name} {i.ip}' for i in up) or 'none')
+    add('Default gateway', OK if c.default_gateway else
+        (MISSING_TEXT if c.gateway_known else UNKNOWN_TEXT),
+        c.default_gateway or ('none' if c.gateway_known else 'not read'))
+    return rows
+
+
+def existing_admins(result):
+    """The names of the privilege-15 accounts the detection found."""
+    if result is None:
+        return []
+    return [u.name for u in result.config.local_users if u.privilege == NEW_USER_PRIVILEGE]
+
+
+def account_exists(result, username):
+    return result is not None and any(u.name == username for u in result.config.local_users)
+
+
 def validate_request(hostname='', domain_name='', username='', password='', confirm='',
                      key_size=DEFAULT_KEY_SIZE, result=None, mgmt_interface='', mgmt_ip='',
-                     mgmt_mask='', gateway='', save=False):
-    """(SetupRequest, {field: message}). Empty fields mean "keep what the device has".
-    The password is checked here and not kept anywhere."""
+                     mgmt_mask='', gateway='', save=False, change_password=False,
+                     required=True):
+    """(SetupRequest, {field: message}). Empty fields mean "keep what the device has",
+    except the ones this device needs (required_fields; required=False skips that rule,
+    for looking at what a plan says about an incomplete request). The password is checked
+    here and not kept anywhere."""
     errors = {}
     hostname, domain_name, username = (hostname or '').strip(), (domain_name or '').strip(), \
         (username or '').strip()
+    for key, why in (required_fields(result) if required else {}).items():
+        if not {'hostname': hostname, 'domain_name': domain_name, 'username': username}[key]:
+            errors[key] = why
     if hostname:
         problem = validation.check_hostname(hostname)
         if problem:
@@ -179,8 +292,8 @@ def validate_request(hostname='', domain_name='', username='', password='', conf
                                  '(for example lab.local).')
     if username:
         if not _USERNAME.match(username):
-            errors['username'] = ('The username must start with a letter and use at most 32 '
-                                  'letters, numbers, dots, dashes or underscores.')
+            errors['username'] = ('The username may use letters, numbers, "-" and "_" only (no '
+                                  'spaces), at most 32 characters.')
         else:
             problem = check_password(password, confirm)
             if problem:
@@ -198,11 +311,15 @@ def validate_request(hostname='', domain_name='', username='', password='', conf
     mgmt_errors, dotted = check_management(mgmt_interface, mgmt_ip, mgmt_mask, gateway, result)
     errors.update(mgmt_errors)
     import validators as V
+    if not (V.clean(mgmt_ip) or V.clean(mgmt_mask) or V.clean(gateway)):
+        mgmt_interface = ''               # an interface alone sets nothing
     request = SetupRequest(hostname=hostname, domain_name=domain_name, username=username,
                            password_set=bool(username and password and 'password' not in errors),
                            key_size=size or DEFAULT_KEY_SIZE,
                            mgmt_interface=V.clean(mgmt_interface), mgmt_ip=V.clean(mgmt_ip),
-                           mgmt_mask=dotted, gateway=V.clean(gateway), save=bool(save))
+                           mgmt_mask=dotted, gateway=V.clean(gateway), save=bool(save),
+                           change_password=bool(change_password and username
+                                                and account_exists(result, username)))
     return request, errors
 
 
@@ -408,9 +525,15 @@ class _Context:
         names = {u.name for u in self.c.local_users}
         self.new_user = bool(request.username and request.password_set
                              and request.username not in names and self.c.local_users_known)
-        # `login local` is proposed only together with a NEW account in this plan: an existing
-        # account is not evidence that the operator knows its password (no lockout).
-        self.login_account = self.new_user
+        # the typed username exists and the operator chose "Change password" (asked by the
+        # Setup page): its secret is replaced with the password TYPED now
+        self.change_user = bool(request.username and request.password_set
+                                and request.username in names and request.change_password)
+        # `login local` is proposed with a new account, a changed password, or the existing
+        # privilege-15 account(s) the operator chose to keep using ("Leave empty to keep using
+        # them"). The console port itself never asks for a login here, so a mistake can
+        # always be corrected through the console.
+        self.login_account = self.new_user or self.change_user or bool(self.admins)
         self.keys_planned = False          # set by rsa(), which runs before ssh_version()
         self.key_state = self._key_state()
         self.vty_total, self.vty_uncovered = self._vty_coverage()
@@ -539,11 +662,23 @@ class _Context:
                             for u in users) or ('none' if known else 'unknown')
         item = PlanItem('user', 'Local SSH account', CONFIGURED, listing, '')
         existing = next((u for u in users if u.name == want), None) if want else None
-        if existing:
-            item.status = CONFLICT
-            item.explanation = (f'An account named {want} already exists. NetCommand never '
-                                f'changes existing accounts or their passwords: choose another '
-                                f'username, or leave it empty to use the existing account.')
+        if existing and self.change_user:
+            item.status = ATTENTION
+            item.commands.append(PlanCommand(
+                f'username {want} privilege {NEW_USER_PRIVILEGE} secret {PASSWORD_PLACEHOLDER}',
+                f'Gives the existing account {want} the password you typed (and privilege 15). '
+                f'"secret" stores it hashed. The password is not shown here.', kind=MODIFY,
+                setting='user'))
+            item.explanation = (f'{want} already exists; its password will be CHANGED to the one '
+                                f'you typed (you chose "Change password").')
+        elif existing:
+            item.status = CONFIGURED if existing.privilege == NEW_USER_PRIVILEGE else ATTENTION
+            item.explanation = (f'{want} already exists and is kept as it is (password not '
+                                f'changed). SSH will log in with its current password.'
+                                if existing.privilege == NEW_USER_PRIVILEGE else
+                                f'{want} already exists with privilege '
+                                f'{existing.privilege or 1}; choose "Change password" to give it '
+                                f'privilege 15 and a new password, or type another username.')
         elif want and not known:
             item.status = UNKNOWN
             item.explanation = ('The local accounts could not be fully read, so a new account '
@@ -562,9 +697,8 @@ class _Context:
         elif self.admins:
             item.explanation = ('Existing privilege-15 account(s): '
                                 + ', '.join(u.name for u in self.admins)
-                                + ' (passwords not shown or changed). NetCommand cannot tell '
-                                  'whether you know their passwords, so it proposes changing the '
-                                  'VTY login only together with a new account.')
+                                + ' (passwords not shown or changed). SSH will log in with '
+                                  'them; you need to know the password.')
         elif known and users:
             item.status = ATTENTION
             item.explanation = ('No local account has privilege 15. Enter a username and password '
@@ -797,16 +931,9 @@ class _Context:
                 continue
             if not self.login_account:
                 worst = _worse(worst, ATTENTION)
-                if self.admins:
-                    notes.append(f'vty {lines}: "login local" is NOT proposed. Existing account(s) '
-                                 f'({", ".join(u.name for u in self.admins)}) are not enough: '
-                                 f'NetCommand cannot tell whether you know their passwords, and '
-                                 f'switching would lock you out if you do not. Add a new account '
-                                 f'in this plan to change the login.')
-                else:
-                    notes.append(f'vty {lines}: "login local" is NOT proposed because no new '
-                                 f'privilege-15 account is being added (it would lock everybody '
-                                 f'out). Add an account above.')
+                notes.append(f'vty {lines}: "login local" is NOT proposed because no '
+                             f'privilege-15 account exists or is being added (it would lock '
+                             f'everybody out). Add an account above.')
                 continue
             disruptive = False
             if new:
@@ -933,7 +1060,9 @@ class _Context:
                 'no shutdown', f'Turns {iface.name} on (a new device has it switched off).',
                 mode=mode, setting='mgmt_up'))
             notes.append(f'{iface.name} is switched off and will be turned on.')
-        if q.gateway:
+        if q.gateway and self.c.default_gateway == q.gateway:
+            notes.append(f'The default gateway is already {q.gateway}; not changed.')
+        elif q.gateway:
             kind = self.d.device_type
             if kind == detect.SWITCH:
                 line = f'ip default-gateway {q.gateway}'

@@ -552,6 +552,9 @@ class Session:
             if hashed:                                    # already a hash: kept as it is
                 self._set_global(f'{prefix} {kind} {hashed[0]} {hashed[1]}', f'username {name}')
                 return Reply()
+            if len(secret) > 25:                          # as a CISCO1941 (IOS 15.4) answers
+                return Reply('% Invalid Password length - must contain 1 to 25 characters. '
+                             'Password configuration failed')
             self._set_global(f'{prefix} {kind} {5 if kind == "secret" else 0} '
                              f'{"$1$mock$" + _scramble(secret) if kind == "secret" else secret}',
                              f'username {name}')

@@ -44,11 +44,13 @@ SHOW_INTERFACES = 'show ip interface brief'
 SHOW_DOMAIN = 'show running-config | include ip domain'
 SHOW_SSH_CONFIG = 'show running-config | include ip ssh'
 SHOW_AAA = 'show running-config | include aaa'
+SHOW_GATEWAY = 'show running-config | include ip default-gateway|ip route 0.0.0.0 0.0.0.0'
+SHOW_VLAN = 'show vlan brief'                                     # switches only
 DETECTION_COMMANDS = (SHOW_VERSION, SHOW_PRIVILEGE, SHOW_HOSTNAME, SHOW_IP_SSH, SHOW_RSA,
                       SHOW_USERNAMES, SHOW_VTY, SHOW_LINE, SHOW_INTERFACES,
-                      SHOW_DOMAIN, SHOW_SSH_CONFIG, SHOW_AAA)
+                      SHOW_DOMAIN, SHOW_SSH_CONFIG, SHOW_AAA, SHOW_GATEWAY, SHOW_VLAN)
 CONFIG_COMMANDS = (SHOW_HOSTNAME, SHOW_USERNAMES, SHOW_VTY, SHOW_DOMAIN, SHOW_SSH_CONFIG,
-                   SHOW_AAA)                                     # output is masked
+                   SHOW_AAA, SHOW_GATEWAY)                       # output is masked
 
 ROUTER, SWITCH, UNKNOWN_TYPE = 'router', 'switch', 'unknown'
 SIMULATION_WARNING = ('SIMULATION: this output came from the NetCommand mock lab, not from a '
@@ -188,6 +190,8 @@ class ConfigInfo:
     aaa_known: bool = False
     local_users: list = field(default_factory=list)        # LocalUser (never a secret)
     local_users_known: bool = False
+    default_gateway: str = None       # 'ip default-gateway X' / 'ip route 0.0.0.0 0.0.0.0 X'
+    gateway_known: bool = False
 
 
 @dataclass
@@ -211,6 +215,7 @@ class DetectionResult:
     vty: VtyInfo = field(default_factory=VtyInfo)
     config: ConfigInfo = field(default_factory=ConfigInfo)
     interfaces: list = field(default_factory=list)
+    vlans: list = field(default_factory=list)      # switches: [(VLAN id, name, ports)]
     management_interface: str = None
     management_reason: str = None
     commands: list = field(default_factory=list)
@@ -503,6 +508,31 @@ def parse_show_line(text):
     return rows.count('VTY') if rows else None
 
 
+def parse_gateway(text):
+    """The default gateway: 'ip default-gateway X' (switch) or the next hop of
+    'ip route 0.0.0.0 0.0.0.0 X' (router); None when neither is configured."""
+    m = re.search(r'^ip default-gateway (\d+\.\d+\.\d+\.\d+)', text or '', re.MULTILINE)
+    if m:
+        return m.group(1)
+    m = re.search(r'^ip route 0\.0\.0\.0 0\.0\.0\.0 (\S+)', text or '', re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def parse_vlan_brief(text):
+    """[(VLAN id, name, ports)] from `show vlan brief` (continuation lines of ports are
+    added to the VLAN above them)."""
+    vlans = []
+    for line in (text or '').replace('\r', '').split('\n'):
+        m = re.match(r'^(\d{1,4})\s+(\S+)\s+(active|act/lshut|act/unsup|suspended|sus/lshut)'
+                     r'\s*(.*)$', line)
+        if m:
+            vlans.append([int(m.group(1)), m.group(2), m.group(4).strip()])
+        elif vlans and line.startswith(' ' * 10) and line.strip():
+            vlans[-1][2] = ', '.join(p for p in (vlans[-1][2].rstrip(', '),
+                                                 line.strip().strip(', ')) if p)
+    return [tuple(v) for v in vlans]
+
+
 def parse_interfaces(text):
     found = []
     for m in re.finditer(r'^(\S+)\s+(\S+)\s+(?:YES|NO)\s+(\S+)\s+(administratively down|up|down|'
@@ -784,6 +814,14 @@ def _read_config(result, runner, users, ip_ssh):
         cfg.aaa_login_lists = lists
         cfg.aaa_known = full or new_model
         cfg.aaa_new_model = new_model if cfg.aaa_known else None
+    gateway = runner.run(SHOW_GATEWAY)
+    if gateway.ok:
+        cfg.default_gateway = parse_gateway(gateway.output)
+        cfg.gateway_known = full or cfg.default_gateway is not None
+    if result.device.device_type == SWITCH:
+        vlans = runner.run(SHOW_VLAN)
+        if vlans.ok:
+            result.vlans = parse_vlan_brief(vlans.output)
     if not full and any(c.ok for c in (users, domain, ssh_cfg, aaa)):
         result.limitations.append('The running configuration was read below privilege level '
                                   '15, where lines can be hidden: settings that were not found '

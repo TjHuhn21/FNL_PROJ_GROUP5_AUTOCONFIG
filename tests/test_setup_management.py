@@ -75,9 +75,17 @@ def test_without_management_fields_nothing_about_an_address_is_proposed():
     assert plan.item('save').status == 'needs_attention'            # changes would be lost
 
 
+def test_an_interface_alone_sets_no_management_address():
+    """The switch's Vlan1 is preselected: without an IP it simply means "no management IP"."""
+    s, r = session('SIM47')
+    req, errors = validate_request('NEW-1', 'lab.local', 'netadmin', 'Str0ng-Pass!',
+                                   'Str0ng-Pass!', 2048, r, mgmt_interface='Vlan1')
+    assert not errors and req.mgmt_interface == '' and req.mgmt_ip == ''
+
+
 @pytest.mark.parametrize('fields, key, words', [
     (dict(iface='Vlan99', ip='192.168.1.2'), 'mgmt_interface', 'was not found'),
-    (dict(iface='Vlan1', ip=''), 'mgmt_ip', 'Required'),
+    (dict(iface='Vlan1', ip='', mask='/24'), 'mgmt_ip', 'Required'),   # a mask, but no IP
     (dict(iface='Vlan1', ip='300.1.1.1'), 'mgmt_ip', '0-255'),
     (dict(iface='Vlan1', ip='192.168.1.0'), 'mgmt_ip', 'network address'),
     (dict(iface='Vlan1', ip='192.168.1.2', mask='255.0.255.0'), 'mgmt_mask', 'contiguous'),
@@ -88,7 +96,8 @@ def test_the_management_fields_are_checked(fields, key, words):
     s, r = session('SIM47')
     if not fields.get('ip'):
         _req, errors = validate_request('NEW-1', 'lab.local', '', '', '', 2048, r,
-                                        mgmt_interface=fields['iface'])
+                                        mgmt_interface=fields['iface'],
+                                        mgmt_mask=fields.get('mask', ''))
     else:
         _req, errors = request(r, fields['iface'], fields['ip'],
                                mask=fields.get('mask', '/24'), gw=fields.get('gw', ''))

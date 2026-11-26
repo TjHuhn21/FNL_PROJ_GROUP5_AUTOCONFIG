@@ -8,10 +8,11 @@
 Nothing here can change or delete an entry (the activity history is append-only in the
 database as well).
 
-Export (encrypted)... writes the log shown - its search and filters, ALL pages, and only
-the lines this person may see - to a NEW .nclog file encrypted with a passphrase typed
-for it (log_export.py: scrypt + AES-256-GCM). The passphrase is not stored anywhere;
-`python -m log_export decrypt` opens the file with it.
+Export (locked)... writes the log shown - its search and filters, ALL pages, and only the
+lines this person may see - to a NEW .nclog file LOCKED with a password typed for it
+(at least 8 characters; log_export.py: scrypt + AES-256-GCM). The password is not stored
+anywhere: only it opens the file. Unlock export... asks for it and saves a readable CSV
+copy.
 
 Who sees what: an admin sees everyone's activity; an operator or viewer sees only their
 own lines and the automatic 'system' ones. This is enforced by the app (its queries are
@@ -78,7 +79,10 @@ class LogsTab(ttk.Frame):
                                      values=[ALL_USERS], font=theme.FONT_FORM)
         self.user_box.bind('<<ComboboxSelected>>', lambda e: self.go_first())
         ttk.Button(top, text='Refresh', command=self.refresh_clicked).pack(side='right')
-        self.export_btn = ttk.Button(top, text='Export (encrypted)...',
+        self.unlock_btn = ttk.Button(top, text='🔓 Unlock export...',
+                                     command=self.unlock_clicked)
+        self.unlock_btn.pack(side='right', padx=(0, theme.PAD))
+        self.export_btn = ttk.Button(top, text='🔒 Export (locked)...',
                                      command=self.export_clicked)
         self.export_btn.pack(side='right', padx=(0, theme.PAD))
 
@@ -237,19 +241,19 @@ class LogsTab(ttk.Frame):
         self.prev_btn.state(['disabled'])
         self.next_btn.state(['disabled'])
 
-    # ---------------------------------------------------------------- encrypted export
+    # ---------------------------------------------------------------- locked export / unlock
     def export_clicked(self):
-        """Export what the page shows (all pages) to a new passphrase-encrypted file."""
+        """Export what the page shows (all pages) to a new file LOCKED with a password
+        typed now (twice). Only that password opens it; it is not stored anywhere."""
         log = self.view.get()
-        passphrase = ask_passphrase(self)
-        if passphrase is None:
+        password = ask_password(self, confirm=True)
+        if password is None:
             return                                    # cancelled: nothing was read
-        stamp = datetime.now().strftime('%Y%m%d-%H%M')
         name = 'activity' if self.activity else 'config-log'
         path = filedialog.asksaveasfilename(
-            parent=self, title='Export the log (encrypted)', defaultextension=log_export.SUFFIX,
-            initialfile=f'netcommand-{name}-{stamp}{log_export.SUFFIX}',
-            filetypes=[('NetCommand encrypted log', '*' + log_export.SUFFIX)])
+            parent=self, title='Export the log (locked)', defaultextension=log_export.SUFFIX,
+            initialfile=f'netcommand-{name}-{file_stamp()}{log_export.SUFFIX}',
+            filetypes=[('NetCommand locked log', '*' + log_export.SUFFIX)])
         if not path:
             return
         activity = self.activity
@@ -259,15 +263,70 @@ class LogsTab(ttk.Frame):
                    'limited_to': list(scope.get('users', [])) or 'everyone'}
         store = self.store
         self.export_btn.state(['disabled'])
-        log_event('logs', f'Exporting the {log} (encrypted)...')
+        log_event('logs', f'Exporting the {log} (locked with a password)...')
 
-        def work(pw=passphrase):
+        def work(pw=password):
             entries = collect_entries(store, activity, text, status, user, scope)
             data = log_export.export_bytes(log, entries, pw, filters=filters)
             log_export.write_export(path, data)
             return len(entries)
-        passphrase = None
+        password = None
         background.run_async(self, work, lambda n, err: self._exported(log, path, n, err))
+
+    def unlock_clicked(self):
+        """Open a locked export with its password and save a READABLE copy (CSV)."""
+        source = filedialog.askopenfilename(
+            parent=self, title='Unlock a log export',
+            filetypes=[('NetCommand locked log', '*' + log_export.SUFFIX), ('All files', '*.*')])
+        if not source:
+            return
+        name = os.path.basename(source)
+        try:
+            with open(source, 'rb') as f:
+                data = f.read(log_export.C.MAX_FILE_BYTES + 1)
+            header = log_export.read_header(data)
+        except (OSError, log_export.C.BackupCryptoError) as err:
+            text = str(err) if isinstance(err, log_export.C.BackupCryptoError) else \
+                f'{name} could not be read.'
+            messagebox.showerror('Cannot unlock', text, parent=self)
+            return
+        if log_export.is_key_locked(header):
+            messagebox.showinfo('Cannot unlock here', (
+                'This file was locked without a password (a test version). Export the log '
+                'again: new exports are locked with a password.'), parent=self)
+            return
+        password = ask_password(self, confirm=False, file_name=name)
+        if password is None:
+            return
+        try:
+            _header, payload = log_export.open_export(data, password)
+        except log_export.C.BackupCryptoError as err:
+            log_event('logs', f'Unlock of {name} FAILED (wrong password, or a changed file).',
+                      'error')
+            messagebox.showerror('Cannot unlock', str(err), parent=self)
+            return
+        finally:
+            password = None
+        text = log_export.to_csv(payload)
+        base = os.path.splitext(name)[0]
+        target = filedialog.asksaveasfilename(
+            parent=self, title='Save the unlocked (readable) copy', defaultextension='.csv',
+            initialfile=f'{base}-unlocked.csv', filetypes=[('CSV (Excel)', '*.csv')])
+        if not target:
+            return
+        try:
+            log_export.write_export(target, text.encode('utf-8-sig'))   # Excel reads UTF-8
+        except (OSError, log_export.LogExportError) as err:
+            messagebox.showerror('Not saved', str(err) if isinstance(
+                err, log_export.LogExportError) else 'The file could not be written.',
+                parent=self)
+            return
+        log_event('logs', f'Unlocked {name} ({header["count"]} entries of the {header["log"]}) '
+                          f'to {os.path.basename(target)} (readable).', 'ok')
+        messagebox.showinfo('Export unlocked', (
+            f'{header["count"]} entries of the {header["log"]} were saved, READABLE, to\n'
+            f'{target}\n\nIt is not locked: keep it safe and delete it when you are done.'),
+            parent=self)
 
     def _exported(self, log, path, count, err):
         try:
@@ -282,15 +341,23 @@ class LogsTab(ttk.Frame):
             log_event('logs', f'Export of the {log} FAILED. {text}', 'error')
             messagebox.showerror('Export failed', f'Nothing was exported.\n\n{text}', parent=self)
             return
-        log_event('logs', f'Exported {count} entries of the {log} (encrypted) to {name}.', 'ok')
+        log_event('logs', f'Exported {count} entries of the {log} (locked with a password) '
+                          f'to {name}.', 'ok')
         messagebox.showinfo('Log exported', (
-            f'{count} entries of the {log} were saved, encrypted, to\n{path}\n\n'
-            f'Open it with:  python -m log_export decrypt "{name}" --out <new file>\n'
-            f'The passphrase is not stored anywhere: without it, nobody can open the file.'),
-            parent=self)
+            f'{count} entries of the {log} were saved, LOCKED, to\n{path}\n\n'
+            f'Only the password you typed opens it ("Unlock export..." on this page). It is '
+            f'not stored anywhere: if it is lost, nobody can open the file.'), parent=self)
 
 
 EXPORT_PAGE = 500                                    # rows read per query while exporting
+
+
+def file_stamp(now=None):
+    """'20261127-0530PM' for a file name (12-hour, like every time NetCommand shows)."""
+    now = now or datetime.now()
+    hour = now.hour % 12 or 12
+    return f'{now.year:04d}{now.month:02d}{now.day:02d}-{hour:02d}{now.minute:02d}' \
+           f'{"AM" if now.hour < 12 else "PM"}'
 
 
 def collect_entries(store, activity, text, status, user, scope):
@@ -317,22 +384,23 @@ def collect_entries(store, activity, text, status, user, scope):
     return out
 
 
-def ask_passphrase(parent):
-    """A passphrase typed twice in a masked dialog, or None (cancelled). Never kept."""
+def ask_password(parent, confirm=True, file_name=''):
+    """The export password in a masked dialog (typed twice when locking, once when
+    unlocking), or None (cancelled). Never kept, logged or shown."""
     win = tk.Toplevel(parent)
-    win.title('Encrypt the export')
+    win.title('Lock the export' if confirm else 'Unlock the export')
     win.transient(parent.winfo_toplevel())
     win.resizable(False, False)
     frame = ttk.Frame(win, padding=theme.PAD * 2)
     frame.pack(fill='both', expand=True)
-    ttk.Label(frame, text=(f'Choose a passphrase for this export (at least '
-                           f'{log_export.PASSPHRASE_MIN} characters).\nYou need it to open the '
-                           f'file. It is not stored anywhere: if it is lost, the export\n'
-                           f'cannot be opened by anyone, NetCommand included.'),
-              justify='left', style='Form.TLabel').pack(anchor='w')
-    first, second = tk.StringVar(win), tk.StringVar(win)     # this dialog's own variables
+    text = (f'Type a password to lock this export (at least {log_export.PASSPHRASE_MIN} '
+            f'characters).\nOnly this password opens the file. It is not stored anywhere:\n'
+            f'if it is lost, nobody can open the file (NetCommand included).') if confirm else \
+        f'Type the password of {file_name or "this export"}.'
+    ttk.Label(frame, text=text, justify='left', style='Form.TLabel').pack(anchor='w')
+    variables = [tk.StringVar(win)] + ([tk.StringVar(win)] if confirm else [])
     entries = []
-    for label, var in (('Passphrase', first), ('Passphrase again', second)):
+    for label, var in zip(('Password', 'Password again'), variables):
         ttk.Label(frame, text=label).pack(anchor='w', pady=(theme.PAD, 0))
         entry = ttk.Entry(frame, textvariable=var, show='*', width=40, font=theme.FONT_FORM)
         entry.pack(anchor='w', ipady=2)
@@ -341,34 +409,38 @@ def ask_passphrase(parent):
     problem.pack(anchor='w', pady=(theme.PAD, 0))
     result = {'value': None}
 
+    def clear():
+        for var in variables:
+            var.set('')
+
     def ok(_event=None):
-        a, b = first.get(), second.get()
-        first.set('')
-        second.set('')
-        if a != b:
-            problem.configure(text='The two passphrases do not match.')
+        values = [var.get() for var in variables]
+        clear()
+        if confirm and values[0] != values[1]:
+            problem.configure(text='The two passwords do not match.')
             return
         try:
-            log_export.check_passphrase(a)
+            log_export.check_passphrase(values[0])
         except log_export.LogExportError as err:
             problem.configure(text=str(err))
             return
-        result['value'] = a
+        result['value'] = values[0]
         win.destroy()
 
     def cancel(_event=None):
-        first.set('')
-        second.set('')
+        clear()
         win.destroy()
     bar = ttk.Frame(frame)
     bar.pack(anchor='e', pady=(theme.PAD, 0))
-    ttk.Button(bar, text='Encrypt and choose file...', style='Accent.TButton',
-               command=ok).pack(side='left')
+    ttk.Button(bar, text='Lock and choose file...' if confirm else 'Unlock',
+               style='Accent.TButton', command=ok).pack(side='left')
     ttk.Button(bar, text='Cancel', command=cancel).pack(side='left', padx=(theme.PAD, 0))
     win.bind('<Return>', ok)
     win.bind('<Escape>', cancel)
     win.protocol('WM_DELETE_WINDOW', cancel)
     entries[0].focus_set()
+    from gui.components.dialogs import place_window
+    place_window(win, parent)
     win.grab_set()
     parent.wait_window(win)
     return result['value']

@@ -319,8 +319,8 @@ def test_detection_with_bare_enable_reports_the_password_prompt():
     assert not build_plan(r).available
 
 
-# ---------------------------------------------------------------- D1: questions never answered
-def test_rsa_replace_question_stops_without_an_answer():
+# ---------------------------------------------------------------- D1: only KNOWN questions answered
+def test_rsa_replace_question_is_answered_yes_by_the_rsa_step():
     def hide_keys(s):                                       # SIM20 keys appear after detection
         s.device.rsa_keys = False
     s, r, req, plan = prepare('SIM20', before_detect=hide_keys)
@@ -329,28 +329,35 @@ def test_rsa_replace_question_stops_without_an_answer():
     s.console = {'keys_appear_on': rsa}
     cli = s.cli
     res = run(s, r, req, plan)
-    st = statuses(res)
-    assert st['rsa'] == UNCERTAIN and res.outcome == A.INCOMPLETE
-    assert any('Do you really want to replace them' in x and 'NOT answered' in x
-               for x in res.step('rsa').reasons)
-    assert cli.pending is not None                          # the device is still asking
-    assert s.config_sent[-1] == rsa and not s.is_active()   # nothing after the question
-    assert 'ssh_version' not in st                         # SIM20 already has version 2
-    assert st['ssh_ready'] == BLOCKED
-    assert any('NetCommand never answers device questions' in x for x in res.recovery)
-    assert res.final_detection is None and res.invariants == []
+    assert statuses(res)['rsa'] == VERIFIED and res.outcome == A.SUCCESS
+    assert 'Do you really want to replace them' in res.step('rsa').reply     # shown, answered
+    assert cli.pending is None and s.is_active()
 
 
-def test_modulus_question_stops_without_an_answer():
+def test_modulus_question_is_answered_with_the_chosen_size():
     s, r, req, plan = prepare('SIM21')
     rsa = 'crypto key generate rsa modulus 2048'
     s.console = {'modulus_question_on': rsa}
     cli = s.cli
     res = run(s, r, req, plan)
+    assert statuses(res)['rsa'] == VERIFIED
+    assert 'How many bits in the modulus' in res.step('rsa').reply
+    assert cli.pending is None and cli.dev.rsa_keys and cli.dev.rsa_bits == 2048
+
+
+def test_a_question_the_step_does_not_expect_stops_without_an_answer():
+    s, r, req, plan = prepare('SIM21')
+    rsa = 'crypto key generate rsa modulus 2048'
+    s.console = {'modulus_question_on': rsa}
+    next(x for x in plan.steps if x.step_id == 'rsa').answers = ()     # not expected here
+    cli = s.cli
+    res = run(s, r, req, plan)
     assert statuses(res)['rsa'] == UNCERTAIN
-    assert any('How many bits in the modulus' in x for x in res.step('rsa').reasons)
+    assert any('How many bits in the modulus' in x and 'NOT answered' in x
+               for x in res.step('rsa').reasons)
     assert cli.pending is not None and not s.is_active()
     assert not cli.dev.rsa_keys                            # nothing was generated
+    assert any('NetCommand never answers device questions' in x for x in res.recovery)
 
 
 def test_sim21_with_the_planned_size_asks_nothing():

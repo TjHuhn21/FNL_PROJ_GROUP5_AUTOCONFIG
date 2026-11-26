@@ -150,9 +150,13 @@ def healthy(version=IOS_1941, **changes):
         'show running-config | include ip domain': 'ip domain-name lab.local',
         'show running-config | include ip ssh': 'ip ssh version 2',
         'show running-config | include aaa': '',
+        detect.SHOW_GATEWAY: '',                       # no default gateway
     }
     answers.update(changes)
     return answers
+
+
+ROUTER_COMMANDS = tuple(c for c in DETECTION_COMMANDS if c != detect.SHOW_VLAN)  # switches only
 
 
 # ------------------------------------------------------------------ fake sessions
@@ -520,7 +524,7 @@ def test_interface_command_unavailable():
 # ------------------------------------------------------------------ error handling
 def test_individual_command_rejection_does_not_stop_detection():
     r = detect_device(ScriptedSession(healthy(**{'show privilege': INVALID})))
-    assert r.complete and len(r.commands) == len(DETECTION_COMMANDS)
+    assert r.complete and len(r.commands) == len(ROUTER_COMMANDS)
     assert [c.command for c in r.failed] == ['show privilege']
     assert r.access.privilege_level is None
 
@@ -533,7 +537,7 @@ def test_command_timeout_keeps_partial_results():
     assert r.command('show version').ok and r.device.model == 'CISCO1941/K9'
     assert r.ssh.status == S.SUPPORTED_ENABLED                 # read before the timeout
     skipped = [c.command for c in r.commands if c.status == detect.SKIPPED]
-    assert skipped == list(DETECTION_COMMANDS[5:])
+    assert skipped == list(ROUTER_COMMANDS[5:])
     assert any('partial' in w for w in r.warnings)
 
 

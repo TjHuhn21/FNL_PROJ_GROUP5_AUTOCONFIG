@@ -407,7 +407,20 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
         scope = None
     refs['logs'] = LogsTab(host, store, scope_users=scope)
     if allowed('setup'):                    # not even built for roles that may not use it
-        refs['setup'] = SetupTab(host, log=log_event, backend=console_backend)
+        refs['setup'] = SetupTab(host, log=log_event, backend=console_backend, store=store,
+                                 on_registered=lambda: after_data_change())
+
+        def use_in_scan(ip, username, password):
+            """The Initial Setup page finished: fill in the Scan page and open it."""
+            scan = refs['scan']
+            scan.demo.set(0)
+            scan.seed.set(ip)
+            scan.user.set(username)
+            scan.pw.set(password)
+            log_event('setup', f'Scan page filled in: Seed IP {ip}, username {username} '
+                               f'(password typed in Initial Setup).')
+            show_page('scan')
+        refs['setup'].on_use_in_scan = use_in_scan if allowed('scan') else None
     # the new-user guide (tour, help) for this user: their server account id, else 'demo'
     user_key = getattr(getattr(account, 'session', None), 'user_id', None) or 'demo'
     refs['guide'] = Guide(root, refs, store, user_key)
@@ -678,6 +691,10 @@ def build_main_window(root, store, demo_store=False, startup_problem=None, acces
             return
         if not any(key == k for k, _label in pages):
             refuse(key)
+            return
+        if state['current'] == 'setup' and 'setup' in refs and \
+                not refs['setup'].confirm_leave():
+            refs['nav'].set_active('setup')            # stay: the console is still in use
             return
         remember_console(state['current'])
         for other, _label in all_pages:
