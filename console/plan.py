@@ -59,7 +59,10 @@ ADD, MODIFY = 'add', 'modify'
 _USERNAME = re.compile(r'^[A-Za-z][A-Za-z0-9._-]{0,31}$')
 _DOMAIN = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
                      r'(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$')
-PASSWORD_MIN, PASSWORD_MAX = 8, 64
+# PASSWORD_MAX: Cisco IOS refuses longer `username ... secret` values, seen on a CISCO1941
+# with IOS 15.4: "% Invalid Password length - must contain 1 to 25 characters. Password
+# configuration failed". Refused here, before anything is sent.
+PASSWORD_MIN, PASSWORD_MAX = 8, 25
 # an IOS-style stored hash: $1$ (MD5, type 5), $8$ (PBKDF2), $9$ (scrypt), $14$ ...
 HASH_LIKE = re.compile(r'^\$\d+\$')
 
@@ -101,7 +104,8 @@ def check_password(password, confirm):
     if password != confirm:
         return 'The two passwords do not match.'
     if not PASSWORD_MIN <= len(password) <= PASSWORD_MAX:
-        return f'The password must be {PASSWORD_MIN} to {PASSWORD_MAX} characters long.'
+        return (f'The password must be {PASSWORD_MIN} to {PASSWORD_MAX} characters long '
+                f'(Cisco IOS accepts at most {PASSWORD_MAX} for an account password).')
     if any(c.isspace() for c in password):
         return ('The password must not contain spaces, tabs or line breaks (Cisco IOS could '
                 'read part of it as a hash type, or cut it short).')

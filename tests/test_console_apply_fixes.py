@@ -240,10 +240,38 @@ def test_m2_whitespace_and_hash_like_passwords_are_refused(password):
 
 
 @pytest.mark.parametrize('password', ['Synth3tic-Pass!', '5$1$abcdefgh', 'pass$1$word',
-                                      '7x0822455D0A16', 'a' * 64, 'Ab3!Ab3!'])
+                                      '7x0822455D0A16', 'a' * 25, 'Ab3!Ab3!'])
 def test_m2_ordinary_passwords_still_pass(password):
     assert check_password(password, password) is None
     assert check_secret(password) == password
+
+
+# ---------------------------------------------------------------- the IOS 25-character limit
+# Seen on the lab router (CISCO1941, IOS 15.4) during the first physical Apply: a longer
+# account secret is refused with exactly this message, and the account step FAILED.
+IOS_TOO_LONG = ('% Invalid Password length - must contain 1 to 25 characters. Password '
+                'configuration failed')
+
+
+def test_passwords_over_25_characters_are_refused_before_anything_is_sent():
+    assert check_password('a' * 25, 'a' * 25) is None
+    problem = check_password('a' * 26, 'a' * 26)
+    assert problem and '25' in problem and 'a' * 26 not in problem
+    with pytest.raises(ConsoleError):
+        check_secret('a' * 26)
+    s, r, req, plan = mock_prepared()
+    long_pw = 'Synth3tic-Pass!-0123456789'                 # 26 characters
+    res = go(s, r, req, plan, password=long_pw, confirm=long_pw)
+    assert res.outcome == A.REFUSED and s.config_sent == []
+    assert '25' in res.message and long_pw not in shown(res)
+
+
+def test_the_real_ios_length_message_is_a_rejection():
+    s, r, req, plan = mock_prepared()
+    user = plan.step('user')
+    reply = f'username netadmin privilege 15 secret ********\n{IOS_TOO_LONG}\nEdge-R1(config)#'
+    assert any(m in reply for m in user.failure_replies)    # "% Invalid" -> FAILED
+    assert user.evaluate({}, reply=reply)[0] == FAILED
 
 
 def test_m2_a_whitespace_password_sends_nothing():

@@ -20,7 +20,7 @@ NetCommand's SSH setup).
    * *New hostname*: letters, numbers and dashes, starting with a letter; not `Router` or
      `Switch` (IOS will not create RSA keys with the factory name).
    * *Domain name*: for example `lab.local`.
-   * *New SSH username* and the *password* (twice): 8–64 characters, no accents, no `?`
+   * *New SSH username* and the *password* (twice): 8–25 characters (Cisco IOS refuses longer account passwords: a CISCO1941 with IOS 15.4 answers `% Invalid Password length - must contain 1 to 25 characters`), no accents, no `?`
      (IOS treats `?` as a help request), **no whitespace at all** (spaces, tabs, line
      breaks), and nothing shaped like a stored Cisco hash (`$1$...`, `$9$...`). In
      `username X secret <password>` IOS reads a leading `5 ` or `7 ` as the secret's type,
@@ -369,7 +369,7 @@ nothing was sent); and the manual recovery actions.
 * Recognising HTTPS keys relies on the `TP-self-signed` name; other non-SSH key names are
   treated as unknown purpose. Whether the "IOS Keys in SECSH format" line of `show ip ssh`
   appears on every release has not been checked.
-* Password rules (length 8–64, characters) are NetCommand's own and unverified against
+* Password rules (length 8–25, characters) are NetCommand's own; the 25-character limit was confirmed on a CISCO1941 (IOS 15.4), the rest is unverified against
   IOS limits.
 * AAA servers (TACACS+/RADIUS) are not checked; the plan only shows the method lists.
 * The preview does not set a management IP address, default gateway or SSH timeouts.

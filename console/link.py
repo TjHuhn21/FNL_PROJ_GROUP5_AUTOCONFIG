@@ -177,13 +177,21 @@ def check_config_line(line, allowed=None):
 def check_secret(value):
     """A secret substituted into a configuration line: printable, no whitespace (IOS
     would read "5 x" / "7 x" as a hash type, or cut the value at a space), no "?", and
-    not shaped like a stored hash ("$1$...")."""
+    not shaped like a stored hash ("$1$..."), and at most SECRET_MAX characters (IOS
+    refuses longer account secrets)."""
     if not isinstance(value, str) or not value or '?' in value or \
-            any(not 33 <= ord(c) <= 126 for c in value) or re.match(r'^\$\d+\$', value):
-        raise ConsoleError(REFUSED, 'The password cannot be sent (empty, whitespace, "?", an '
-                                    'unprintable character, or shaped like a stored hash); '
-                                    'nothing was sent.')
+            any(not 33 <= ord(c) <= 126 for c in value) or re.match(r'^\$\d+\$', value) or \
+            len(value) > SECRET_MAX:
+        raise ConsoleError(REFUSED, f'The password cannot be sent (empty, longer than '
+                                    f'{SECRET_MAX} characters, whitespace, "?", an unprintable '
+                                    f'character, or shaped like a stored hash); nothing was '
+                                    f'sent.')
     return value
+
+
+# Cisco IOS limit for `username ... secret` (IOS 15.4 on a CISCO1941: "% Invalid Password
+# length - must contain 1 to 25 characters"); console.plan.PASSWORD_MAX is the same
+SECRET_MAX = 25
 
 
 def mask_text(text, secrets):

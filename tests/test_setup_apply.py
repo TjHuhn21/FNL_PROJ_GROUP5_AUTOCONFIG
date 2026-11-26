@@ -188,3 +188,16 @@ def test_only_apply_and_stop_were_added(root):
     names = {b.lower() for b in buttons(tab)}
     assert {'apply ssh configuration', 'stop after the current step'} <= names
     assert not any(w in n for n in names for w in ('save', 'write', 'reload'))
+
+
+def test_a_failed_step_and_its_reason_go_to_the_config_log(root):
+    # the first physical run: the reason was only in the table and was lost with the page
+    tab = previewed(root)
+    tab.session.console = {'reject_on': 'username netadmin privilege 15 secret <SSH_PASSWORD>'}
+    type_apply(tab)
+    tab.apply_btn.invoke()
+    settle(root, tab)
+    lines = [m for _s, m, _l in tab.logged if m.startswith('SSH apply step')]
+    assert lines and 'Create the new administrator account' in lines[0]
+    assert 'FAILED' in lines[0] and 'rejected the command' in lines[0]
+    assert PW not in str(tab.logged)

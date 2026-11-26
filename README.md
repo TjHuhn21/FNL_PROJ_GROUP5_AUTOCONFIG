@@ -110,7 +110,14 @@ be approved into the real database (Approve is disabled, and `db.py` refuses the
 4. **Findings**: Run review (reads each device's config over SSH). Health score + fixes.
 5. Select a finding, **Send to Configure**, check the preview, **Apply**.
 6. Or in **Configure**: add 3 VLANs, Preview, Apply. Check with `show vlan brief` on the switch.
-7. **Logs** shows every apply, success or failed.
+7. **Logs** shows every apply, success or failed. **Export (encrypted)...** saves the log
+   being shown (its search and filters, all pages, and only the lines you may see) to a new
+   `.nclog` file, encrypted with a passphrase you type (at least 12 characters; scrypt +
+   AES-256-GCM, see `log_export.py`). The passphrase is not stored: without it nobody can
+   open the file. To read it:
+   `.\venv\Scripts\python.exe -m log_export decrypt FILE --out copy.csv` (asks the
+   passphrase; `--format json` for JSON; it never replaces an existing file). The copy is
+   readable, not encrypted: delete it when done.
 
 ## Build the lab
 

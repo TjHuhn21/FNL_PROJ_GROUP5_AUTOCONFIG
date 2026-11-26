@@ -1556,6 +1556,12 @@ class SetupTab(ttk.Frame):
                 f'•  {p}' for p in res.problems))
         level = {ssh_apply.SUCCESS: 'ok', ssh_apply.REFUSED: 'warn'}.get(res.outcome, 'error')
         self._log(f'SSH apply: {res.outcome}. {res.message}', level)
+        # why a step did not pass, kept in the log too (the table is gone once the page
+        # closes); reasons are NetCommand's own text and masked device replies, never a password
+        for rec in res.steps + res.invariants:
+            if rec.status in (ssh_apply.FAILED, ssh_apply.UNCERTAIN):
+                self._log(f'SSH apply step "{rec.title}" {ssh_apply.STATUS_TEXT[rec.status]}: '
+                          f'{"; ".join(rec.reasons) or "no reason recorded"}', 'error')
         if res.final_detection is not None:
             self.result, self.result_live = res.final_detection, True
             self.result_time = datetime.now()
